@@ -5,6 +5,7 @@ import bisect
 import logging
 import os
 from collections.abc import Callable, Iterable
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -21,13 +22,22 @@ from .const import (
     MANUFACTURER_NAME_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
+    VALUE_TO_AUTO_LOCK_MODE,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_STATUS,
+    AutoLockMode,
+    AutoLockState,
     BatteryState,
     Commands,
+    DoorActivity,
     DoorStatus,
+    LockActivity,
+    LockActivityType,
     LockInfo,
+    LockStateValue,
     LockStatus,
+    SettingType,
+    StatusType,
 )
 from .secure_session import SecureSession
 from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
@@ -65,9 +75,7 @@ AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
 AA_BATTERY_VOLTAGE_LIST = [
     voltage for voltage, _ in sorted(AA_BATTERY_VOLTAGE_TO_PERCENTAGE)
 ]
-AA_BATTERY_VOLTAGE_MAP = {
-    voltage: percentage for voltage, percentage in AA_BATTERY_VOLTAGE_TO_PERCENTAGE
-}
+AA_BATTERY_VOLTAGE_MAP = dict(AA_BATTERY_VOLTAGE_TO_PERCENTAGE)
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 
@@ -100,9 +108,7 @@ class Lock:
         keyString: str,
         keyIndex: int,
         name: str,
-        state_callback: Callable[
-            [Iterable[LockStatus | DoorStatus | BatteryState]], None
-        ],
+        state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
     ) -> None:
@@ -150,9 +156,9 @@ class Lock:
                 ble_device_callback=self.ble_device_callback,
                 max_attempts=max_attempts,
             )
-        except (asyncio.TimeoutError, BleakError) as err:
+        except (TimeoutError, BleakError) as err:
             _LOGGER.error("%s: Failed to connect to the lock: %s", self.name, err)
-            raise err
+            raise
         _LOGGER.debug("%s: Connected", self.name)
 
         self.session = Session(
@@ -190,7 +196,7 @@ class Lock:
             error_desc = str(err).lower()
             if "invalid handle" in error_desc:
                 await self._handle_missing_characteristic(error_desc)
-            raise err
+            raise
         await self.session.start_notify()
 
     async def _handle_missing_characteristic(self, char_uuid: str) -> None:
@@ -204,33 +210,41 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
+    def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+        if state[0] == 0xBB:
+            if state[1] == Commands.LOCK_ACTIVITY.value:
+                return None  # Ignore lock activity as these are historical events
+            if state[1] == Commands.GETSTATUS.value:
+                if state[4] == StatusType.LOCK_ONLY.value:
+                    lock_status = state[0x08]
+                    return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
+                if state[4] == StatusType.DOOR_ONLY.value:
+                    door_status = state[0x08]
+                    return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
+                if state[4] == StatusType.DOOR_AND_LOCK.value:
+                    return self._parse_lock_and_door_state(state)
+                if state[4] == StatusType.BATTERY.value:
+                    return [self._parse_battery_state(state)]
+            elif (
+                state[1] == Commands.WRITESETTING.value
+                or state[1] == Commands.READSETTING.value
+            ):
+                if state[4] == SettingType.AUTOLOCK.value:
+                    return [self._parse_auto_lock_state(state)]
+        elif state[0] == 0xAA:
+            if state[1] == Commands.UNLOCK.value:
+                return [LockStatus.UNLOCKED]
+            if state[1] == Commands.LOCK.value:
+                return [LockStatus.LOCKED]
+        return None
+
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
-        if state[0] == 0xBB:
-            if state[4] == 0x02:  # lock only
-                lock_status = state[0x08]
-                self._state_callback(
-                    [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
-                )
-            elif state[4] == 0x2E:  # door state
-                door_status = state[0x08]
-                self._state_callback(
-                    [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
-                )
-            elif state[4] == 0x2F:  # door and lock
-                self._state_callback(self._parse_lock_and_door_state(state))
-            elif state[4] == 0x0F:
-                self._state_callback([self._parse_battery_state(state)])
-            else:
-                _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
-        elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                self._state_callback([LockStatus.UNLOCKED])
-            elif state[1] == Commands.LOCK.value:
-                self._state_callback([LockStatus.LOCKED])
-            else:
-                _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
+        if (parsed_state := self._parse_state(state)) is not None:
+            self._state_callback(parsed_state)
+        else:
+            _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
 
     async def _setup_session(self) -> None:
         """Setup the session."""
@@ -248,7 +262,8 @@ class Lock:
         )
         if response[0x00] != 0x02:
             raise AuthError(
-                "Authentication error: key or slot (key index) is incorrect: unexpected response to SEC_LOCK_TO_MOBILE_KEY_EXCHANGE: "
+                "Authentication error: key or slot (key index) is incorrect: "
+                "unexpected response to SEC_LOCK_TO_MOBILE_KEY_EXCHANGE: "
                 + response.hex()
             )
 
@@ -265,8 +280,8 @@ class Lock:
         response = await self.secure_session.execute(cmd, "SEC_INITIALIZATION_COMMAND")
         if response[0] != 0x04:
             raise AuthError(
-                "Authentication error: key or slot (key index) is incorrect: unexpected response to SEC_INITIALIZATION_COMMAND: "
-                + response.hex()
+                "Authentication error: key or slot (key index) is incorrect: "
+                "unexpected response to SEC_INITIALIZATION_COMMAND: " + response.hex()
             )
         self.session.set_key(session_key)
         self.secure_session.enable_cooldown()
@@ -324,6 +339,25 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
 
+    @raise_if_not_connected
+    async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
+        """Change the auto lock setting."""
+        _LOGGER.debug(
+            "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
+        )
+        assert self.session is not None  # nosec
+        if mode == AutoLockMode.OFF:
+            mode = AutoLockMode.INSTANT
+            duration = 0
+
+        cmd = self.session.build_operation_command(
+            Commands.WRITESETTING, SettingType.AUTOLOCK
+        )
+        util._copy(cmd, util._int_to_bytes(duration, 2), destLocation=0x08)
+        cmd[0x0A] = mode
+        await self.session.execute(cmd, "set_auto_lock")
+        _LOGGER.debug("%s: Finished setting auto lock", self.name)
+
     async def securemode(self) -> None:
         if (await self.lock_status()) != LockStatus.SECUREMODE:
             await self.force_securemode()
@@ -374,11 +408,26 @@ class Lock:
             )
         return door_status_enum
 
+    def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
+        """Parse the auto lock state from the response."""
+        duration = util._bytes_to_int(response[0x08:0x0A])
+        mode = VALUE_TO_AUTO_LOCK_MODE.get(response[0x0A], AutoLockMode.OFF)
+        if mode == AutoLockMode.OFF:
+            _LOGGER.info(
+                "%s: Unrecognized auto lock mode code: %s", self.name, hex(mode)
+            )
+        if mode == 0 and duration == 0:
+            # If both values are 0, auto lock is disabled
+            mode = AutoLockMode.OFF
+        return AutoLockState(mode, duration)
+
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
         _LOGGER.debug("%s: Executing lock_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
-        response = await self._execute_command(Commands.GETSTATUS, 0x02, "lock_status")
+        response = await self._execute_command(
+            Commands.GETSTATUS, StatusType.LOCK_ONLY, "lock_status"
+        )
         _LOGGER.debug("%s: Finished executing lock_status", self.name)
         return self._parse_lock_status(response[0x08])
 
@@ -386,13 +435,15 @@ class Lock:
     async def door_status(self) -> DoorStatus:
         _LOGGER.debug("%s: Executing door_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
-        response = await self._execute_command(Commands.GETSTATUS, 0x2E, "door_status")
+        response = await self._execute_command(
+            Commands.GETSTATUS, StatusType.DOOR_ONLY, "door_status"
+        )
         _LOGGER.debug("%s: Finished executing door_status", self.name)
         return self._parse_door_status(response[0x08])
 
     def _parse_battery_state(self, response: bytes) -> BatteryState:
         """Parse the battery state from the response."""
-        voltage = (response[0x09] * 256 + response[0x08]) / 1000
+        voltage = util._bytes_to_int(response[0x08:0x0A]) / 1000
         # The voltage is divided by 4 in the lock
         # since it uses 4 AA batteries. For the Li-ion
         # battery, this is likely wrong, but since we don't
@@ -404,9 +455,78 @@ class Lock:
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
         _LOGGER.debug("%s: Executing battery", self.name)
-        response = await self._execute_command(Commands.GETSTATUS, 0x0F, "battery")
+        response = await self._execute_command(
+            Commands.GETSTATUS, StatusType.BATTERY, "battery"
+        )
         _LOGGER.debug("%s: Finished executing battery", self.name)
         return self._parse_battery_state(response)
+
+    @raise_if_not_connected
+    async def auto_lock_status(self) -> AutoLockState:
+        _LOGGER.debug("%s: Executing auto_lock_status", self.name)
+        response = await self._execute_command(
+            Commands.READSETTING, SettingType.AUTOLOCK, "auto_lock_status"
+        )
+        _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
+        return self._parse_auto_lock_state(response)
+
+    def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
+        """Parse the unix timestamp to datetime from the bytes."""
+        _LOGGER.debug(
+            "%s: Parsing unix timestamp: %s", self.name, timestamp_bytes.hex()
+        )
+        unix_timestamp = int.from_bytes(timestamp_bytes, byteorder="little")
+        _LOGGER.debug("%s: Parsed unix timestamp: %d", self.name, unix_timestamp)
+        return datetime.fromtimestamp(unix_timestamp)
+
+    def _parse_lock_activity(
+        self, response: bytes
+    ) -> DoorActivity | LockActivity | None:
+        """Parse the lock activity from the response."""
+        # We only know a subset of lock activities currently
+        # response[0x04] seems to be the activity type
+        # the rest of the response is data for the activity,
+        # format seems to be specific to each individual activity type
+        activity_type = response[0x04]
+        _LOGGER.debug("%s: Activity type: 0x%02X", self.name, activity_type)
+        if activity_type == LockActivityType.NONE.value:
+            _LOGGER.debug("%s: No activity", self.name)
+            return None
+
+        if activity_type == LockActivityType.DOOR.value:
+            # Timestamp is at 0x05-0x08
+            # Door status is at 0x09
+            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
+            door_status = self._parse_door_status(response[0x09])
+            return DoorActivity(timestamp, door_status)
+        if activity_type == LockActivityType.LOCK.value:
+            # Timestamp is at 0x08-0x0B
+            # Lock status is at 0x06
+            timestamp = self._parse_unix_timestamp(response[0x08:0x0C])
+            lock_status = self._parse_lock_status(response[0x06])
+
+            return LockActivity(timestamp, lock_status)
+        if activity_type == LockActivityType.PIN.value:
+            # Timestamp is at 0x05-0x08
+            # Slot is at 0x10
+            # Lock status seems to be at lower half of 0x0C
+            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
+            pin_slot = response[0x10]
+            lock_status = self._parse_lock_status(response[0x0C] & 0x0F)
+
+            return LockActivity(timestamp, lock_status, pin_slot)
+        _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
+        return None
+
+    @raise_if_not_connected
+    async def lock_activity(self) -> DoorActivity | LockActivity | None:
+        _LOGGER.debug("%s: Executing lock_activity", self.name)
+        assert self.session is not None  # nosec
+        response = await self.session.execute(
+            self.session.build_command(Commands.LOCK_ACTIVITY.value), "lock_activity"
+        )
+        _LOGGER.debug("%s: Finished executing lock_activity", self.name)
+        return self._parse_lock_activity(response)
 
     async def disconnect(self) -> None:
         """Disconnect from the lock."""
@@ -444,7 +564,7 @@ class Lock:
         except (AuthError, DisconnectedError):
             # Lock already disconnected us
             return
-        except (BleakError, asyncio.TimeoutError, EOFError) as err:
+        except (TimeoutError, BleakError, EOFError) as err:
             if not util.is_disconnected_error(err):
                 _LOGGER.debug(
                     "%s: Failed to cleanly disconnect from lock: %s", self.name, err
@@ -456,7 +576,9 @@ class Lock:
             )
             return
         if response and response[0] != 0x8B:
-            _LOGGER.debug("%s: Unexpected response to DISCONNECT: %s", response.hex())
+            _LOGGER.debug(
+                "%s: Unexpected response to DISCONNECT: %s", self.name, response.hex()
+            )
 
     @property
     def is_connected(self) -> bool:
