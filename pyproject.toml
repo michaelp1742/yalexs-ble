@@ -1,6 +1,6 @@
 [project]
 name = "yalexs-ble"
-version = "3.1.0"
+version = "3.2.0"
 description = "Bluetooth control of Yale and August locks"
 authors = [{ name = "J. Nick Koston", email = "nick@koston.org" }]
 license = "GPL-3.0-only"
@@ -40,7 +40,7 @@ async-interrupt = ">=1.1.1"
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4"
 pytest-cov = "^6.2"
-pytest-asyncio = "^1.1.0"
+pytest-asyncio = "^1.2.0"
 
 [tool.semantic_release]
 branch = "main"
@@ -132,6 +132,7 @@ select = [
     "I",   # isort
     "RUF", # ruff specific
     "FLY", # flynt
+    "FURB", # refurb rules
     "G", # flake8-logging-format   ,
     "PERF", # Perflint
     "PGH", # pygrep-hooks
