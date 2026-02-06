@@ -1001,25 +1001,6 @@ class PushLock:
     def update_advertisement(
         self, ble_device: BLEDevice, ad: AdvertisementData
     ) -> None:
-
-        # ===== START OF NEW LOGGING CODE =====
-        mfr_data = ad.manufacturer_data
-        if mfr_data:
-            _LOGGER.info("=" * 80)
-            _LOGGER.info("%s: ADVERTISEMENT RECEIVED", self.name)
-            _LOGGER.info("%s: Address: %s, RSSI: %s", self.name, ble_device.address, ad.rssi)
-            for mfr_id, data in mfr_data.items():
-                _LOGGER.info(
-                    "%s: MFR_ID=%d (0x%04X) Length=%d", 
-                    self.name, mfr_id, mfr_id, len(data)
-                )
-                if data:
-                    hex_str = " ".join(f"{b:02X}" for b in data)
-                    _LOGGER.info("%s:   Data: %s", self.name, hex_str)
-                    _LOGGER.info("%s:   Hex:  %s", self.name, data.hex())
-            _LOGGER.info("=" * 80)
-        # ===== END OF NEW LOGGING CODE =====
-
         """Update the advertisement."""
         adv_debug_enabled = _ADV_LOGGER.isEnabledFor(logging.DEBUG)
         if self._local_name_is_unique and self._local_name == ad.local_name:
@@ -1063,57 +1044,11 @@ class PushLock:
                 # Encrypted data, we don't know how to decrypt it
                 # but we know its a state change so we schedule an update
                 next_update = HK_UPDATE_COALESCE_SECONDS
-
-            # PATCH: Fallback for HomeKit locks with static GSN
-            # If we took the HomeKit path but GSN didn't change, also check Yale data
-            if (
-                self._last_hk_state >= 0  # We have seen HomeKit data
-                and not next_update  # HomeKit didn't trigger an update
-                and YALE_MFR_ID in mfr_data
-                and len(mfr_data[YALE_MFR_ID]) >= 1
-            ):
-                yale_byte0 = mfr_data[YALE_MFR_ID][0]
-                if yale_byte0 in VALID_ADV_VALUES and yale_byte0 != self._last_adv_value:
-                    next_update = ADV_UPDATE_COALESCE_SECONDS
-                    _LOGGER.info(
-                        "%s: HomeKit GSN unchanged but Yale byte changed %s->%s, triggering update",
-                        self.name,
-                        self._last_adv_value,
-                        yale_byte0,
-                    )
-                self._last_adv_value = yale_byte0
-
         # Only track the single 0/1 value from the advertisement
         # as we can get an storm of metadata we don't know how to
         # decode that starts with b'\x00\x00' and will cause us to
         # connect over and over again when active scanning is enabled.
         # b'\x00\x00\x80\x15\xd0\x11\xf7\xa5\x43\x1f\x85\xd7\xff\x23\x5f\x1e\x75\x46'
-
-        # ===== ADD THIS LOGGING BLOCK HERE =====
-        is_first_advertisement = self._last_adv_value == -1
-        if YALE_MFR_ID in mfr_data:
-            yale_data = mfr_data[YALE_MFR_ID]
-            yale_len = len(yale_data)
-
-            _LOGGER.info(
-                "%s: Yale data: len=%d, first_adv=%s", 
-                self.name, yale_len, is_first_advertisement
-            )
-
-            # Log if this data will be FILTERED OUT
-            if yale_len != 1 and not is_first_advertisement:
-                _LOGGER.warning("*" * 80)
-                _LOGGER.warning(
-                    "%s: *** FILTERING OUT Yale data (len=%d, not first) ***", 
-                    self.name, yale_len
-                )
-                _LOGGER.warning("%s: *** FILTERED: %s", self.name, yale_data.hex())
-                if yale_len >= 18:
-                    _LOGGER.warning("%s: *** Byte 0: 0x%02X", self.name, yale_data[0])
-                    _LOGGER.warning("%s: *** Byte 1: 0x%02X", self.name, yale_data[1])
-                    _LOGGER.warning("%s: *** Last 16: %s", self.name, yale_data[-16:].hex())
-                _LOGGER.warning("*" * 80)
-        # ===== END OF LOGGING BLOCK =====
 
         is_first_advertisement = self._last_adv_value == -1
         now = time.monotonic()
