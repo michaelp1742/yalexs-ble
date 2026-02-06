@@ -107,6 +107,9 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 # How long to wait before retrying battery after a timeout (5 minutes)
 BATTERY_TIMEOUT_COOLDOWN = 300
 
+# How often to refresh battery state via 18-byte Yale advertisements (10 minutes)
+BATTERY_ADV_REFRESH_INTERVAL = 600.0
+
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
 # exclusions
 NO_BATTERY_SUPPORT_MODELS = {
@@ -308,6 +311,7 @@ class PushLock:
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._last_battery_adv_time = NEVER_TIME
 
     @property
     def local_name(self) -> str | None:
@@ -1103,9 +1107,24 @@ class PushLock:
         # ===== END OF LOGGING BLOCK =====
 
         is_first_advertisement = self._last_adv_value == -1
+        now = time.monotonic()
+        battery_adv_refresh_due = (
+            now - self._last_battery_adv_time
+        ) > BATTERY_ADV_REFRESH_INTERVAL
         if YALE_MFR_ID in mfr_data and (
-            len(mfr_data[YALE_MFR_ID]) == 1 or is_first_advertisement
+            len(mfr_data[YALE_MFR_ID]) == 1
+            or is_first_advertisement
+            or battery_adv_refresh_due
         ):
+            if battery_adv_refresh_due:
+                self._last_battery_adv_time = now
+                next_update = ADV_UPDATE_COALESCE_SECONDS
+                # Clear BatteryState from seen so it gets re-polled
+                self._seen_this_session.discard(BatteryState)
+                _LOGGER.debug(
+                    "%s: Allowing Yale advertisement for battery refresh",
+                    self.name,
+                )
             current_value = mfr_data[YALE_MFR_ID][0]
             if not next_update:
                 if is_first_advertisement:
