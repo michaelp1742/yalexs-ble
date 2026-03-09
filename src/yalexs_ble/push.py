@@ -88,6 +88,14 @@ HK_UPDATE_COALESCE_SECONDS = 0.025
 # How long to wait before processing a manual update request
 MANUAL_UPDATE_COALESCE_SECONDS = 0.05
 
+# BLE connection parameters for always-connected mode (battery saving)
+# After the initial sync, we switch to slow intervals to conserve battery.
+# Values are in BLE units: intervals in 1.25ms, timeout in 10ms.
+SLOW_MIN_INTERVAL = 800  # 1000ms
+SLOW_MAX_INTERVAL = 800  # 1000ms
+SLOW_LATENCY = 0
+SLOW_TIMEOUT = 600  # 6000ms
+
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
@@ -310,6 +318,7 @@ class PushLock:
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
+        self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
         self._last_battery_adv_time = NEVER_TIME
 
@@ -615,6 +624,7 @@ class PushLock:
             self._next_disconnect_delay = self._idle_disconnect_delay
             self._reset_disconnect_timer()
             self._seen_this_session.clear()
+            self._slow_params_set = False
             return self._client
 
     async def securemode(self) -> None:
@@ -867,6 +877,25 @@ class PushLock:
 
         return state, True
 
+    async def _probe_lock_info(self, lock: Lock) -> LockInfo:
+        """Probe the lock for info, falling back to defaults on failure."""
+        try:
+            lock_info = await lock.lock_info()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.warning(
+                "%s: Failed to probe lock info (%s), continuing with defaults",
+                self.name,
+                err,
+            )
+            lock_info = LockInfo(
+                manufacturer="Unknown",
+                model="",
+                serial=self.address,
+                firmware="Unknown",
+            )
+        _LOGGER.debug("Obtained lock info: %s", lock_info)
+        return lock_info
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -878,8 +907,7 @@ class PushLock:
         )
         lock = await self._ensure_connected()
         if not self._lock_info:
-            self._lock_info = await lock.lock_info()
-            _LOGGER.debug("Obtained lock info: %s", self._lock_info)
+            self._lock_info = await self._probe_lock_info(lock)
         # Asking for battery first seems to be reduce the chance of the lock
         # getting into a bad state.
         state = self._get_current_state()
@@ -972,10 +1000,32 @@ class PushLock:
             self._next_disconnect_delay = FIRST_CONNECTION_DISCONNECT_TIME
             self._reset_disconnect_timer()
 
+        if self._always_connected and made_request:
+            await self._set_slow_connection_params(lock)
+
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
         return state
+
+    async def _set_slow_connection_params(self, lock: Lock) -> None:
+        """Set slow BLE connection parameters to conserve battery."""
+        if self._slow_params_set:
+            return
+        client = lock.client
+        if client is None:
+            return
+        try:
+            await client.set_connection_params(
+                SLOW_MIN_INTERVAL, SLOW_MAX_INTERVAL, SLOW_LATENCY, SLOW_TIMEOUT
+            )
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "%s: Failed to set connection parameters", self.name, exc_info=True
+            )
+        else:
+            self._slow_params_set = True
+            _LOGGER.debug("%s: Set slow connection parameters", self.name)
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""

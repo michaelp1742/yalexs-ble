@@ -18,6 +18,10 @@ from yalexs_ble.const import (
 from yalexs_ble.push import (
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
+    SLOW_LATENCY,
+    SLOW_MAX_INTERVAL,
+    SLOW_MIN_INTERVAL,
+    SLOW_TIMEOUT,
     PushLock,
     operation_lock,
     retry_bluetooth_connection_error,
@@ -481,3 +485,241 @@ async def test_update_preserves_notify_state_from_cache() -> None:
         assert final_state.door == DoorStatus.CLOSED, (
             f"Door status should be CLOSED from cache, got {final_state.door}"
         )
+
+
+@pytest.mark.asyncio
+async def test_update_continues_when_lock_info_probe_fails() -> None:
+    """Test that _update() proceeds with defaults when lock_info() raises."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(side_effect=TimeoutError("probe timed out"))
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        final_state = await push_lock._update()
+
+    # lock_info was attempted
+    mock_lock.lock_info.assert_called_once()
+
+    # Update still completed with real data
+    assert final_state.lock == LockStatus.LOCKED
+
+    # door_status not called because model="" makes door_sense=False
+    mock_lock.door_status.assert_not_called()
+    assert final_state.door == DoorStatus.UNKNOWN
+
+    # Defaults were used for lock_info, serial falls back to MAC address
+    assert push_lock._lock_info is not None
+    assert push_lock._lock_info.model == ""
+    assert push_lock._lock_info.serial == "aa:bb:cc:dd:ee:ff"
+    assert push_lock._lock_info.door_sense is False
+
+
+@pytest.mark.asyncio
+async def test_update_continues_when_lock_info_probe_bleak_error() -> None:
+    """Test that _update() proceeds with defaults when lock_info() raises BleakError."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(
+        side_effect=BleakError("connection dropped during probe")
+    )
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        final_state = await push_lock._update()
+
+    assert final_state.lock == LockStatus.LOCKED
+    assert push_lock._lock_info is not None
+    assert push_lock._lock_info.manufacturer == "Unknown"
+    assert push_lock._lock_info.serial == "aa:bb:cc:dd:ee:ff"
+    assert push_lock._lock_info.door_sense is False
+
+
+@pytest.mark.asyncio
+async def test_update_sets_slow_connection_params_when_always_connected():
+    """Test _update() sets slow BLE connection params when always connected."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_client = MagicMock()
+    mock_client.set_connection_params = AsyncMock()
+
+    mock_lock = MagicMock()
+    mock_lock.client = mock_client
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+
+    mock_client.set_connection_params.assert_called_once_with(
+        SLOW_MIN_INTERVAL, SLOW_MAX_INTERVAL, SLOW_LATENCY, SLOW_TIMEOUT
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_set_connection_params_when_not_always_connected():
+    """Test _update() skips connection params when not always connected."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_client = MagicMock()
+    mock_client.set_connection_params = AsyncMock()
+
+    mock_lock = MagicMock()
+    mock_lock.client = mock_client
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+
+    mock_client.set_connection_params.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_handles_connection_params_failure():
+    """Test that _update() continues even if set_connection_params fails."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_client = MagicMock()
+    mock_client.set_connection_params = AsyncMock(
+        side_effect=BleakError("Failed to set params")
+    )
+
+    mock_lock = MagicMock()
+    mock_lock.client = mock_client
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        # Should NOT raise even though set_connection_params failed
+        final_state = await push_lock._update()
+
+    assert final_state.lock == LockStatus.LOCKED
+    mock_client.set_connection_params.assert_called_once()
