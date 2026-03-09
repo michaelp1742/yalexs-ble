@@ -321,6 +321,7 @@ class PushLock:
         self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
         self._last_battery_adv_time = NEVER_TIME
+        self._diag_yale_byte0 = -1
 
     @property
     def local_name(self) -> str | None:
@@ -1075,6 +1076,18 @@ class PushLock:
         self.set_advertisement_data(ad)
         next_update = 0.0
         mfr_data = ad.manufacturer_data
+        # --- diagnostic: log 1-byte Yale adv state changes ---
+        if YALE_MFR_ID in mfr_data and len(mfr_data[YALE_MFR_ID]) == 1:
+            adv_value = mfr_data[YALE_MFR_ID][0]
+            if adv_value != self._diag_yale_byte0:
+                _LOGGER.info(
+                    "%s: Yale 1-byte adv changed: 0x%02X -> 0x%02X",
+                    self.name,
+                    self._diag_yale_byte0,
+                    adv_value,
+                )
+            self._diag_yale_byte0 = adv_value
+        # --- end diagnostic ---
         if APPLE_MFR_ID in mfr_data:
             first_byte = mfr_data[APPLE_MFR_ID][0]
             if first_byte == HAP_FIRST_BYTE:
