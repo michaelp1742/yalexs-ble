@@ -116,7 +116,7 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 BATTERY_TIMEOUT_COOLDOWN = 300
 
 # How often to re-poll battery state in always_connected mode (10 minutes)
-BATTERY_REFRESH_INTERVAL = 600.0
+BATTERY_REFRESH_INTERVAL = 600
 
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
 # exclusions
