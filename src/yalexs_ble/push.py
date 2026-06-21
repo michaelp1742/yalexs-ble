@@ -54,7 +54,9 @@ _ADV_LOGGER = logging.getLogger("yalexs_ble_adv")
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
-NEVER_TIME = -86400.0
+# A monotonic timestamp ~one day in the past, used as a "never happened /
+# no deadline" sentinel. Makes no assumption about the clock's epoch.
+NEVER_TIME = time.monotonic() - 86400.0
 
 DEFAULT_ATTEMPTS = 4
 
@@ -319,8 +321,10 @@ class PushLock:
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._slow_params_set = False
-        self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
-        self._last_battery_refresh_time = NEVER_TIME
+        # Earliest next battery poll attempt (cooldown)
+        self._earliest_battery_attempt_time = NEVER_TIME
+        # Scheduled battery refresh time (in always_connected mode)
+        self._next_battery_refresh_time = NEVER_TIME
 
     @property
     def local_name(self) -> str | None:
@@ -833,21 +837,42 @@ class PushLock:
     async def _poll_battery(
         self, lock: Lock, state: LockState
     ) -> tuple[LockState, bool]:
-        """Poll battery status with timeout handling and cooldown.
+        """Poll battery if needed: periodic refresh, timeout cooldown, errors.
+
+        Battery state requires a poll of the lock to update. In always_connected mode
+        _seen_this_session never clears, so once the refresh deadline passes
+        BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
 
         Returns tuple of (updated_state, made_request).
         """
-        # Check battery timeout cooldown
-        now = time.monotonic()
-        battery_on_cooldown = now < self._next_battery_attempt_time
+        assert self._lock_info is not None  # nosec
+        if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
+            _LOGGER.debug(
+                "%s: Needs battery workaround model %s",
+                self.name,
+                self._lock_info.model,
+            )
+            return state, False
 
-        if battery_on_cooldown:
+        now = time.monotonic()
+        # Skip while in cooldown after a prior battery timeout.
+        if now < self._earliest_battery_attempt_time:
             _LOGGER.debug(
                 "%s: Skipping battery request due to recent timeout "
                 "(cooldown until %.1fs)",
                 self.name,
-                self._next_battery_attempt_time - now,
+                self._earliest_battery_attempt_time - now,
             )
+            return state, False
+
+        # Periodic refresh: evict BatteryState once its deadline has passed.
+        if (
+            self._always_connected
+            and BatteryState in self._seen_this_session
+            and now > self._next_battery_refresh_time
+        ):
+            self._seen_this_session.discard(BatteryState)
+        if BatteryState in self._seen_this_session:
             return state, False
 
         try:
@@ -856,8 +881,9 @@ class PushLock:
             state = replace(
                 state, battery=battery_state, auth=AuthState(successful=True)
             )
-            # Reset cooldown on success
-            self._next_battery_attempt_time = NEVER_TIME
+            # Success: disable cooldown and schedule the next refresh.
+            self._earliest_battery_attempt_time = NEVER_TIME
+            self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
         except TimeoutError as err:
             _LOGGER.info(
                 "%s: Battery request timed out (%s), will retry in %d "
@@ -866,8 +892,8 @@ class PushLock:
                 err,
                 BATTERY_TIMEOUT_COOLDOWN,
             )
-            # Set cooldown to prevent repeated timeouts
-            self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            # Set cooldown to prevent repeated timeouts.
+            self._earliest_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
         except (BleakError, BleakDBusError) as err:
             _LOGGER.debug(
                 "%s: Battery request failed (%s), continuing with other updates.",
@@ -896,36 +922,6 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
-    async def _maybe_poll_battery(
-        self, lock: Lock, state: LockState, made_request: bool, lock_info: LockInfo
-    ) -> tuple[LockState, bool]:
-        """Poll battery if needed, with periodic refresh in always_connected mode."""
-        needs_battery_workaround = lock_info.model in NO_BATTERY_SUPPORT_MODELS
-        _LOGGER.debug(
-            "Needs battery workaround model %s: %s",
-            lock_info.model,
-            needs_battery_workaround,
-        )
-        # In always_connected mode _seen_this_session never clears, so
-        # periodically evict BatteryState to force a re-poll.
-        if (
-            self._always_connected
-            and BatteryState in self._seen_this_session
-            and time.monotonic() - self._last_battery_refresh_time
-            > BATTERY_REFRESH_INTERVAL
-        ):
-            self._seen_this_session.discard(BatteryState)
-            self._last_battery_refresh_time = time.monotonic()
-            _LOGGER.debug(
-                "%s: Battery refresh due, will re-poll on this update",
-                self.name,
-            )
-        if not needs_battery_workaround and BatteryState not in self._seen_this_session:
-            state, battery_requested = await self._poll_battery(lock, state)
-            if battery_requested:
-                made_request = True
-        return state, made_request
-
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -943,9 +939,9 @@ class PushLock:
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        state, made_request = await self._maybe_poll_battery(
-            lock, state, made_request, self._lock_info
-        )
+        state, battery_requested = await self._poll_battery(lock, state)
+        if battery_requested:
+            made_request = True
 
         if (
             DoorStatus not in self._seen_this_session

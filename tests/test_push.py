@@ -28,6 +28,15 @@ from yalexs_ble.push import (
     retry_bluetooth_connection_error,
 )
 
+# Shared battery-supporting lock used across tests. model is NOT in
+# NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
+TEST_LOCK_INFO = LockInfo(
+    manufacturer="August",
+    model="ASL-03",
+    serial="12345",
+    firmware="2.0.0",
+)
+
 
 @pytest.mark.asyncio
 async def test_operation_lock():
@@ -185,14 +194,7 @@ async def test_update_continues_after_battery_timeout():
 
     # Mock lock that times out on battery()
     mock_lock = MagicMock()
-    mock_lock.lock_info = AsyncMock(
-        return_value=LockInfo(
-            manufacturer="August",
-            model="ASL-03",
-            serial="12345",
-            firmware="2.0.0",
-        )
-    )
+    mock_lock.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
 
     # Battery times out
     mock_lock.battery = AsyncMock(side_effect=TimeoutError("Battery timeout"))
@@ -204,12 +206,7 @@ async def test_update_continues_after_battery_timeout():
     )
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
 
     # Mock advertisement_data for connection_info
@@ -253,9 +250,10 @@ async def test_poll_battery_cooldown_skip():
         always_connected=False,
     )
     push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
 
     # Set cooldown to 5 seconds in the future
-    push_lock._next_battery_attempt_time = time.monotonic() + 5.0
+    push_lock._earliest_battery_attempt_time = time.monotonic() + 5.0
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
@@ -289,9 +287,10 @@ async def test_poll_battery_success():
         always_connected=False,
     )
     push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
 
     # Set cooldown to simulate previous timeout
-    push_lock._next_battery_attempt_time = time.monotonic() + 100.0
+    push_lock._earliest_battery_attempt_time = time.monotonic() + 100.0
 
     mock_lock = MagicMock()
     battery_state = BatteryState(voltage=6.0, percentage=80)
@@ -308,7 +307,7 @@ async def test_poll_battery_success():
 
     # Call _poll_battery (cooldown should be ignored since it's in the future)
     # Wait a moment to ensure cooldown expires
-    push_lock._next_battery_attempt_time = NEVER_TIME
+    push_lock._earliest_battery_attempt_time = NEVER_TIME
 
     result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
 
@@ -322,7 +321,7 @@ async def test_poll_battery_success():
     assert result_state.auth.successful is True
 
     # Cooldown should be reset to NEVER_TIME
-    assert push_lock._next_battery_attempt_time == NEVER_TIME
+    assert push_lock._earliest_battery_attempt_time == NEVER_TIME
 
 
 @pytest.mark.asyncio
@@ -335,6 +334,7 @@ async def test_poll_battery_bleak_error():
         always_connected=False,
     )
     push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock(side_effect=BleakError("Connection failed"))
@@ -359,7 +359,7 @@ async def test_poll_battery_bleak_error():
     assert result_state == initial_state
 
     # Cooldown should NOT be set (only TimeoutError sets cooldown)
-    assert push_lock._next_battery_attempt_time == NEVER_TIME
+    assert push_lock._earliest_battery_attempt_time == NEVER_TIME
 
 
 @pytest.mark.asyncio
@@ -372,6 +372,7 @@ async def test_poll_battery_bleak_dbus_error():
         always_connected=False,
     )
     push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock(
@@ -398,7 +399,7 @@ async def test_poll_battery_bleak_dbus_error():
     assert result_state == initial_state
 
     # Cooldown should NOT be set (only TimeoutError sets cooldown)
-    assert push_lock._next_battery_attempt_time == NEVER_TIME
+    assert push_lock._earliest_battery_attempt_time == NEVER_TIME
 
 
 @pytest.mark.asyncio
@@ -606,12 +607,7 @@ async def test_update_sets_slow_connection_params_when_always_connected():
         return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
     )
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
         service_data={},
@@ -654,12 +650,7 @@ async def test_update_does_not_set_connection_params_when_not_always_connected()
         return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
     )
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
         service_data={},
@@ -702,12 +693,7 @@ async def test_update_handles_connection_params_failure():
         return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
     )
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
         service_data={},
@@ -750,12 +736,7 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
         service_data={},
@@ -770,10 +751,8 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
     # Simulate battery already polled this session
     push_lock._seen_this_session.add(BatteryState)
 
-    # Set refresh time far enough in the past to trigger
-    push_lock._last_battery_refresh_time = (
-        time.monotonic() - BATTERY_REFRESH_INTERVAL - 1.0
-    )
+    # Set the refresh deadline in the past so a refresh is due
+    push_lock._next_battery_refresh_time = time.monotonic() - 1.0
     before_update = time.monotonic()
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
@@ -782,8 +761,10 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
     # Battery should have been re-polled
     mock_lock.battery.assert_called_once()
     assert final_state.battery == battery_state
-    # Timestamp should have been refreshed so the next cycle waits a full interval
-    assert push_lock._last_battery_refresh_time >= before_update
+    # Deadline should have been pushed out a full interval from the poll
+    assert (
+        push_lock._next_battery_refresh_time >= before_update + BATTERY_REFRESH_INTERVAL
+    )
 
 
 @pytest.mark.asyncio
@@ -808,12 +789,7 @@ async def test_battery_refresh_not_due_skips_repoll():
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
         service_data={},
@@ -828,8 +804,8 @@ async def test_battery_refresh_not_due_skips_repoll():
     # Simulate battery already polled this session
     push_lock._seen_this_session.add(BatteryState)
 
-    # Set refresh time to just now — interval not elapsed
-    push_lock._last_battery_refresh_time = time.monotonic()
+    # Set the refresh deadline in the future — not yet due
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
         await push_lock._update()
@@ -861,12 +837,7 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
 
-    push_lock._lock_info = LockInfo(
-        manufacturer="August",
-        model="ASL-03",
-        serial="12345",
-        firmware="2.0.0",
-    )
+    push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
         service_data={},
@@ -878,11 +849,10 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
     )
     push_lock._running = True
 
-    # Simulate battery already seen and interval well elapsed
+    # Simulate battery already seen and a refresh deadline in the past
     push_lock._seen_this_session.add(BatteryState)
-    push_lock._last_battery_refresh_time = (
-        time.monotonic() - BATTERY_REFRESH_INTERVAL - 1.0
-    )
+    refresh_deadline = time.monotonic() - 1.0
+    push_lock._next_battery_refresh_time = refresh_deadline
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
         await push_lock._update()
@@ -890,8 +860,49 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
     # Refresh block should not have fired — battery skipped because it is
     # in _seen_this_session and always_connected is False
     mock_lock.battery.assert_not_called()
-    # Timestamp must not have been touched
-    assert (
-        push_lock._last_battery_refresh_time
-        < time.monotonic() - BATTERY_REFRESH_INTERVAL
+    # Deadline must not have been touched
+    assert push_lock._next_battery_refresh_time == refresh_deadline
+
+
+@pytest.mark.asyncio
+async def test_battery_refresh_due_but_on_cooldown_does_not_evict():
+    """A refresh that comes due while the battery cooldown is active must not
+    evict BatteryState or poll early. The cooldown gate precedes eviction, so
+    BatteryState stays in _seen_this_session and the deadline is untouched until
+    a later cycle (after cooldown) can actually re-poll — never an early poll."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
     )
+    push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+
+    initial_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    # Battery already polled this session and the refresh is due...
+    push_lock._seen_this_session.add(BatteryState)
+    refresh_deadline = time.monotonic() - 1.0
+    push_lock._next_battery_refresh_time = refresh_deadline
+    # ...but a prior timeout left the battery cooldown active.
+    push_lock._earliest_battery_attempt_time = time.monotonic() + 100.0
+
+    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+
+    # Cooldown gate wins: no poll, no eviction, deadline untouched.
+    assert made_request is False
+    mock_lock.battery.assert_not_called()
+    assert BatteryState in push_lock._seen_this_session
+    assert push_lock._next_battery_refresh_time == refresh_deadline
+    assert result_state == initial_state
