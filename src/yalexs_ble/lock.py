@@ -196,6 +196,8 @@ class Lock:
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
         write_success_callback: Callable[[], None] | None = None,
+        ack_callback: Callable[[], None] | None = None,
+        op_response_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -212,6 +214,16 @@ class Lock:
         # ATT write response) -- the consumer's single state-action moment:
         # the command verifiably reached the lock's stack.
         self._write_success_callback = write_success_callback
+        # Invoked when an operation acknowledgement (0xAA echoing LOCK/UNLOCK) is
+        # parsed, so the consumer can timestamp it. The acknowledgement is consumed
+        # mid-wait by the session's typed matcher and never surfaces as a return
+        # value, so this hook is the only way to observe it.
+        self._ack_callback = ack_callback
+        # Invoked when a LOCK/UNLOCK op-response (0xBB) is parsed, success or
+        # failure, solicited or not. An operation started at the lock, in the
+        # app, or by auto-lock produces no command or acknowledgement on our
+        # side, so this is the only signal that a lock operation just finished.
+        self._op_response_callback = op_response_callback
         # byte[15] of the most recent op-response: 0x00 success, non-zero =
         # OperationError enum value (MECH_* = jam). None until the first op.
         # Retained so a follow-up can expose the failure reason as a
@@ -313,6 +325,8 @@ class Lock:
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
                 and len(state) > 0x0F
             ):
+                if self._op_response_callback is not None:
+                    self._op_response_callback()
                 result = state[0x0F]
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
@@ -345,10 +359,12 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
+                # Operation acknowledgement: it echoes the request type and
+                # carries no result nor resultant state
+                if self._ack_callback is not None:
+                    self._ack_callback()
+                return ()
             if state[1] in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,

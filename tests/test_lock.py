@@ -326,13 +326,72 @@ def test_parse_bogus_frame_is_none_and_logs_unknown(
     assert "Unknown state" in caplog.text
 
 
-def test_parse_ack_still_reports_state() -> None:
-    """The AA transport-ack path is unchanged by the op-response decode."""
-    lock = _make_lock()
+def test_parse_operation_ack_reports_no_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Operation acks (0xAA LOCK/UNLOCK) are recognized but carry no state.
 
-    result = lock._parse_state(bytes.fromhex("aa0b00490000000000000000000000000200"))
-    assert result is not None
-    assert list(result) == [LockStatus.LOCKED]
+    They echo the request type with no result, so a securemode request (the
+    0x0B Lock echo) used to display a false LOCKED. State now comes from the
+    op-response; the ack is recognized (empty iterable), emits nothing, and
+    must not surface as an unknown frame.
+    """
+    states: list[list[LockStateValue]] = []
+    lock = _make_lock(lambda s: states.append(list(s)))
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        for frame_hex in (
+            "aa0b00490000000000000000000000000200",
+            "aa0a004a0000000000000000000000000200",
+        ):
+            frame = bytes.fromhex(frame_hex)
+            result = lock._parse_state(frame)
+            assert result is not None
+            assert list(result) == []
+            lock._internal_state_callback(frame)
+
+    assert states == []  # the state callback was never invoked
+    assert "Unknown state" not in caplog.text
+
+
+def test_ack_and_op_response_callbacks_fire() -> None:
+    """ack_callback fires per operation ack; op_response_callback per op-response.
+
+    The op-response hook fires for both a success and a failure result,
+    independent of whatever state the parse emits.
+    """
+    ack_calls: list[int] = []
+    op_calls: list[int] = []
+    lock = _make_lock(
+        ack_callback=lambda: ack_calls.append(1),
+        op_response_callback=lambda: op_calls.append(1),
+    )
+
+    # Each operation ack fires ack_callback exactly once and emits no state.
+    lock_ack = lock._parse_state(bytes.fromhex("aa0b00490000000000000000000000000200"))
+    unlock_ack = lock._parse_state(
+        bytes.fromhex("aa0a004a0000000000000000000000000200")
+    )
+
+    assert lock_ack is not None
+    assert unlock_ack is not None
+    assert list(lock_ack) == []
+    assert list(unlock_ack) == []
+    assert ack_calls == [1, 1]
+    assert op_calls == []  # acks are not op-responses
+
+    # A success op-response (byte[15]=0x00) and a failure one (byte[15]=0x1F)
+    # both stamp op_response_callback, regardless of the emitted state.
+    success = lock._parse_state(bytes.fromhex("bb0a003b0000000000000000000000000000"))
+    failure = lock._parse_state(bytes.fromhex("bb0a001c00000000000000000000001f0000"))
+
+    assert op_calls == [1, 1]
+    assert success is not None
+    assert failure is not None
+    assert list(success) == []
+    assert list(failure) == [LockStatus.JAMMED]
+    # The op-responses did not spuriously fire the ack hook.
+    assert ack_calls == [1, 1]
 
 
 def test_internal_state_callback_emits_recognized_state() -> None:
@@ -383,6 +442,9 @@ def test_operation_response_matcher_matches_only_its_opcode() -> None:
 
 def _make_lock(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
+    *,
+    ack_callback: Callable[[], None] | None = None,
+    op_response_callback: Callable[[], None] | None = None,
 ) -> Lock:
     return Lock(
         lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
@@ -390,6 +452,8 @@ def _make_lock(
         1,
         "mylock",
         state_callback,
+        ack_callback=ack_callback,
+        op_response_callback=op_response_callback,
     )
 
 
