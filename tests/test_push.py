@@ -29,11 +29,13 @@ from yalexs_ble.push import (
     AUTO_LOCK_READ_RESPONSE_TIMEOUT,
     AUTO_LOCK_WRITE_ATTEMPTS,
     BATTERY_REFRESH_INTERVAL,
+    BATTERY_TIMEOUT_COOLDOWN,
     DEFAULT_ATTEMPTS,
     JAMMED_HOLD_TIME,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     POST_OP_RESPONSE_DEBOUNCE_DELAY,
+    POST_OPERATION_BATTERY_COOLDOWN,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
@@ -3021,3 +3023,81 @@ async def test_execute_operation_restamps_start_anchor_per_attempt():
     assert len(start_stamps) == 2
     assert start_stamps[1] > start_stamps[0]
     assert push_lock._last_lock_operation_start_time == start_stamps[1]
+
+
+# ---------------------------------------------------------------------------
+# Defer battery polls past the post-operation voltage sag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [True, False], ids=["success", "jam"])
+async def test_operation_defers_battery_poll_past_voltage_sag(outcome):
+    """Both operation outcomes (success and jam) arm the post-op battery
+    cooldown; _poll_battery then skips within the window and polls past it."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:38")
+    # Base "now" past NEVER_TIME so the cooldown arithmetic is not masked by the
+    # NEVER_TIME sentinel default of _earliest_battery_attempt_time.
+    base = NEVER_TIME + 90000.0
+
+    async def force_lock():
+        push_lock._operation_write_success()
+        return outcome
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.time.monotonic", return_value=base),
+    ):
+        await push_lock.lock()
+
+    # The operation armed the post-op cooldown regardless of outcome.
+    assert push_lock._earliest_battery_attempt_time == (
+        base + POST_OPERATION_BATTERY_COOLDOWN
+    )
+    # Drop the RESYNC poll the state change scheduled; this test drives
+    # _poll_battery directly.
+    push_lock._cancel_future_update()
+
+    state = _known_state(LockStatus.LOCKED)
+    # Inside the cooldown window: the poll is skipped (would sample the sag).
+    with patch("yalexs_ble.push.time.monotonic", return_value=base + 29.0):
+        _, made_request = await push_lock._poll_battery(mock_lock, state)
+    assert made_request is False
+    mock_lock.battery.assert_not_called()
+
+    # Past the window: the poll proceeds.
+    with patch("yalexs_ble.push.time.monotonic", return_value=base + 31.0):
+        _, made_request = await push_lock._poll_battery(mock_lock, state)
+    assert made_request is True
+    mock_lock.battery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_operation_does_not_shorten_a_longer_battery_cooldown():
+    """A live battery-timeout cooldown further out than the 30 s post-op window
+    is preserved (max), never shortened by an operation."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    base = NEVER_TIME + 90000.0
+    # A battery timeout already set a cooldown far past the post-op window.
+    longer_cooldown = base + BATTERY_TIMEOUT_COOLDOWN
+    push_lock._earliest_battery_attempt_time = longer_cooldown
+
+    async def force_lock():
+        push_lock._operation_write_success()
+        return True
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.time.monotonic", return_value=base),
+    ):
+        await push_lock.lock()
+
+    # max() keeps the longer live cooldown; base + 30 would have shortened it.
+    assert push_lock._earliest_battery_attempt_time == longer_cooldown
