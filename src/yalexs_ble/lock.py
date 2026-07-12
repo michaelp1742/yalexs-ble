@@ -44,11 +44,33 @@ from .const import (
     StatusType,
 )
 from .secure_session import SecureSession
-from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+from .session import (
+    AuthError,
+    DisconnectedError,
+    OperationIncompleteError,
+    OperationProgress,
+    ResponseError,
+    Session,
+    UnlatchError,
+    YaleXSBLEError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+
+# Budget of 12 s for the op-response, anchored at the command write like the
+# acknowledgement budget; observed op-responses land 0.75-3 s after the command.
+# Unlatch is the longest operation (retract the deadbolt, hold the spring
+# latch, timed release), has no field data, default 20 s budget instead.
+OPERATION_RESPONSE_TIMEOUT = 12.0
+UNLATCH_OPERATION_RESPONSE_TIMEOUT = 20.0
+
+# byte[4] of an Unlock command: 0x0A turns the plain unlock into an unlatch
+# (retract the latch). Same opcode+optype mechanism securemode uses on the
+# Lock opcode (0x04).
+UNLATCH_OPERATION_BYTE = 0x0A
+SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -130,6 +152,40 @@ def _settings_response_matcher(
     return matches
 
 
+def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
+    """Match the acknowledgement of the written command.
+
+    The acknowledgement echoes the request: 0xAA, the written opcode in
+    byte[1], and the command's operation byte in byte[4] (plain operations
+    carry 0x00 there, securemode 0x04, unlatch 0x0A). Any other frame is not
+    this command's acknowledgement; it stays on the state-callback path and
+    the wait continues.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return (
+            len(data) > 0x04
+            and data[0] == 0xAA
+            and data[1] == opcode
+            and data[4] == operation_byte
+        )
+
+    return _matches
+
+
+def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match the op-response that completes a mechanical operation.
+
+    The op-response (0xBB + the sent opcode) is emitted when the motor stops
+    and carries the operation result in byte[15].
+    """
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x0F and data[0] == 0xBB and data[1] == opcode
+
+    return _matches
+
+
 class Lock:
     def __init__(
         self,
@@ -140,6 +196,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -152,6 +209,10 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # Fired the moment a mechanical command's GATT write completes (the
+        # ATT write response) -- the consumer's single state-action moment:
+        # the command verifiably reached the lock's stack.
+        self._write_success_callback = write_success_callback
         # byte[15] of the most recent op-response: 0x00 success, non-zero =
         # OperationError enum value (MECH_* = jam). None until the first op.
         # Retained so a follow-up can expose the failure reason as a
@@ -409,36 +470,111 @@ class Lock:
         )
         return self._lock_info
 
+    async def _execute_operation_command(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
+        progress: OperationProgress | None = None,
+    ) -> bool:
+        """Run a mechanical operation; True = byte[15] reported success.
+
+        Completes only on the operation's own op-response (or an error): the
+        staged session wait accepts the acknowledgement that echoes this
+        command (opcode + operation byte) and then only the 0xBB op-response
+        with the same opcode. The matcher values are captured from the command
+        bytes here, BEFORE the session encrypts the buffer in place.
+        """
+        assert self.session is not None  # nosec
+        opcode = command[0x01]
+        operation_byte = command[0x04]
+        if progress is None:
+            progress = OperationProgress()
+        response = await self.session.execute_operation(
+            command,
+            command_name,
+            ack_matcher=_ack_matcher(opcode, operation_byte),
+            response_matcher=_operation_response_matcher(opcode),
+            response_timeout=response_timeout,
+            progress=progress,
+            write_success_callback=self._write_success_callback,
+        )
+        return response[0x0F] == OperationError.COMM_SUCCESS
+
     @raise_if_not_connected
-    async def force_securemode(self) -> None:
+    async def force_securemode(self) -> bool:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
+        result = await self._execute_operation_command(
+            self.session.build_operation_command(
+                Commands.LOCK, SECUREMODE_OPERATION_BYTE
+            ),
             "force_securemode",
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
+        return result
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
+    async def force_lock(self) -> bool:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
+        result = await self._execute_operation_command(
             self.session.build_command(Commands.LOCK), "force_lock"
         )
         _LOGGER.debug("%s: Finished locking", self.name)
+        return result
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
+    async def force_unlock(self) -> bool:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
+        result = await self._execute_operation_command(
             self.session.build_command(Commands.UNLOCK), "force_unlock"
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
+        return result
+
+    @raise_if_not_connected
+    async def force_unlatch(self) -> bool:
+        """Force the lock to unlatch (momentary "open door" / retract the latch).
+
+        The Unlock opcode with operation byte 0x0A (there is no dedicated
+        unlatch opcode); its op-response is a normal Unlock (0xBB 0A) frame.
+        Support is advertised via LockInfo.can_open.
+
+        A repeated unlatch fires the latch again -- the door opens again -- so
+        once the command write has succeeded NO failure may re-send it: any
+        retryable failure after the write converts to the non-retryable
+        UnlatchError. Failures before the write stay retryable.
+        """
+        _LOGGER.debug("%s: Unlatching", self.name)
+        assert self.session is not None  # nosec
+        progress = OperationProgress()
+        try:
+            result = await self._execute_operation_command(
+                self.session.build_operation_command(
+                    Commands.UNLOCK, UNLATCH_OPERATION_BYTE
+                ),
+                "force_unlatch",
+                response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+                progress=progress,
+            )
+        except OperationIncompleteError:
+            # Already non-retryable: the result never arrived.
+            raise
+        except (TimeoutError, DisconnectedError, ResponseError, BleakError) as err:
+            if progress.command_written:
+                raise UnlatchError(
+                    f"{self.name}: Unlatch failed after the command was "
+                    "written; not retried because a repeated unlatch fires "
+                    "the latch again"
+                ) from err
+            raise
+        _LOGGER.debug("%s: Finished unlatching", self.name)
+        return result
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -491,6 +627,12 @@ class Lock:
     async def unlock(self) -> None:
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        # Unlatch is a momentary "open door" action, not a steady state, so it
+        # always fires (lock/unlock short-circuit when already in the target
+        # state; there is no "unlatched" steady state to test).
+        await self.force_unlatch()
 
     async def _execute_command(
         self, opcode: int, cmd_byte: int, command_name: str

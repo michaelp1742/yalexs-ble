@@ -722,7 +722,7 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
-            await getattr(lock, op_attr)()
+            success = await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
             # The retry_bluetooth_connection_error wrapper calls
@@ -735,8 +735,15 @@ class PushLock:
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        if success:
+            self._update_any_state([complete_state])
+            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        else:
+            _LOGGER.debug(
+                "%s: %s did not report success; the op-response carried a failure",
+                self.name,
+                op_attr,
+            )
         now = time.monotonic()
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)

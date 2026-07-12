@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -21,6 +22,11 @@ from .const import READ_CHARACTERISTIC, WRITE_CHARACTERISTIC
 _LOGGER = logging.getLogger(__name__)
 
 COOLDOWN_TIME = 0.25
+
+# Budget for a command's acknowledgement, and for the whole wait on the plain
+# execute path. Sized above the ~6 s link supervision timeout so a dead link
+# surfaces as a disconnect before this timer fires.
+RESPONSE_TIMEOUT = 10
 
 
 class YaleXSBLEError(Exception):
@@ -45,6 +51,36 @@ class NoAdvertisementError(YaleXSBLEError):
 
 class BluetoothError(YaleXSBLEError):
     """Bluetooth error."""
+
+
+class OperationIncompleteError(YaleXSBLEError):
+    """The operation's result never arrived.
+
+    The command reached the lock (it was written, and normally acknowledged),
+    so the motor may have run, but the op-response that reports the result was
+    not received: timeout or disconnect mid-operation. Deliberately NOT a
+    ResponseError and NOT in the bleak retry set: it must pass the retry
+    decorator so the failure is reported up instead of the command being
+    re-sent to a lock whose position is unknown.
+    """
+
+
+class UnlatchError(YaleXSBLEError):
+    """An unlatch failed after its command write succeeded.
+
+    Once the write has reached the lock the unlatch may execute, and a
+    repeated unlatch fires the latch again -- the door opens again -- so no
+    post-write failure may re-send it. Deliberately NOT a ResponseError so it
+    passes the retry decorator to the caller unchanged.
+    """
+
+
+@dataclass
+class OperationProgress:
+    """How far a mechanical command travelled, for stage-aware error policy."""
+
+    command_written: bool = False
+    acknowledged: bool = False
 
 
 class Session:
@@ -73,7 +109,16 @@ class Session:
         )
         self._notifications_started = False
         self._notify_future: asyncio.Future[bytes] | None = None
-        self._notify_matcher: Callable[[bytes], bool] | None = None
+        # When set, only a frame this predicate accepts resolves the pending
+        # future; other valid frames are passed to the state callback and the
+        # wait continues. None = the first valid frame resolves (default).
+        self._response_matcher: Callable[[bytes], bool] | None = None
+        # Armed alongside the response future for mechanical operations: the
+        # typed wait for the command's acknowledgement (0xAA echoing the
+        # written opcode). Both futures are armed before the write so no frame
+        # can fall into a gap between the two wait stages.
+        self._ack_future: asyncio.Future[bytes] | None = None
+        self._ack_matcher: Callable[[bytes], bool] | None = None
         self._state_callback = state_callback
         self._disconnected_futures = disconnected_futures
         self._first_request = True
@@ -158,44 +203,63 @@ class Session:
         _LOGGER.debug(
             "%s: Decrypted response via notify: %s", self.name, decrypted_data.hex()
         )
-        if self._notify_future is None:
+        if self._notify_future is None and self._ack_future is None:
             return
         try:
             self._validate_response(data)
         except ResponseError as ex:
-            _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
-            self._notify_future.set_exception(ex)
-            self._notify_future = None
-            self._notify_matcher = None
+            if (
+                self._notify_future is not None
+                and self._response_matcher is None
+                and self._ack_matcher is None
+            ):
+                # A plain wait with no matcher armed: this frame was the
+                # response, so deliver the error and let the caller decide
+                # on a retry.
+                _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
+                self._notify_future.set_exception(ex)
+                self._notify_future = None
+                return
+            # A typed wait is in flight. Surfacing the error would divert
+            # the staged wait (and on the plain path re-send the command);
+            # skip the bad frame and keep waiting -- the stage timeout is
+            # the backstop. Not expected in practice: the BLE link layer's
+            # CRC and retransmission keep corrupted frames away from us.
+            _LOGGER.debug(
+                "%s: Invalid frame during a typed wait, still waiting", self.name
+            )
             return
-        if self._notify_matcher is not None and not self._notify_matcher(
+        if (
+            self._ack_future is not None
+            and self._ack_matcher is not None
+            and self._ack_matcher(decrypted_data)
+        ):
+            self._ack_future.set_result(decrypted_data)
+            self._ack_future = None
+            self._ack_matcher = None
+            return
+        if self._notify_future is None:
+            return
+        if self._response_matcher is not None and not self._response_matcher(
             decrypted_data
         ):
-            # A valid frame, but not the answer this command is waiting for
-            # (for example the 0xAA acknowledgment that precedes a settings response).
-            # It has already been passed to the state callback above; keep the
-            # future armed for the real answer.
+            # A valid frame that does not complete the pending command (a
+            # foreign push, a status settle, an unexpected ack): the state
+            # callback has already seen it; the wait continues.
             _LOGGER.debug(
-                "%s: Response is not the awaited frame, waiting for next one",
+                "%s: Frame does not complete the pending command, still waiting",
                 self.name,
             )
             return
         self._notify_future.set_result(decrypted_data)
         self._notify_future = None
-        self._notify_matcher = None
+        self._response_matcher = None
 
-    async def _locked_write(
-        self,
-        command: bytearray,
-        command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    def _encrypt_command(self, command: bytearray, command_name: str) -> None:
         # NOTE: The last two bytes are not encrypted
         # General idea seems to be that if the last byte
         # of the command indicates an offline key offset (is non-zero),
         # the command is "secure" and encrypted with the offline key
-        if not self.client.is_connected:
-            raise BleakError("disconnected")
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         plainText = command[0x00:0x10]
         cipherText = self.cipher_encrypt.update(plainText)
@@ -204,10 +268,20 @@ class Session:
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
 
+    async def _locked_write(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        if not self.client.is_connected:
+            raise BleakError("disconnected")
+        self._encrypt_command(command, command_name)
+
         for attempt in range(3):
             future: asyncio.Future[bytes] = self.loop.create_future()
             self._notify_future = future
-            self._notify_matcher = response_matcher
+            self._response_matcher = response_matcher
             _LOGGER.debug(
                 "%s: Writing command to %s: %s",
                 self.name,
@@ -216,27 +290,116 @@ class Session:
             )
             _LOGGER.debug("%s: Waiting for response", self.name)
             try:
-                async with util.asyncio_timeout(10):
+                async with util.asyncio_timeout(RESPONSE_TIMEOUT):
                     try:
                         await self.client.write_gatt_char(
                             self.write_characteristic, command, True
                         )
                         result = await future
                     except ResponseError:
+                        # Only reachable with no matcher armed: _notify never
+                        # errors a matcher-armed future, so a typed command is
+                        # never re-written from here.
                         if attempt == 2:
                             raise
                         _LOGGER.debug("%s: Invalid response, retrying", self.name)
                         continue
                     else:
                         break
-            except TimeoutError:
-                # The wait expired with the future still armed. Disarm it so a
-                # late frame cannot land on the cancelled future or leak this
-                # command's matcher into a later wait.
-                self._notify_future = None
-                self._notify_matcher = None
-                raise
+            finally:
+                # If THIS attempt's future is still armed we are exiting
+                # abnormally (timeout / cancellation / disconnect): disarm it
+                # so a late notification cannot resolve a future belonging to
+                # a later command with this command's response.
+                if self._notify_future is future:
+                    self._notify_future = None
+                    self._response_matcher = None
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
+        return result
+
+    async def _locked_write_operation(
+        self,
+        command: bytearray,
+        command_name: str,
+        ack_matcher: Callable[[bytes], bool],
+        response_matcher: Callable[[bytes], bool],
+        response_timeout: float,
+        progress: OperationProgress,
+        write_success_callback: Callable[[], None] | None = None,
+    ) -> bytes:
+        """Write a mechanical command and run the staged wait.
+
+        Starting (or restarting) an operation initialises its timers: both
+        stage deadlines run from the attempt start. Stage 1 (RESPONSE_TIMEOUT)
+        covers the GATT write and the typed acknowledgement; stage 2 (the
+        operation's response_timeout, also from attempt start) covers the
+        op-response -- the physical end of movement. Only an op-response, or
+        an error, ends the wait.
+        """
+        if not self.client.is_connected:
+            raise BleakError("disconnected")
+        self._encrypt_command(command, command_name)
+
+        attempt_start = time.monotonic()
+        ack_future: asyncio.Future[bytes] = self.loop.create_future()
+        result_future: asyncio.Future[bytes] = self.loop.create_future()
+        # Arm both stages before the write: the op-response can follow the
+        # acknowledgement within milliseconds on a fast link, so re-arming
+        # between stages would race it.
+        self._ack_future = ack_future
+        self._ack_matcher = ack_matcher
+        self._notify_future = result_future
+        self._response_matcher = response_matcher
+        try:
+            _LOGGER.debug(
+                "%s: Writing command to %s: %s",
+                self.name,
+                self.write_characteristic,
+                command.hex(),
+            )
+            async with util.asyncio_timeout(RESPONSE_TIMEOUT):
+                await self.client.write_gatt_char(
+                    self.write_characteristic, command, True
+                )
+            progress.command_written = True
+            if write_success_callback is not None:
+                write_success_callback()
+            _LOGGER.debug("%s: Waiting for acknowledgement", self.name)
+            ack_remaining = RESPONSE_TIMEOUT - (time.monotonic() - attempt_start)
+            done, _ = await asyncio.wait(
+                (ack_future, result_future),
+                timeout=max(ack_remaining, 0),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if result_future in done:
+                # The op-response arrived without (or before) a matching
+                # acknowledgement; it supersedes the acknowledgement stage.
+                return result_future.result()
+            if ack_future not in done:
+                raise TimeoutError(
+                    f"{self.name}: No acknowledgement to {command_name} within "
+                    f"{RESPONSE_TIMEOUT}s"
+                )
+            progress.acknowledged = True
+            _LOGGER.debug("%s: Waiting for the op-response", self.name)
+            result_remaining = response_timeout - (time.monotonic() - attempt_start)
+            try:
+                async with util.asyncio_timeout(max(result_remaining, 0)):
+                    result = await result_future
+            except TimeoutError as err:
+                raise OperationIncompleteError(
+                    f"{self.name}: {command_name} was acknowledged but no "
+                    f"op-response arrived within {response_timeout}s of the "
+                    "command being issued"
+                ) from err
+        finally:
+            if self._ack_future is ack_future:
+                self._ack_future = None
+                self._ack_matcher = None
+            if self._notify_future is result_future:
+                self._notify_future = None
+                self._response_matcher = None
+        _LOGGER.debug("%s: Got op-response: %s", self.name, result.hex())
         return result
 
     async def start_notify(self) -> None:
@@ -277,20 +440,7 @@ class Session:
         except BleakError as err:
             _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
 
-    async def execute(
-        self,
-        command: bytearray,
-        command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
-        """Execute command.
-
-        ``response_matcher`` narrows which notify frame answers the command:
-        valid frames that do not match still reach the state callback, but the
-        solicited wait stays armed until a matching frame arrives (or the
-        write times out). Without a matcher the first valid frame answers, as
-        before.
-        """
+    async def _wait_for_cooldown(self) -> None:
         while (
             self._enable_cooldown
             and (cooldown_remain := time.monotonic() - self._last_callback_time)
@@ -303,6 +453,15 @@ class Session:
             # advertising. This is a workaround to avoid that since
             # it means a battery pull is required to recover.
             await asyncio.sleep(COOLDOWN_TIME - cooldown_remain)
+
+    async def execute(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        """Execute command."""
+        await self._wait_for_cooldown()
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         self._write_checksum(command)
         disconnected_future = asyncio.get_running_loop().create_future()
@@ -319,6 +478,73 @@ class Session:
                     f"Authentication error: key or slot (key index) is incorrect: {err}"
                 ) from err
             if util.is_disconnected_error(err):
+                raise DisconnectedError(f"{self.name}: {err}") from err
+            raise
+        finally:
+            disconnected_futures.discard(disconnected_future)
+            self._first_request = False
+
+    async def execute_operation(
+        self,
+        command: bytearray,
+        command_name: str,
+        ack_matcher: Callable[[bytes], bool],
+        response_matcher: Callable[[bytes], bool],
+        response_timeout: float,
+        progress: OperationProgress,
+        write_success_callback: Callable[[], None] | None = None,
+    ) -> bytes:
+        """Execute a mechanical operation command with the staged wait.
+
+        Error policy by stage (the caller's retry decorator sees the types):
+        write and acknowledgement failures keep their retryable types
+        (TimeoutError / DisconnectedError / BleakError); once the operation is
+        acknowledged, a timeout or disconnect raises the non-retryable
+        OperationIncompleteError -- the result is unknown and the command must
+        not be silently re-sent.
+        """
+        await self._wait_for_cooldown()
+        assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
+        self._write_checksum(command)
+        disconnected_future = asyncio.get_running_loop().create_future()
+        disconnected_futures = self._disconnected_futures
+        disconnected_futures.add(disconnected_future)
+        try:
+            async with (
+                interrupt(
+                    disconnected_future,
+                    DisconnectedError,
+                    f"{self.name}: Disconnected",
+                ),
+                self._lock,
+            ):
+                return await self._locked_write_operation(
+                    command,
+                    command_name,
+                    ack_matcher,
+                    response_matcher,
+                    response_timeout,
+                    progress,
+                    write_success_callback,
+                )
+        except DisconnectedError as err:
+            if progress.acknowledged:
+                raise OperationIncompleteError(
+                    f"{self.name}: Disconnected while awaiting the op-response "
+                    f"to {command_name}; the result is unknown"
+                ) from err
+            raise
+        except BleakError as err:
+            if self._first_request and util.is_key_error(err):
+                raise AuthError(
+                    f"Authentication error: key or slot (key index) is incorrect: {err}"
+                ) from err
+            if util.is_disconnected_error(err):
+                if progress.acknowledged:
+                    raise OperationIncompleteError(
+                        f"{self.name}: Disconnected while awaiting the "
+                        f"op-response to {command_name}; the result is unknown"
+                    ) from err
                 raise DisconnectedError(f"{self.name}: {err}") from err
             raise
         finally:

@@ -2229,3 +2229,63 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up(
         await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
 
     assert mock_lock.set_auto_lock.await_count == AUTO_LOCK_WRITE_ATTEMPTS
+
+
+def _make_operable_push_lock() -> PushLock:
+    """A running PushLock with lock info and advertisement, ready to operate."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+    return push_lock
+
+
+@pytest.mark.asyncio
+async def test_execute_lock_operation_success_stamps_complete_state() -> None:
+    """A force_* returning True advances the state to the completed status.
+
+    Drives lock() to completion: the transitional LOCKING is stamped, the
+    op-response reports success, and the completed LOCKED status is applied.
+    """
+    push_lock = _make_operable_push_lock()
+    mock_lock = MagicMock()
+    mock_lock.force_lock = AsyncMock(return_value=True)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    mock_lock.force_lock.assert_awaited_once()
+    assert push_lock.lock_status == LockStatus.LOCKED
+
+
+@pytest.mark.asyncio
+async def test_execute_lock_operation_failure_leaves_transitional_state() -> None:
+    """A force_* returning False (the op-response carried a failure) never
+    stamps the completed status; the transitional UNLOCKING stays in place."""
+    push_lock = _make_operable_push_lock()
+    mock_lock = MagicMock()
+    mock_lock.force_unlock = AsyncMock(return_value=False)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.unlock()
+
+    mock_lock.force_unlock.assert_awaited_once()
+    assert push_lock.lock_status == LockStatus.UNLOCKING

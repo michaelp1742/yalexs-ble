@@ -11,7 +11,13 @@ from .const import (
 )
 from .lock import Lock
 from .push import PushLock
-from .session import AuthError, DisconnectedError, YaleXSBLEError
+from .session import (
+    AuthError,
+    DisconnectedError,
+    OperationIncompleteError,
+    UnlatchError,
+    YaleXSBLEError,
+)
 from .util import (
     ValidatedLockConfig,
     local_name_is_unique,
@@ -33,7 +39,9 @@ __all__ = [
     "LockInfo",
     "LockState",
     "LockStatus",
+    "OperationIncompleteError",
     "PushLock",
+    "UnlatchError",
     "ValidatedLockConfig",
     "YaleXSBLEDiscovery",
     "YaleXSBLEError",
