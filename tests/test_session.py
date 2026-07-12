@@ -266,9 +266,9 @@ async def test_execute_operation_happy_path() -> None:
         await _spin_until(lambda: progress.command_written)
         order.append("ack")
         session._notify(0, bytearray(ack))
-        # Let the ack stage complete before the op-response, so the op-response
-        # does not supersede the acknowledgement (see the before-ack test).
-        await _spin_until(lambda: progress.acknowledged)
+        # Deliver the op-response in the SAME event-loop turn: both stage
+        # futures resolve before the writer resumes, exercising the
+        # supersede branch, which must still record the acknowledgement.
         session._notify(0, bytearray(op_response))
 
     feeder = asyncio.create_task(feed())

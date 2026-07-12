@@ -387,8 +387,12 @@ class Session:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if result_future in done:
-                # The op-response arrived without (or before) a matching
-                # acknowledgement; it supersedes the acknowledgement stage.
+                # The op-response supersedes the acknowledgement stage: it
+                # either beat the acknowledgement entirely, or both resolved
+                # in the same event-loop turn -- in which case the
+                # acknowledgement DID arrive and progress must record it.
+                if ack_future in done:
+                    progress.acknowledged = True
                 return result_future.result()
             if ack_future not in done:
                 raise TimeoutError(
