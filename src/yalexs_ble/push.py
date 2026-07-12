@@ -114,6 +114,16 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long a fresh JAMMED status stays pinned on display, as a deadline that
+# every admitted jam event pushes out again (now + JAMMED_HOLD_TIME, the
+# _poll_battery deadline pattern). Post-jam GETSTATUS fabricates a plain
+# position (14/14 field jams; JAMMED was clobbered in under a second), and
+# the end of a jam cannot be determined remotely, so the hold's primary
+# purpose is making the user aware of the jam via the UI. The hold masks
+# only the reported lock status: no poll is deferred, so the duration has no
+# tie to the keep-alive cadence -- 30 s is a nominal visibility window.
+JAMMED_HOLD_TIME = 30.0
+
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
@@ -359,6 +369,9 @@ class PushLock:
         # error): received lock-status values are filtered out -- the operation
         # applies its own outcome when it completes.
         self._operation_window_open = False
+        # Deadline until which a displayed JAMMED status is pinned; every
+        # admitted jam event pushes it out again (NEVER_TIME = no hold).
+        self._jammed_hold_deadline = NEVER_TIME
         self._always_connected = always_connected
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
@@ -731,9 +744,16 @@ class PushLock:
     def _operation_write_success(self) -> None:
         """The command write reached the lock: the single state-action moment.
 
-        Order matters: stamp the operation's transitional while the window is
-        still closed, so the stamp passes the filter, then open the window.
+        Order matters: release any JAMMED display hold first (a fresh operation
+        supersedes it), then stamp the operation's transitional while the window
+        is still closed, so the stamp passes the filter, then open the window.
         """
+        if time.monotonic() < self._jammed_hold_deadline:
+            _LOGGER.debug(
+                "%s: New operation write succeeded; releasing the JAMMED display hold",
+                self.name,
+            )
+        self._jammed_hold_deadline = NEVER_TIME
         if self._pending_op_state is not None:
             self._update_any_state([self._pending_op_state])
         self._operation_window_open = True
@@ -762,6 +782,27 @@ class PushLock:
             # frame still pass (they are filtered per-member by the callers).
             _LOGGER.debug(
                 "%s: Operation in flight, not accepting lock status %s",
+                self.name,
+                incoming,
+            )
+            return current
+        now = time.monotonic()
+        if incoming is LockStatus.JAMMED:
+            # Admitted jam evidence, whatever the bearer (our own op-response
+            # applied after the window closes, a settled 0x07 push, a poll
+            # answer, a foreign failure op-response): every event sets a new
+            # hold end.
+            self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
+            return incoming
+        if current is LockStatus.JAMMED and now < self._jammed_hold_deadline:
+            # Display hold: after a jam the polled register fabricates a plain
+            # locked/unlocked position and no remote signal marks the jam's
+            # end, so JAMMED stays pinned until the deadline or until a new
+            # operation's write-success releases it. This also intentionally
+            # gates the 01/06 forced reconnect in _update: 01/06 are treated as
+            # jammed, and a reconnect is not a valid response to jammed.
+            _LOGGER.debug(
+                "%s: Holding JAMMED, not accepting lock status %s",
                 self.name,
                 incoming,
             )
@@ -968,9 +1009,10 @@ class PushLock:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
                 # Route every incoming lock status through the policy before the
-                # equality check, so the admission filter is the single authority
-                # for the displayed value -- a repeated identical reading is put
-                # through it too rather than short-circuited.
+                # equality check: a repeated identical reading must still reach
+                # the admission filter, because a repeated JAMMED re-arms the
+                # display hold deadline (see _admit_lock_status), so short-
+                # circuiting an unchanged value would let the hold lapse.
                 admitted = self._admit_lock_status(state, lock_state.lock)
                 if lock_state.lock != admitted:
                     changes["lock"] = admitted
@@ -1224,7 +1266,7 @@ class PushLock:
 
     @operation_lock
     @retry_bluetooth_connection_error
-    async def _update(self) -> LockState:
+    async def _update(self) -> LockState:  # noqa: PLR0915
         """Update the lock state."""
         has_lock_info = self._lock_info is not None
 
@@ -1236,6 +1278,10 @@ class PushLock:
             self._lock_info = await self._probe_lock_info(lock)
         state = self._get_current_state()
         made_request = False
+        # Whether this cycle actually read a lock status. A carried-forward
+        # cached value is not fresh jam evidence, so the JAMMED hold policy is
+        # applied below only when this is set (see the merge section).
+        lock_status_fetched = False
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
@@ -1269,6 +1315,7 @@ class PushLock:
             not made_request and self._always_connected
         ):
             made_request = True
+            lock_status_fetched = True
             lock_status = await lock.lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(state, lock=lock_status, auth=AuthState(successful=True))
@@ -1288,10 +1335,21 @@ class PushLock:
         # window cannot be open here (operations hold the operation lock while
         # they run), but routing both state-application sites through the one
         # policy is deliberate: patching a single site would let the other
-        # bypass the filter.
-        admitted = self._admit_lock_status(state.lock, cached_state.lock)
-        if admitted != state.lock:
-            state = replace(state, lock=admitted)
+        # bypass the filter. This also pins the JAMMED display hold: after a jam
+        # the polled register fabricates a plain locked/unlocked position, and a
+        # coincident poll must not clear JAMMED. Only a freshly fetched status
+        # is evidence -- a carried-forward cached value must not re-arm the hold
+        # (see _admit_lock_status), so this is applied only when this cycle
+        # actually read a lock status.
+        if lock_status_fetched:
+            admitted = self._admit_lock_status(state.lock, cached_state.lock)
+            if admitted != state.lock:
+                _LOGGER.debug(
+                    "%s: Holding displayed status; polled lock status was %s",
+                    self.name,
+                    state.lock,
+                )
+                state = replace(state, lock=admitted)
 
         # Auto-lock is owned by the notify path: the 0xBB settings responses
         # (read and write) publish it mid-update, while the poll's own return
@@ -1316,6 +1374,10 @@ class PushLock:
             await self._execute_forced_disconnect("impossible battery voltage")
 
         if state.lock in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
+            # Outside a JAMMED hold this is unchanged. During a hold the merged
+            # status above reads JAMMED, so 01/06 never reaches here and the
+            # forced reconnect is deliberately suppressed: 01/06 are treated as
+            # jammed and a reconnect is not a valid response to a jam.
             _LOGGER.debug("%s: Lock is in an unknown state: %s", self.name, state.lock)
             # If the lock is in a bad state, reconnect.
             await self._execute_forced_disconnect(
