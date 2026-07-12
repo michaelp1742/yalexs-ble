@@ -914,9 +914,9 @@ def _make_connected_lock_with_session(
 def _with_checksum(frame: bytearray) -> bytes:
     """Stamp byte[3] so the 18-byte simple checksum sums to zero (a valid frame).
 
-    Synthetic frames, not field captures: the operation-model replays in
-    tests/test_lockoperation_model.py use verbatim captures, but the unlatch
-    ack has no capture yet, so these are built to the layout the matchers key on.
+    Synthetic frames, not field captures: the 1000 ms replays in
+    tests/test_session.py use verbatim captures, but the unlatch ack has no
+    capture yet, so these are built to the layout the matchers key on.
     """
     frame = bytearray(frame)
     frame[0x03] = 0

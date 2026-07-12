@@ -713,3 +713,129 @@ async def test_execute_operation_generic_bleak_error_is_reraised() -> None:
             response_timeout=5.0,
             progress=OperationProgress(),
         )
+
+
+# =========================================================================== #
+# 1000 ms field replays -- the typed staged wait vs the wrong-capture frames
+#
+# Verbatim, ordered field frame sequences from fixtures_1000ms_wrong_captures.md
+# where the OLD untyped wait captured a wrong frame, written ahead of the staged
+# wait that answers them. Each is replayed through session._notify during an
+# execute_operation staged wait. Frame classes:
+#   * bb0a / bb0b = 0xBB op-response (opcode 0x0a unlock / 0x0b lock+securemode)
+#   * bb02        = 0xBB 0x02 settled GETSTATUS status push
+#   * aa0a / aa0b = 0xAA acknowledgement echoing the written opcode
+# byte[3] checksums are valid as captured, so the frames are fed unchanged.
+# =========================================================================== #
+@pytest.mark.asyncio
+async def test_replay_incident1_force_lock_ignores_prev_unlock_stale_bb0a() -> None:
+    """Incident 1: a force_lock wait ignores the previous unlock's stale bb0a.
+
+    The old untyped wait was satisfied by bb0a003b... -- the delayed op-response
+    (opcode 0x0a = unlock) of the PRECEDING force_unlock, a leftover frame, not
+    an answer to this force_lock (opcode 0x0b). The typed wait keeps it on the
+    state-callback path and completes only on this force_lock's own bb0b.
+    """
+    seen: list[bytes] = []
+    session, _ = _make_session(seen.append)
+    progress = OperationProgress()
+    command = session.build_command(Commands.LOCK)  # force_lock: opcode 0x0b
+
+    # Verbatim field frames (byte[3] checksums valid as captured).
+    stale_unlock_result = bytes.fromhex("bb0a003b0000000000000000000000000000")
+    settled_unlocked = bytes.fromhex("bb02003e0200000003000000000000000000")
+    true_lock_ack = bytes.fromhex("aa0b00490000000000000000000000000200")
+    genuine_lock_result = bytes.fromhex("bb0b003a0000000000000000000000000000")
+
+    op_task: asyncio.Task[bytes] | None = None
+
+    async def feed() -> None:
+        await _spin_until(lambda: progress.command_written)
+        # The previous unlock's stale op-response and a settled status push:
+        # neither is this force_lock's ack or op-response.
+        session._notify(0, bytearray(stale_unlock_result))
+        session._notify(0, bytearray(settled_unlocked))
+        await asyncio.sleep(0)
+        assert op_task is not None and not op_task.done()  # wrong frame ignored
+        # The genuine LOCK ack (opcode 0x0b, op byte 0x00) advances to stage 2.
+        session._notify(0, bytearray(true_lock_ack))
+        await _spin_until(lambda: progress.acknowledged)
+        # Only its own bb0b op-response completes the wait.
+        session._notify(0, bytearray(genuine_lock_result))
+
+    feeder = asyncio.create_task(feed())
+    op_task = asyncio.create_task(
+        session.execute_operation(
+            command,
+            "force_lock",
+            ack_matcher=_ack_matcher(Commands.LOCK, 0x00),
+            response_matcher=_operation_response_matcher(Commands.LOCK),
+            response_timeout=5.0,
+            progress=progress,
+        )
+    )
+    result = await op_task
+    await feeder
+
+    assert result == genuine_lock_result
+    # It went through the real ack stage; the stale bb0a did not short-circuit.
+    assert progress.acknowledged is True
+    # The stale op-response and the settle stayed on the state-callback path.
+    assert stale_unlock_result in seen
+    assert settled_unlocked in seen
+
+
+@pytest.mark.asyncio
+async def test_replay_incident2_settled_bb02_never_completes_force_unlock() -> None:
+    """Incident 2 (substitute): a settled bb02 push never completes an operation.
+
+    The documented ~6.4 s stale bb02 was not present in the log; this replays
+    the closest same-family case -- a settled STATUS-UNLOCKED push (bb02...03)
+    that the old wait claimed for a force_unlock. A GETSTATUS status push
+    (0xBB 0x02) is not an operation frame, so it completes the wait at NEITHER
+    stage; only the unlock's own bb0a does.
+    """
+    seen: list[bytes] = []
+    session, _ = _make_session(seen.append)
+    progress = OperationProgress()
+    command = session.build_command(Commands.UNLOCK)  # force_unlock: opcode 0x0a
+
+    # Verbatim field frames (byte[3] checksums valid as captured).
+    settled_unlocked = bytes.fromhex("bb02003e0200000003000000000000000000")
+    true_unlock_ack = bytes.fromhex("aa0a004a0000000000000000000000000200")
+    genuine_unlock_result = bytes.fromhex("bb0a003b0000000000000000000000000000")
+
+    op_task: asyncio.Task[bytes] | None = None
+
+    async def feed() -> None:
+        await _spin_until(lambda: progress.command_written)
+        # A settled status push during the ack stage does not complete it.
+        session._notify(0, bytearray(settled_unlocked))
+        await asyncio.sleep(0)
+        assert op_task is not None and not op_task.done()
+        session._notify(0, bytearray(true_unlock_ack))
+        await _spin_until(lambda: progress.acknowledged)
+        # A settled status push during the op-response stage does not either.
+        session._notify(0, bytearray(settled_unlocked))
+        await asyncio.sleep(0)
+        assert not op_task.done()
+        session._notify(0, bytearray(genuine_unlock_result))
+
+    feeder = asyncio.create_task(feed())
+    op_task = asyncio.create_task(
+        session.execute_operation(
+            command,
+            "force_unlock",
+            ack_matcher=_ack_matcher(Commands.UNLOCK, 0x00),
+            response_matcher=_operation_response_matcher(Commands.UNLOCK),
+            response_timeout=5.0,
+            progress=progress,
+        )
+    )
+    result = await op_task
+    await feeder
+
+    assert result == genuine_unlock_result
+    assert progress.acknowledged is True
+    # Both settled pushes stayed on the state-callback path, never claimed.
+    assert seen.count(settled_unlocked) == 2
