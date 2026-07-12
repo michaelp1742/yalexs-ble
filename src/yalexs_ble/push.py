@@ -43,7 +43,9 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -348,6 +350,15 @@ class PushLock:
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
+        # The operation in flight, from the caller's view: the pending
+        # transitional to stamp at write-success (only one LockOperation is
+        # ever in play -- the operation lock enforces it) and whether the
+        # display window is open.
+        self._pending_op_state: LockStatus | None = None
+        # True from a command's write-success until its op-response (or an
+        # error): received lock-status values are filtered out -- the operation
+        # applies its own outcome when it completes.
+        self._operation_window_open = False
         self._always_connected = always_connected
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
@@ -500,6 +511,7 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            write_success_callback=self._operation_write_success,
         )
 
     def _disconnected_callback(self) -> None:
@@ -684,7 +696,6 @@ class PushLock:
 
     async def securemode(self) -> None:
         """Set the lock into securemode."""
-        self._update_any_state([LockStatus.LOCKING])
         self._cancel_future_update()
         await self._execute_lock_operation(
             "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
@@ -692,7 +703,6 @@ class PushLock:
 
     async def lock(self) -> None:
         """Lock the lock."""
-        self._update_any_state([LockStatus.LOCKING])
         self._cancel_future_update()
         await self._execute_lock_operation(
             "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
@@ -700,11 +710,63 @@ class PushLock:
 
     async def unlock(self) -> None:
         """Unlock the lock."""
-        self._update_any_state([LockStatus.UNLOCKING])
         self._cancel_future_update()
         await self._execute_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
+
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        Support is advertised via lock_info.can_open; check it before
+        exposing the operation. The op-response arrives when the latch has
+        returned from its open dwell, so the completed state is UNLOCKED; a
+        settled UNLATCHED push displays only outside an operation window.
+        """
+        self._cancel_future_update()
+        await self._execute_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
+        )
+
+    def _operation_write_success(self) -> None:
+        """The command write reached the lock: the single state-action moment.
+
+        Order matters: stamp the operation's transitional while the window is
+        still closed, so the stamp passes the filter, then open the window.
+        """
+        if self._pending_op_state is not None:
+            self._update_any_state([self._pending_op_state])
+        self._operation_window_open = True
+
+    def _close_operation_window(self) -> None:
+        """Close the operation window and drop the pending transitional."""
+        self._operation_window_open = False
+        self._pending_op_state = None
+
+    def _admit_lock_status(
+        self, incoming: LockStatus, current: LockStatus
+    ) -> LockStatus:
+        """Decide the displayed lock status for an incoming value.
+
+        Applied at BOTH state-application sites (the notify path via
+        _update_any_state and the poll path in _update); any code path that
+        applies a lock status must pass through here.
+        """
+        if self._operation_window_open:
+            # Literal filter: between our command's write-success and its
+            # op-response no received lock status is accepted, whatever the
+            # source -- our own stale reads, mid-motion readings, foreign
+            # centrals, jam evidence. The operation applies its own outcome
+            # when it completes; a mechanically jammed lock re-issues its
+            # evidence after the window. Door and battery members of the same
+            # frame still pass (they are filtered per-member by the callers).
+            _LOGGER.debug(
+                "%s: Operation in flight, not accepting lock status %s",
+                self.name,
+                incoming,
+            )
+            return current
+        return incoming
 
     @operation_lock
     @retry_bluetooth_connection_error
@@ -717,32 +779,58 @@ class PushLock:
                 f"{self.name}: Lock operation not possible because not running"
             )
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
-        self._update_any_state([pending_state])
-        self._cancel_future_update()
+        # Re-set on every retry attempt: the transitional to stamp when this
+        # attempt's command write reaches the lock (write-success).
+        self._pending_op_state = pending_state
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
             success = await getattr(lock, op_attr)()
+        except (OperationIncompleteError, UnlatchError):
+            # Non-retryable: this propagates to the caller. If our write
+            # succeeded, a transitional is on display with no result coming --
+            # the state is unknown.
+            if self._operation_window_open:
+                self._close_operation_window()
+                self._update_any_state([LockStatus.UNKNOWN])
+            self._pending_op_state = None
+            _LOGGER.debug(
+                "%s: %s did not complete; the result never arrived",
+                self.name,
+                op_attr,
+            )
+            raise
+        except asyncio.CancelledError:
+            # A bare cancel (a service-call timeout, an unload) is a
+            # BaseException and would skip the handler below, leaking the
+            # window open with no operation in flight -- the displayed status
+            # would freeze on the transitional and polling could not heal it.
+            self._close_operation_window()
+            raise
         except Exception as ex:
-            self._update_any_state([LockStatus.UNKNOWN])
-            # The retry_bluetooth_connection_error wrapper calls
-            # _async_handle_disconnected for RETRY_EXCEPTIONS /
-            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
-            # any other exception propagate without disconnecting.
+            # Retryable (or terminal after retries exhaust): close the window so
+            # normal acceptance resumes; the next attempt re-stamps at its own
+            # write-success. No UNKNOWN stamp -- through send/ack-stage retries
+            # the display stays untouched.
+            self._close_operation_window()
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
                 self.name,
                 ex,
             )
             raise
+        self._close_operation_window()
         if success:
             self._update_any_state([complete_state])
             _LOGGER.debug("%s: Finished %s", self.name, complete_state)
         else:
+            # Our own op-response reported a failure (byte[15] != 0). The parser
+            # already logged the named cause and emitted JAMMED, but that
+            # emission fell inside our own window -- the operation applies its
+            # outcome itself now the window is closed.
+            self._update_any_state([LockStatus.JAMMED])
             _LOGGER.debug(
-                "%s: %s did not report success; the op-response carried a failure",
-                self.name,
-                op_attr,
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
             )
         now = time.monotonic()
         self._last_lock_operation_complete_time = now
@@ -879,8 +967,13 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                if lock_state.lock != state:
-                    changes["lock"] = state
+                # Route every incoming lock status through the policy before the
+                # equality check, so the admission filter is the single authority
+                # for the displayed value -- a repeated identical reading is put
+                # through it too rather than short-circuited.
+                admitted = self._admit_lock_status(state, lock_state.lock)
+                if lock_state.lock != admitted:
+                    changes["lock"] = admitted
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
@@ -1190,6 +1283,15 @@ class PushLock:
             state = replace(state, lock=cached_state.lock)
         if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
             state = replace(state, door=cached_state.door)
+
+        # Apply the same lock-status policy the notify path uses. The operation
+        # window cannot be open here (operations hold the operation lock while
+        # they run), but routing both state-application sites through the one
+        # policy is deliberate: patching a single site would let the other
+        # bypass the filter.
+        admitted = self._admit_lock_status(state.lock, cached_state.lock)
+        if admitted != state.lock:
+            state = replace(state, lock=admitted)
 
         # Auto-lock is owned by the notify path: the 0xBB settings responses
         # (read and write) publish it mid-update, while the poll's own return
