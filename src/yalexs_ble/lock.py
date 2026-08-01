@@ -49,7 +49,6 @@ from .session import (
     DisconnectedError,
     OperationIncompleteError,
     OperationProgress,
-    ResponseError,
     Session,
     UnlatchError,
     YaleXSBLEError,
@@ -546,9 +545,13 @@ class Lock:
         Support is advertised via LockInfo.can_open.
 
         A repeated unlatch fires the latch again -- the door opens again -- so
-        once the command write has succeeded NO failure may re-send it: any
-        retryable failure after the write converts to the non-retryable
-        UnlatchError. Failures before the write stay retryable.
+        once the command write has been ATTEMPTED no failure may re-send it: a
+        write call that errors can still have delivered the request (the PDU
+        leaves the radio and only the ATT response is lost), so every failure
+        from the write attempt onward converts to the non-retryable
+        UnlatchError (OperationIncompleteError, already non-retryable,
+        propagates as itself). Failures before the write attempt (connect,
+        session setup, encryption) stay retryable.
         """
         _LOGGER.debug("%s: Unlatching", self.name)
         assert self.session is not None  # nosec
@@ -563,14 +566,24 @@ class Lock:
                 progress=progress,
             )
         except OperationIncompleteError:
-            # Already non-retryable: the result never arrived.
+            # Already non-retryable: the result never arrived. Ordered ahead
+            # of the broad clause below so the type reaches the caller
+            # unwrapped.
             raise
-        except (TimeoutError, DisconnectedError, ResponseError, BleakError) as err:
-            if progress.command_written:
+        except Exception as err:
+            # Broad on purpose, and every path here re-raises, so no failure
+            # is discarded. The rule is stronger than any list of retryable
+            # types: after a write attempt no failure of any kind may reach
+            # the retry wrapper, because a retry re-sends the unlatch.
+            # Converting to UnlatchError, which is not in the retry set,
+            # enforces that even when the retry set widens. Cancellation is a
+            # BaseException and passes through untouched.
+            if progress.write_attempted:
                 raise UnlatchError(
-                    f"{self.name}: Unlatch failed after the command was "
-                    "written; not retried because a repeated unlatch fires "
-                    "the latch again"
+                    f"{self.name}: Unlatch failed after the command write was "
+                    "attempted; not retried because the command may have "
+                    "reached the lock and a repeated unlatch fires the latch "
+                    "again"
                 ) from err
             raise
         _LOGGER.debug("%s: Finished unlatching", self.name)

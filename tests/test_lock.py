@@ -996,7 +996,7 @@ async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_force_unlatch_failure_before_write_stays_retryable() -> None:
-    """A failure before the command write leaves command_written False, so the
+    """A failure before the command write leaves write_attempted False, so the
     error propagates unchanged and the caller may retry -- the latch never fired.
     """
     lock = _make_lock()
@@ -1034,6 +1034,7 @@ async def test_force_unlatch_failure_after_write_converts_to_unlatch_error() -> 
         progress: OperationProgress | None = None,
     ) -> bool:
         assert progress is not None
+        progress.write_attempted = True
         progress.command_written = True
         raise TimeoutError("no op-response after the write")
 
@@ -1042,6 +1043,77 @@ async def test_force_unlatch_failure_after_write_converts_to_unlatch_error() -> 
         await lock.force_unlatch()
     # The originating error is preserved as the cause.
     assert isinstance(excinfo.value.__cause__, TimeoutError)
+
+
+@pytest.mark.asyncio
+async def test_force_unlatch_errored_write_converts_to_unlatch_error() -> None:
+    """A write call that errors leaves delivery unknown (write_attempted True,
+    command_written False): the request PDU may have reached the lock, so the
+    failure converts to the non-retryable UnlatchError instead of retrying.
+    """
+    lock = _make_lock()
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+
+    async def _fail(
+        command: bytearray,
+        command_name: str,
+        response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
+        progress: OperationProgress | None = None,
+    ) -> bool:
+        assert progress is not None
+        progress.write_attempted = True
+        raise BleakError("link dropped during the write")
+
+    lock._execute_operation_command = _fail  # type: ignore[method-assign]
+    with pytest.raises(UnlatchError) as excinfo:
+        await lock.force_unlatch()
+    # The originating error is preserved as the cause.
+    assert isinstance(excinfo.value.__cause__, BleakError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        EOFError("dbus socket closed"),
+        BrokenPipeError("dbus socket closed"),
+        AttributeError("backend went away mid-write"),
+        ValueError("an error from nowhere near the retry set"),
+    ],
+)
+async def test_force_unlatch_converts_every_post_write_failure(
+    error: Exception,
+) -> None:
+    """The post-write conversion is type-blind, so no failure can re-send.
+
+    Enumerating retryable types is what let this leak: the retry set is
+    assembled from bleak_retry_connector and grows without reference to this
+    guard. The first three of these were in that set and outside an earlier
+    enumeration, so a post-write escape was retried and the latch fired
+    twice; the fourth is in no retry set at all and converts just the same,
+    which is the property that keeps the invariant true as the set widens.
+    """
+    lock = _make_lock()
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+
+    async def _fail(
+        command: bytearray,
+        command_name: str,
+        response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
+        progress: OperationProgress | None = None,
+    ) -> bool:
+        assert progress is not None
+        progress.write_attempted = True
+        raise error
+
+    lock._execute_operation_command = _fail  # type: ignore[method-assign]
+    with pytest.raises(UnlatchError) as excinfo:
+        await lock.force_unlatch()
+    assert excinfo.value.__cause__ is error
 
 
 @pytest.mark.asyncio

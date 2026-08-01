@@ -77,8 +77,19 @@ class UnlatchError(YaleXSBLEError):
 
 @dataclass
 class OperationProgress:
-    """How far a mechanical command travelled, for stage-aware error policy."""
+    """How far a mechanical command travelled, for stage-aware error policy.
 
+    write_attempted and command_written bracket the GATT write:
+    write_attempted is set immediately before the write call, command_written
+    is set when the call returns with the ATT write response. A write call
+    that errors leaves the two split -- the request PDU can leave the radio
+    and only the response be lost, so the command may have reached the lock
+    even though the write reported failure. A caller that must never re-send
+    (unlatch) keys on write_attempted; command_written is the record of
+    confirmed delivery.
+    """
+
+    write_attempted: bool = False
     command_written: bool = False
     acknowledged: bool = False
 
@@ -357,6 +368,10 @@ class Session:
                 self.write_characteristic,
                 command.hex(),
             )
+            # A write call that errors may still have delivered the command:
+            # the request PDU can leave the radio with only the ATT response
+            # lost, so from this point an error leaves delivery unknown.
+            progress.write_attempted = True
             async with util.asyncio_timeout(RESPONSE_TIMEOUT):
                 await self.client.write_gatt_char(
                     self.write_characteristic, command, True
