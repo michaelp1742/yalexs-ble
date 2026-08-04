@@ -544,7 +544,6 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
-            write_success_callback=self._operation_write_success,
             ack_callback=self._ack_callback,
             op_response_callback=self._op_response_callback,
         )
@@ -887,7 +886,10 @@ class PushLock:
             # Command-issue anchor, re-stamped per attempt so a retry moves the
             # stale-state floor forward with it.
             self._last_lock_operation_start_time = time.monotonic()
-            success = await getattr(lock, op_attr)()
+            # Hand the write-success hook to this operation alone. The window it
+            # opens is closed only on the paths below, so nothing that did not
+            # come through here can open it.
+            success = await getattr(lock, op_attr)(self._operation_write_success)
         except (OperationIncompleteError, UnlatchError):
             # Non-retryable: this propagates to the caller. If our write
             # succeeded, a transitional is on display with no result coming --

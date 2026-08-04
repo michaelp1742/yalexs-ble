@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import logging
 import time
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -2332,9 +2333,9 @@ async def test_lock_stamps_transitional_only_at_write_success():
 
     mock_lock = MagicMock()
 
-    async def force_lock():
+    async def force_lock(write_success_callback):
         order.append(("write_success", None))
-        push_lock._operation_write_success()
+        write_success_callback()
         return True
 
     mock_lock.force_lock = force_lock
@@ -2446,8 +2447,8 @@ async def test_nonretryable_after_write_stamps_unknown(exc):
 
     mock_lock = MagicMock()
 
-    async def force_lock():
-        push_lock._operation_write_success()  # opens window, stamps LOCKING
+    async def force_lock(write_success_callback):
+        write_success_callback()  # opens window, stamps LOCKING
         raise exc
 
     mock_lock.force_lock = force_lock
@@ -2511,8 +2512,8 @@ async def test_failure_op_response_applies_jammed_after_window():
 
     mock_lock = MagicMock()
 
-    async def force_lock():
-        push_lock._operation_write_success()  # opens window, stamps LOCKING
+    async def force_lock(write_success_callback):
+        write_success_callback()  # opens window, stamps LOCKING
         # Parser emission of the failure op-response lands inside our window.
         push_lock._state_callback([LockStatus.JAMMED])
         return False  # op-response byte[15] != 0
@@ -2546,11 +2547,11 @@ async def test_retry_restamps_at_write_success_without_unknown():
     pending_at_entry: list[LockStatus | None] = []
     attempts = 0
 
-    async def force_lock():
+    async def force_lock(write_success_callback):
         nonlocal attempts
         attempts += 1
         pending_at_entry.append(push_lock._pending_op_state)
-        push_lock._operation_write_success()  # opens window, stamps LOCKING
+        write_success_callback()  # opens window, stamps LOCKING
         if attempts == 1:
             raise DisconnectedError("dropped before ack")
         return True
@@ -2590,9 +2591,9 @@ async def test_unlatch_stamps_unlatching_then_unlocked():
 
     mock_lock = MagicMock()
 
-    async def force_unlatch():
+    async def force_unlatch(write_success_callback):
         order.append("write_success")
-        push_lock._operation_write_success()
+        write_success_callback()
         return True
 
     mock_lock.force_unlatch = force_unlatch
@@ -2622,10 +2623,10 @@ async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     gate = asyncio.Event()
     calls = 0
 
-    async def gated_force_lock() -> bool:
+    async def gated_force_lock(write_success_callback: Callable[[], None]) -> bool:
         nonlocal calls
         calls += 1
-        push_lock._operation_write_success()
+        write_success_callback()
         if calls == 1:
             await gate.wait()  # hold op1 open while op2 queues behind it
         return True
@@ -2750,10 +2751,10 @@ async def test_operation_incomplete_after_write_success_stamps_unknown_once() ->
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
 
-    def force_lock_side_effect() -> bool:
+    def force_lock_side_effect(write_success_callback: Callable[[], None]) -> bool:
         # The write reached the lock (window opens, LOCKING on display) but the
         # result never arrived.
-        push_lock._operation_write_success()
+        write_success_callback()
         raise OperationIncompleteError("no op-response")
 
     mock_lock = MagicMock()
@@ -2823,8 +2824,8 @@ async def test_cancelled_mid_operation_closes_window_without_unknown() -> None:
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
 
-    async def force_lock() -> bool:
-        push_lock._operation_write_success()  # opens window, stamps LOCKING
+    async def force_lock(write_success_callback: Callable[[], None]) -> bool:
+        write_success_callback()  # opens window, stamps LOCKING
         raise asyncio.CancelledError
 
     mock_lock = MagicMock()
@@ -3038,8 +3039,8 @@ async def test_operation_failure_arms_hold():
 
     mock_lock = MagicMock()
 
-    async def force_lock():
-        push_lock._operation_write_success()
+    async def force_lock(write_success_callback):
+        write_success_callback()
         return False  # op-response byte[15] != 0
 
     mock_lock.force_lock = force_lock
@@ -3128,17 +3129,82 @@ async def test_ack_and_op_response_callbacks_stamp_their_anchors():
 
 
 @pytest.mark.asyncio
-async def test_c5_get_lock_instance_wires_operation_callbacks():
-    """_get_lock_instance wires all three operation hooks onto the Lock: the
-    write-success stamp plus the C5 acknowledgement and op-response anchors."""
+async def test_get_lock_instance_wires_only_the_stream_observers():
+    """_get_lock_instance stores the two stream observers and nothing else.
+
+    The acknowledgement and op-response hooks fire on any matching frame,
+    including operations we did not issue, so they belong to the connection.
+    The write-success hook belongs to a single operation and is handed over at
+    the call site instead, so a Lock built here carries no way to open the
+    operation window on its own.
+    """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:33")
     push_lock._ble_device = MagicMock()
 
     lock = push_lock._get_lock_instance()
 
-    assert lock._write_success_callback == push_lock._operation_write_success
     assert lock._ack_callback == push_lock._ack_callback
     assert lock._op_response_callback == push_lock._op_response_callback
+    assert not hasattr(lock, "_write_success_callback")
+
+
+@pytest.mark.asyncio
+async def test_operation_outside_the_gate_cannot_open_the_window():
+    """A force_* issued straight at the Lock leaves the operation window shut.
+
+    Only _execute_lock_operation hands over the write-success hook, and only
+    that method closes the window again. A caller reaching the Lock directly
+    therefore gets no hook and cannot leave a window open with no operation in
+    flight, which would freeze status admission for the object's life.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:34")
+    push_lock._ble_device = MagicMock()
+    lock = push_lock._get_lock_instance()
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+
+    handed: list[object] = []
+
+    async def _capture(
+        command: bytearray,
+        command_name: str,
+        response_timeout: float | None = None,
+        progress: object | None = None,
+        write_success_callback: Callable[[], None] | None = None,
+    ) -> bool:
+        handed.append(write_success_callback)
+        if write_success_callback is not None:
+            write_success_callback()
+        return True
+
+    lock._execute_operation_command = _capture  # type: ignore[method-assign]
+
+    assert await lock.force_lock() is True
+
+    assert handed == [None]
+    assert push_lock._operation_window_open is False
+
+
+@pytest.mark.asyncio
+async def test_execute_lock_operation_hands_the_hook_to_the_operation():
+    """The gated path passes its own write-success hook to the operation."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:35")
+    received: list[object] = []
+
+    async def force_lock(write_success_callback):
+        received.append(write_success_callback)
+        return True
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    assert received == [push_lock._operation_write_success]
 
 
 @pytest.mark.asyncio
@@ -3229,7 +3295,7 @@ async def test_execute_operation_restamps_start_anchor_per_attempt():
     start_stamps: list[float] = []
     attempts = 0
 
-    async def force_lock():
+    async def force_lock(write_success_callback):
         nonlocal attempts
         attempts += 1
         start_stamps.append(push_lock._last_lock_operation_start_time)
@@ -3271,8 +3337,8 @@ async def test_operation_defers_battery_poll_past_voltage_sag(outcome):
     # NEVER_TIME sentinel default of _earliest_battery_attempt_time.
     base = NEVER_TIME + 90000.0
 
-    async def force_lock():
-        push_lock._operation_write_success()
+    async def force_lock(write_success_callback):
+        write_success_callback()
         return outcome
 
     mock_lock = MagicMock()
@@ -3317,8 +3383,8 @@ async def test_operation_does_not_shorten_a_longer_battery_cooldown():
     longer_cooldown = base + BATTERY_TIMEOUT_COOLDOWN
     push_lock._earliest_battery_attempt_time = longer_cooldown
 
-    async def force_lock():
-        push_lock._operation_write_success()
+    async def force_lock(write_success_callback):
+        write_success_callback()
         return True
 
     mock_lock = MagicMock()

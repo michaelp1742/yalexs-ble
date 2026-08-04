@@ -195,7 +195,6 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
-        write_success_callback: Callable[[], None] | None = None,
         ack_callback: Callable[[], None] | None = None,
         op_response_callback: Callable[[], None] | None = None,
     ) -> None:
@@ -210,10 +209,6 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
-        # Fired the moment a mechanical command's GATT write completes (the
-        # ATT write response) -- the consumer's single state-action moment:
-        # the command verifiably reached the lock's stack.
-        self._write_success_callback = write_success_callback
         # Invoked when an operation acknowledgement (0xAA echoing LOCK/UNLOCK) is
         # parsed, so the consumer can timestamp it. The acknowledgement is consumed
         # mid-wait by the session's typed matcher and never surfaces as a return
@@ -491,6 +486,7 @@ class Lock:
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         """Run a mechanical operation; True = byte[15] reported success.
 
@@ -499,6 +495,13 @@ class Lock:
         command (opcode + operation byte) and then only the 0xBB op-response
         with the same opcode. The matcher values are captured from the command
         bytes here, BEFORE the session encrypts the buffer in place.
+
+        write_success_callback belongs to the operation, not to this instance:
+        it fires the moment the command's GATT write completes, which is the
+        caller's single state-action moment, so only a caller that issued this
+        command can reach it. The acknowledgement and op-response hooks are
+        instance state by contrast -- they observe the notify stream and must
+        fire for operations we did not issue.
         """
         assert self.session is not None  # nosec
         opcode = command[0x01]
@@ -512,12 +515,14 @@ class Lock:
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=response_timeout,
             progress=progress,
-            write_success_callback=self._write_success_callback,
+            write_success_callback=write_success_callback,
         )
         return response[0x0F] == OperationError.COMM_SUCCESS
 
     @raise_if_not_connected
-    async def force_securemode(self) -> bool:
+    async def force_securemode(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
@@ -526,34 +531,45 @@ class Lock:
                 Commands.LOCK, SECUREMODE_OPERATION_BYTE
             ),
             "force_securemode",
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
         return result
 
     @raise_if_not_connected
-    async def force_lock(self) -> bool:
+    async def force_lock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
         result = await self._execute_operation_command(
-            self.session.build_command(Commands.LOCK), "force_lock"
+            self.session.build_command(Commands.LOCK),
+            "force_lock",
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
         return result
 
     @raise_if_not_connected
-    async def force_unlock(self) -> bool:
+    async def force_unlock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
         result = await self._execute_operation_command(
-            self.session.build_command(Commands.UNLOCK), "force_unlock"
+            self.session.build_command(Commands.UNLOCK),
+            "force_unlock",
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
         return result
 
     @raise_if_not_connected
-    async def force_unlatch(self) -> bool:
+    async def force_unlatch(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock to unlatch (momentary "open door" / retract the latch).
 
         The Unlock opcode with operation byte 0x0A (there is no dedicated
@@ -580,6 +596,7 @@ class Lock:
                 "force_unlatch",
                 response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
                 progress=progress,
+                write_success_callback=write_success_callback,
             )
         except OperationIncompleteError:
             # Already non-retryable: the result never arrived. Ordered ahead

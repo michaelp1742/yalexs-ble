@@ -1043,6 +1043,7 @@ async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         nonlocal captured_command, captured_timeout
         captured_command = command
@@ -1073,6 +1074,7 @@ async def test_force_unlatch_failure_before_write_stays_retryable() -> None:
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         raise DisconnectedError("dropped before the write")
 
@@ -1096,6 +1098,7 @@ async def test_force_unlatch_failure_after_write_converts_to_unlatch_error() -> 
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         assert progress is not None
         progress.write_attempted = True
@@ -1125,6 +1128,7 @@ async def test_force_unlatch_errored_write_converts_to_unlatch_error() -> None:
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         assert progress is not None
         progress.write_attempted = True
@@ -1169,6 +1173,7 @@ async def test_force_unlatch_converts_every_post_write_failure(
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         assert progress is not None
         progress.write_attempted = True
@@ -1195,6 +1200,7 @@ async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         assert progress is not None
         progress.command_written = True
