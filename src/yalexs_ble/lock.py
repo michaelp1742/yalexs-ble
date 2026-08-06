@@ -19,6 +19,7 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_DOOR_STATUS,
@@ -47,6 +48,7 @@ from .secure_session import SecureSession
 from .session import (
     AuthError,
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
     Session,
@@ -326,12 +328,25 @@ class Lock:
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
                     error = VALUE_TO_OPERATION_ERROR.get(result)
-                    _LOGGER.warning(
-                        "%s: Operation failed with result 0x%02X (%s)",
-                        self.name,
-                        result,
-                        error.name if error else "unknown",
-                    )
+                    if result in MECHANICAL_OPERATION_ERRORS:
+                        # The known failure class: the motor stalled, a jam.
+                        _LOGGER.debug(
+                            "%s: Operation failed with result 0x%02X (%s)",
+                            self.name,
+                            result,
+                            error.name if error else "unknown",
+                        )
+                    else:
+                        # Any other result is unexpected in a lock/unlock
+                        # op-response; keep the decoded cause visible.
+                        _LOGGER.warning(
+                            "%s: Operation failed with result 0x%02X (%s)",
+                            self.name,
+                            result,
+                            error.name if error else "unknown",
+                        )
+                    # Every failure class needs manual intervention at the
+                    # lock, so all of them display as JAMMED.
                     return [LockStatus.JAMMED]
                 return ()  # success: recognized, no state update
             if state[1] == Commands.LOCK_ACTIVITY.value:
@@ -487,8 +502,8 @@ class Lock:
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
-        """Run a mechanical operation; True = byte[15] reported success.
+    ) -> None:
+        """Run a mechanical operation; returns only on a reported success.
 
         Completes only on the operation's own op-response (or an error): the
         staged session wait accepts the acknowledgement that echoes this
@@ -502,6 +517,10 @@ class Lock:
         command can reach it. The acknowledgement and op-response hooks are
         instance state by contrast -- they observe the notify stream and must
         fire for operations we did not issue.
+
+        Raises OperationFailedError when the op-response carries a non-zero
+        result in byte[15]: the exchange completed and the lock named the
+        failure (a MECH_* code is a motor stall, a jam).
         """
         assert self.session is not None  # nosec
         opcode = command[0x01]
@@ -517,16 +536,23 @@ class Lock:
             progress=progress,
             write_success_callback=write_success_callback,
         )
-        return response[0x0F] == OperationError.COMM_SUCCESS
+        result = response[0x0F]
+        if result != OperationError.COMM_SUCCESS:
+            error = VALUE_TO_OPERATION_ERROR.get(result)
+            raise OperationFailedError(
+                f"{self.name}: {command_name} reported failure 0x{result:02X} "
+                f"({error.name if error else 'unknown'})",
+                result,
+            )
 
     @raise_if_not_connected
     async def force_securemode(
         self, write_success_callback: Callable[[], None] | None = None
-    ) -> bool:
+    ) -> None:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
-        result = await self._execute_operation_command(
+        await self._execute_operation_command(
             self.session.build_operation_command(
                 Commands.LOCK, SECUREMODE_OPERATION_BYTE
             ),
@@ -534,42 +560,39 @@ class Lock:
             write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
-        return result
 
     @raise_if_not_connected
     async def force_lock(
         self, write_success_callback: Callable[[], None] | None = None
-    ) -> bool:
+    ) -> None:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
-        result = await self._execute_operation_command(
+        await self._execute_operation_command(
             self.session.build_command(Commands.LOCK),
             "force_lock",
             write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
-        return result
 
     @raise_if_not_connected
     async def force_unlock(
         self, write_success_callback: Callable[[], None] | None = None
-    ) -> bool:
+    ) -> None:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
-        result = await self._execute_operation_command(
+        await self._execute_operation_command(
             self.session.build_command(Commands.UNLOCK),
             "force_unlock",
             write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
-        return result
 
     @raise_if_not_connected
     async def force_unlatch(
         self, write_success_callback: Callable[[], None] | None = None
-    ) -> bool:
+    ) -> None:
         """Force the lock to unlatch (momentary "open door" / retract the latch).
 
         The Unlock opcode with operation byte 0x0A (there is no dedicated
@@ -581,15 +604,15 @@ class Lock:
         write call that errors can still have delivered the request (the PDU
         leaves the radio and only the ATT response is lost), so every failure
         from the write attempt onward converts to the non-retryable
-        UnlatchError (OperationIncompleteError, already non-retryable,
-        propagates as itself). Failures before the write attempt (connect,
-        session setup, encryption) stay retryable.
+        UnlatchError (OperationIncompleteError and OperationFailedError,
+        already non-retryable, propagate as themselves). Failures before the
+        write attempt (connect, session setup, encryption) stay retryable.
         """
         _LOGGER.debug("%s: Unlatching", self.name)
         assert self.session is not None  # nosec
         progress = OperationProgress()
         try:
-            result = await self._execute_operation_command(
+            await self._execute_operation_command(
                 self.session.build_operation_command(
                     Commands.UNLOCK, UNLATCH_OPERATION_BYTE
                 ),
@@ -598,10 +621,10 @@ class Lock:
                 progress=progress,
                 write_success_callback=write_success_callback,
             )
-        except OperationIncompleteError:
-            # Already non-retryable: the result never arrived. Ordered ahead
-            # of the broad clause below so the type reaches the caller
-            # unwrapped.
+        except (OperationIncompleteError, OperationFailedError):
+            # Already non-retryable: the result never arrived, or it arrived
+            # and named a failure. Ordered ahead of the broad clause below so
+            # both types reach the caller unwrapped.
             raise
         except Exception as err:
             # Broad on purpose, and every path here re-raises, so no failure
@@ -620,7 +643,6 @@ class Lock:
                 ) from err
             raise
         _LOGGER.debug("%s: Finished unlatching", self.name)
-        return result
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:

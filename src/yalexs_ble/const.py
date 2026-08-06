@@ -97,6 +97,21 @@ class OperationError(IntEnum):
 
 VALUE_TO_OPERATION_ERROR = {err.value: err for err in OperationError}
 
+# The known failure class of a lock/unlock op-response: the motor stalled, a
+# jam. Any other non-zero result is unexpected there and is surfaced at a
+# higher log level; every failure class still needs manual intervention at
+# the lock, so all of them display as JAMMED.
+MECHANICAL_OPERATION_ERRORS = frozenset(
+    {
+        OperationError.MECH_TIMEOUT,
+        OperationError.MECH_POSITION,
+        OperationError.MECH_MOTPOL,
+        OperationError.MECH_TIMEOUT_CAL,
+        OperationError.MECH_BACKOFF,
+        OperationError.MECH_HANDLE_NOT_LIFTED,
+    }
+)
+
 
 class StatusType(IntEnum):
     LOCK_ONLY = 0x02

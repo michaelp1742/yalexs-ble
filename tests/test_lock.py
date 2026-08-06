@@ -38,6 +38,7 @@ from yalexs_ble.lock import (
 )
 from yalexs_ble.session import (
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
     Session,
@@ -181,6 +182,37 @@ def test_parse_unlock_command_response_jammed() -> None:
 
     assert result is not None
     assert list(result) == [LockStatus.JAMMED]
+
+
+@pytest.mark.parametrize(
+    ("result_byte", "expected_level"),
+    [(0x1F, "DEBUG"), (0x32, "WARNING")],
+    ids=["mechanical", "non-mechanical"],
+)
+def test_parse_op_response_failure_log_level(
+    result_byte: int,
+    expected_level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mechanical result logs at DEBUG, the known failure class; any other
+    result is unexpected in a lock/unlock op-response and logs at WARNING.
+    Both display JAMMED, since every failure class needs manual intervention
+    at the lock."""
+    lock = _make_lock()
+
+    frame = bytearray.fromhex("bb0b001b00000000000000000000001f0000")
+    frame[0x0F] = result_byte
+    with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
+        result = lock._parse_state(bytes(frame))
+
+    assert result is not None
+    assert list(result) == [LockStatus.JAMMED]
+    records = [
+        record
+        for record in caplog.records
+        if "Operation failed with result" in record.message
+    ]
+    assert [record.levelname for record in records] == [expected_level]
 
 
 def test_parse_lock_command_response_success_is_no_update() -> None:
@@ -944,7 +976,7 @@ def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -
 
 async def _drive_operation(
     lock: Lock, op_attr: str, opcode: int, operation_byte: int
-) -> bool:
+) -> None:
     """Run a force_* method, feeding its ack then op-response through notify."""
     session = lock.session
     assert session is not None
@@ -956,9 +988,8 @@ async def _drive_operation(
         session._notify(0, bytearray(_op_response_frame(opcode)))
 
     feeder = asyncio.create_task(feed())
-    result: bool = await getattr(lock, op_attr)()
+    await getattr(lock, op_attr)()
     await feeder
-    return result
 
 
 @pytest.mark.asyncio
@@ -977,11 +1008,39 @@ async def test_force_operations_complete_on_ack_then_op_response(
     """Each force_* completes only on its own ack, then its 0xBB op-response.
 
     Drives _execute_operation_command end to end through the real staged session
-    wait; byte[15]=COMM_SUCCESS makes the method return True.
+    wait; byte[15]=COMM_SUCCESS makes the method return instead of raising
+    OperationFailedError.
     """
     lock = _make_connected_lock_with_session()
-    result = await _drive_operation(lock, op_attr, opcode, operation_byte)
-    assert result is True
+    await _drive_operation(lock, op_attr, opcode, operation_byte)
+
+
+@pytest.mark.asyncio
+async def test_force_lock_failure_op_response_raises_operation_failed() -> None:
+    """A failure op-response (byte[15] != 0) raises OperationFailedError.
+
+    The exchange completed and the lock named the cause, so the exception
+    carries the result byte and is not converted or retried. Frame origin
+    (field_frames.md): byte[15] = 0x1F MECH_POSITION, a real lock-jam capture.
+    """
+    lock = _make_connected_lock_with_session()
+    session = lock.session
+    assert session is not None
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(0, bytearray(_ack_frame(Commands.LOCK, 0x00)))
+        await asyncio.sleep(0)
+        session._notify(
+            0,
+            bytearray(_op_response_frame(Commands.LOCK, OperationError.MECH_POSITION)),
+        )
+
+    feeder = asyncio.create_task(feed())
+    with pytest.raises(OperationFailedError) as excinfo:
+        await lock.force_lock()
+    await feeder
+    assert excinfo.value.result == OperationError.MECH_POSITION
 
 
 @pytest.mark.asyncio
@@ -1044,15 +1103,14 @@ async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         nonlocal captured_command, captured_timeout
         captured_command = command
         captured_timeout = response_timeout
-        return True
 
     lock._execute_operation_command = _capture  # type: ignore[method-assign]
 
-    assert await lock.force_unlatch() is True
+    await lock.force_unlatch()
     assert captured_timeout == UNLATCH_OPERATION_RESPONSE_TIMEOUT
     assert captured_command is not None
     assert captured_command[0x01] == Commands.UNLOCK
@@ -1075,7 +1133,7 @@ async def test_force_unlatch_failure_before_write_stays_retryable() -> None:
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         raise DisconnectedError("dropped before the write")
 
     lock._execute_operation_command = _fail  # type: ignore[method-assign]
@@ -1099,7 +1157,7 @@ async def test_force_unlatch_failure_after_write_converts_to_unlatch_error() -> 
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         progress.command_written = True
@@ -1129,7 +1187,7 @@ async def test_force_unlatch_errored_write_converts_to_unlatch_error() -> None:
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         raise BleakError("link dropped during the write")
@@ -1174,7 +1232,7 @@ async def test_force_unlatch_converts_every_post_write_failure(
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         raise error
@@ -1186,9 +1244,21 @@ async def test_force_unlatch_converts_every_post_write_failure(
 
 
 @pytest.mark.asyncio
-async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
-    """OperationIncompleteError is already non-retryable, so it propagates as
-    itself even after the write -- it is not re-wrapped as UnlatchError.
+@pytest.mark.parametrize(
+    "error",
+    [
+        OperationIncompleteError("acked but no op-response"),
+        OperationFailedError("op failed", 0x1F),
+    ],
+    ids=["incomplete", "failed"],
+)
+async def test_force_unlatch_operation_result_errors_are_not_converted(
+    error: Exception,
+) -> None:
+    """Both operation-result types are already non-retryable, so each
+    propagates as itself even after the write; neither is re-wrapped as
+    UnlatchError. The identity assertion is what pins the two-member
+    passthrough tuple: wrapping either type would break it.
     """
     lock = _make_lock()
     lock.session = MagicMock()
@@ -1201,14 +1271,16 @@ async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
+        progress.write_attempted = True
         progress.command_written = True
-        raise OperationIncompleteError("acked but no op-response")
+        raise error
 
     lock._execute_operation_command = _fail  # type: ignore[method-assign]
-    with pytest.raises(OperationIncompleteError):
+    with pytest.raises(type(error)) as excinfo:
         await lock.force_unlatch()
+    assert excinfo.value is error
 
 
 @pytest.mark.parametrize("model", ["Yale Linus L2", "Yale Linus L2 Lite", "SL-103"])

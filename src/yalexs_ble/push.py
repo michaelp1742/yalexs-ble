@@ -43,6 +43,7 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     UnlatchError,
@@ -889,7 +890,24 @@ class PushLock:
             # Hand the write-success hook to this operation alone. The window it
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
-            success = await getattr(lock, op_attr)(self._operation_write_success)
+            await getattr(lock, op_attr)(self._operation_write_success)
+        except OperationFailedError:
+            # The op-response arrived and its result byte named a failure
+            # (mechanical codes are a motor stall, the rest name their own
+            # cause): the exchange completed, the operation did not. The
+            # parser's JAMMED emission fell inside our own window,
+            # so the operation applies it itself once the window is closed,
+            # then propagates: the display carries the jam, the exception
+            # tells the caller the operation did not happen.
+            self._close_operation_window()
+            self._update_any_state([LockStatus.JAMMED])
+            _LOGGER.debug(
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
+            )
+            now = time.monotonic()
+            self._last_lock_operation_complete_time = now
+            self._complete_operation(now)
+            raise
         except (OperationIncompleteError, UnlatchError):
             # Non-retryable: this propagates to the caller. If our write
             # succeeded, a transitional is on display with no result coming --
@@ -927,18 +945,8 @@ class PushLock:
             # One deferral per attempt, whatever the exit.
             self._defer_battery_poll_past_motor_sag()
         self._close_operation_window()
-        if success:
-            self._update_any_state([complete_state])
-            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
-        else:
-            # Our own op-response reported a failure (byte[15] != 0). The parser
-            # already logged the named cause and emitted JAMMED, but that
-            # emission fell inside our own window -- the operation applies its
-            # outcome itself now the window is closed.
-            self._update_any_state([LockStatus.JAMMED])
-            _LOGGER.debug(
-                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
-            )
+        self._update_any_state([complete_state])
+        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
         now = time.monotonic()
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)

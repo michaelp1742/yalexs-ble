@@ -48,6 +48,7 @@ from yalexs_ble.push import (
 )
 from yalexs_ble.session import (
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     UnlatchError,
@@ -2244,14 +2245,15 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up(
 
 @pytest.mark.asyncio
 async def test_execute_lock_operation_success_stamps_complete_state() -> None:
-    """A force_* returning True advances the state to the completed status.
+    """A force_* that returns without raising advances the state to the
+    completed status.
 
     Drives lock() to completion: the transitional LOCKING is stamped, the
     op-response reports success, and the completed LOCKED status is applied.
     """
     push_lock = _operational_push_lock()
     mock_lock = MagicMock()
-    mock_lock.force_lock = AsyncMock(return_value=True)
+    mock_lock.force_lock = AsyncMock(return_value=None)
 
     with patch.object(
         push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
@@ -2264,20 +2266,32 @@ async def test_execute_lock_operation_success_stamps_complete_state() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_lock_operation_failure_displays_jammed() -> None:
-    """A force_* returning False (its op-response reported a failure) never
-    stamps the completed status; the operation applies JAMMED once its window
-    closes (the parser already logged the named cause and emitted JAMMED)."""
+    """A force_* raising OperationFailedError (its op-response reported a
+    failure) never stamps the completed status; the operation applies JAMMED
+    once its window closes (the parser already logged the named cause and
+    emitted JAMMED) and the failure propagates to the caller."""
     push_lock = _operational_push_lock()
     mock_lock = MagicMock()
-    mock_lock.force_unlock = AsyncMock(return_value=False)
+    mock_lock.force_unlock = AsyncMock(
+        side_effect=OperationFailedError("op failed", 0x1F)
+    )
 
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
     ):
         await push_lock.unlock()
 
     mock_lock.force_unlock.assert_awaited_once()
     assert push_lock.lock_status == LockStatus.JAMMED
+    # Completion anchors: the failure handler stamps the completion time and
+    # runs _complete_operation with the same now, so the stale-state floor,
+    # the disconnect timer, and the keep-alive all move despite the jam.
+    assert push_lock._last_lock_operation_complete_time != NEVER_TIME
+    assert (
+        push_lock._last_operation_complete_time
+        == push_lock._last_lock_operation_complete_time
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2336,7 +2350,6 @@ async def test_lock_stamps_transitional_only_at_write_success():
     async def force_lock(write_success_callback):
         order.append(("write_success", None))
         write_success_callback()
-        return True
 
     mock_lock.force_lock = force_lock
 
@@ -2496,7 +2509,8 @@ async def test_nonretryable_before_write_success_stamps_no_unknown():
 async def test_failure_op_response_applies_jammed_after_window():
     """The parser emits JAMMED for our own failure op-response mid-window (the
     state callback runs before session resolves the future), so it is dropped;
-    the success==False path re-applies JAMMED after closing the window.
+    the OperationFailedError path re-applies JAMMED after closing the window
+    and propagates the failure.
 
     Frame origin (field_frames.md): the failure op-response
     bb0b001b...00001f0000 (byte[15]=0x1f MECH_POSITION) makes the Lock parser
@@ -2516,12 +2530,14 @@ async def test_failure_op_response_applies_jammed_after_window():
         write_success_callback()  # opens window, stamps LOCKING
         # Parser emission of the failure op-response lands inside our window.
         push_lock._state_callback([LockStatus.JAMMED])
-        return False  # op-response byte[15] != 0
+        # op-response byte[15] != 0
+        raise OperationFailedError("force_lock reported failure", 0x1F)
 
     mock_lock.force_lock = force_lock
 
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
     ):
         await push_lock.lock()
 
@@ -2554,7 +2570,6 @@ async def test_retry_restamps_at_write_success_without_unknown():
         write_success_callback()  # opens window, stamps LOCKING
         if attempts == 1:
             raise DisconnectedError("dropped before ack")
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -2594,7 +2609,6 @@ async def test_unlatch_stamps_unlatching_then_unlocked():
     async def force_unlatch(write_success_callback):
         order.append("write_success")
         write_success_callback()
-        return True
 
     mock_lock.force_unlatch = force_unlatch
 
@@ -2623,13 +2637,12 @@ async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     gate = asyncio.Event()
     calls = 0
 
-    async def gated_force_lock(write_success_callback: Callable[[], None]) -> bool:
+    async def gated_force_lock(write_success_callback: Callable[[], None]) -> None:
         nonlocal calls
         calls += 1
         write_success_callback()
         if calls == 1:
             await gate.wait()  # hold op1 open while op2 queues behind it
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = gated_force_lock
@@ -3033,21 +3046,23 @@ async def test_forced_reconnect_still_fires_without_hold(bad):
 
 @pytest.mark.asyncio
 async def test_operation_failure_arms_hold():
-    """The success==False JAMMED (applied by the C3 path) also arms the display
-    hold deadline."""
+    """The operation-failure JAMMED also arms the
+    display hold deadline before the failure propagates."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:2e")
 
     mock_lock = MagicMock()
 
     async def force_lock(write_success_callback):
         write_success_callback()
-        return False  # op-response byte[15] != 0
+        # op-response byte[15] != 0
+        raise OperationFailedError("force_lock reported failure", 0x1F)
 
     mock_lock.force_lock = force_lock
 
     before = time.monotonic()
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
     ):
         await push_lock.lock()
 
@@ -3172,15 +3187,14 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         response_timeout: float | None = None,
         progress: object | None = None,
         write_success_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> None:
         handed.append(write_success_callback)
         if write_success_callback is not None:
             write_success_callback()
-        return True
 
     lock._execute_operation_command = _capture  # type: ignore[method-assign]
 
-    assert await lock.force_lock() is True
+    await lock.force_lock()
 
     assert handed == [None]
     assert push_lock._operation_window_open is False
@@ -3194,7 +3208,6 @@ async def test_execute_lock_operation_hands_the_hook_to_the_operation():
 
     async def force_lock(write_success_callback):
         received.append(write_success_callback)
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -3301,7 +3314,6 @@ async def test_execute_operation_restamps_start_anchor_per_attempt():
         start_stamps.append(push_lock._last_lock_operation_start_time)
         if attempts == 1:
             raise DisconnectedError("dropped before write")
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -3328,10 +3340,16 @@ async def test_execute_operation_restamps_start_anchor_per_attempt():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", [True, False], ids=["success", "jam"])
-async def test_operation_defers_battery_poll_past_voltage_sag(outcome):
+@pytest.mark.parametrize(
+    "failure",
+    [None, OperationFailedError("op failed", 0x1F)],
+    ids=["success", "jam"],
+)
+async def test_operation_defers_battery_poll_past_voltage_sag(failure):
     """Both operation outcomes (success and jam) arm the post-op battery
-    cooldown; _poll_battery then skips within the window and polls past it."""
+    cooldown; _poll_battery then skips within the window and polls past it.
+    The jam leg exits through the OperationFailedError handler, so the leg
+    holds only while the deferral sits in the finally clause."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:38")
     # Base "now" past NEVER_TIME so the cooldown arithmetic is not masked by the
     # NEVER_TIME sentinel default of _earliest_battery_attempt_time.
@@ -3339,7 +3357,8 @@ async def test_operation_defers_battery_poll_past_voltage_sag(outcome):
 
     async def force_lock(write_success_callback):
         write_success_callback()
-        return outcome
+        if failure is not None:
+            raise failure
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -3349,7 +3368,11 @@ async def test_operation_defers_battery_poll_past_voltage_sag(outcome):
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch("yalexs_ble.push.time.monotonic", return_value=base),
     ):
-        await push_lock.lock()
+        if failure is None:
+            await push_lock.lock()
+        else:
+            with pytest.raises(OperationFailedError):
+                await push_lock.lock()
 
     # The operation armed the post-op cooldown regardless of outcome.
     assert push_lock._earliest_battery_attempt_time == (
@@ -3385,7 +3408,6 @@ async def test_operation_does_not_shorten_a_longer_battery_cooldown():
 
     async def force_lock(write_success_callback):
         write_success_callback()
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
