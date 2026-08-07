@@ -213,6 +213,54 @@ def test_parse_getstatus_staticposition() -> None:
     assert list(result) == [LockStatus.JAMMED]
 
 
+@pytest.mark.parametrize(
+    ("frame_hex", "expected"),
+    [
+        ("bb0200380200000009000000000000000000", LockStatus.UNLATCHING),
+        ("bb020037020000000a000000000000000000", LockStatus.UNLATCHED),
+    ],
+    ids=["unlatching", "unlatched"],
+)
+def test_parse_getstatus_unlatch_states(frame_hex: str, expected: LockStatus) -> None:
+    """A pushed GETSTATUS position of 0x09 or 0x0A decodes to the unlatch states.
+
+    Both decoded as UNKNOWN while the two members were commented out of
+    LockStatus, since VALUE_TO_LOCK_STATUS is derived from that enum.
+    """
+    lock = _make_lock()
+
+    result = lock._parse_state(bytes.fromhex(frame_hex))
+
+    assert result is not None
+    assert list(result) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(0x09, LockStatus.UNLATCHING), (0x0A, LockStatus.UNLATCHED)],
+    ids=["unlatching", "unlatched"],
+)
+def test_parse_lock_status_decodes_the_unlatch_states(
+    value: int, expected: LockStatus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The second decode site takes the two values, and stops logging them.
+
+    _parse_lock_status has four call sites: the DOOR_AND_LOCK branch, every
+    lock_status() poll, the activity LOCK record's status byte, and the low
+    nibble of the activity PIN record's status byte. It is therefore the site
+    the enum change reaches beyond the pushed LOCK_ONLY frame above. Both
+    values logged an "Unrecognized lock_status_str code" line at all four
+    sites while the members were commented out; this change ends that
+    diagnostic for them everywhere, including the two activity decodes.
+    """
+    lock = _make_lock()
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        assert lock._parse_lock_status(value) is expected
+
+    assert "Unrecognized lock_status_str" not in caplog.text
+
+
 def test_parse_success_op_response_with_0200_trailer_is_no_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
