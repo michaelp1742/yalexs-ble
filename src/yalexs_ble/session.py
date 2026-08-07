@@ -229,13 +229,16 @@ class Session:
                         continue
                     else:
                         break
-            except TimeoutError:
-                # The wait expired with the future still armed. Disarm it so a
-                # late frame cannot land on the cancelled future or leak this
-                # command's matcher into a later wait.
-                self._notify_future = None
-                self._notify_matcher = None
-                raise
+            finally:
+                # If THIS attempt's future is still armed we are exiting
+                # abnormally (timeout / cancellation / disconnect / a write
+                # that raised): disarm it, so a frame arriving before the next
+                # command re-arms the slot does not land on a future nobody is
+                # waiting on. The next command re-arms both slots before its
+                # own write, so what leaks here is only this window.
+                if self._notify_future is future:
+                    self._notify_future = None
+                    self._notify_matcher = None
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 
