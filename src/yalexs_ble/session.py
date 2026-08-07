@@ -157,15 +157,23 @@ class Session:
     def _reject_frame(self, ex: ResponseError, frame: bytes | bytearray) -> None:
         """Dispose of a frame that failed admission.
 
-        The frame is withheld from the state callback. A solicited wait still
-        receives the error, so _locked_write re-sends its command; an
-        unsolicited frame has no waiter and is dropped.
+        The frame is withheld from the state callback. A live solicited wait
+        receives the error, so _locked_write re-sends its command. A wait that
+        has already ended is left to its own cleanup, and an unsolicited frame
+        has no waiter at all; either way the frame is dropped.
         """
         # The drop line carries the frame hex at INFO: these frames should not
         # occur at all, so a drop and its evidence are visible without turning
         # debug on, where the frames themselves are logged.
         _LOGGER.info("%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex)
         if self._notify_future is None:
+            return
+        if self._notify_future.done():
+            # The wait ended before this frame arrived: its timeout cancelled
+            # the future, and the waiting task has not resumed yet to disarm
+            # the slot. Resolving a future that is already done raises
+            # InvalidStateError into the notify dispatcher, so the slot is left
+            # to the waiter's own cleanup.
             return
         _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
         self._notify_future.set_exception(ex)
@@ -178,7 +186,7 @@ class Session:
             "%s: Receiving response via notify: %s (waiting=%s)",
             self.name,
             data.hex(),
-            bool(self._notify_future),
+            self._notify_future is not None and not self._notify_future.done(),
         )
         if len(data) != RESPONSE_FRAME_LEN:
             # This gate must sit ahead of decrypt (see RESPONSE_FRAME_LEN):
@@ -225,6 +233,17 @@ class Session:
             _LOGGER.debug(
                 "%s: Response is not the awaited frame, waiting for next one",
                 self.name,
+            )
+            return
+        if self._notify_future.done():
+            # The same window as above, reached by a frame that would otherwise
+            # answer the command. The waiter reports its own timeout, and that
+            # report is all a reader of the log would otherwise see, so the
+            # frame that would have answered it is named here.
+            _LOGGER.debug(
+                "%s: dropping the answer to a wait that already ended: %s",
+                self.name,
+                decrypted_data.hex(),
             )
             return
         self._notify_future.set_result(decrypted_data)
@@ -276,13 +295,16 @@ class Session:
                         continue
                     else:
                         break
-            except TimeoutError:
-                # The wait expired with the future still armed. Disarm it so a
-                # late frame cannot land on the cancelled future or leak this
-                # command's matcher into a later wait.
-                self._notify_future = None
-                self._notify_matcher = None
-                raise
+            finally:
+                # If THIS attempt's future is still armed we are exiting
+                # abnormally (timeout / cancellation / disconnect / a write
+                # that raised): disarm it, so a frame arriving before the next
+                # command re-arms the slot does not land on a future nobody is
+                # waiting on. The next command re-arms both slots before its
+                # own write, so what leaks here is only this window.
+                if self._notify_future is future:
+                    self._notify_future = None
+                    self._notify_matcher = None
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 
@@ -334,9 +356,10 @@ class Session:
 
         ``response_matcher`` narrows which notify frame answers the command:
         valid frames that do not match still reach the state callback, but the
-        solicited wait stays armed until a matching frame arrives (or the
-        write times out). Without a matcher the first valid frame answers, as
-        before.
+        solicited wait stays armed until a matching frame arrives, or until
+        the wait ends some other way: this commit disarms it on a timeout, a
+        cancellation, a disconnect and a write that raised alike. Without a
+        matcher the first valid frame answers, as before.
         """
         while (
             self._enable_cooldown
