@@ -89,27 +89,6 @@ async def test_execute_without_matcher_takes_first_valid_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty() -> (
-    None
-):
-    """Three corrupt frames exhaust the retries and the error reaches the caller."""
-    received: list[bytes] = []
-    session = _make_matcher_session(received)
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(CORRUPT_ANSWER))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-
-    with pytest.raises(ResponseError):
-        await session._locked_write(bytearray(18), "auto_lock_status")
-
-    assert session.client.write_gatt_char.await_count == 3
-    assert session._notify_future is None
-    assert session._response_matcher is None
-
-
-@pytest.mark.asyncio
 async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> None:
     """A frame that fails the checksum ends the wait, and the write is repeated.
 
@@ -136,6 +115,27 @@ async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> No
     assert session.client.write_gatt_char.await_count == 2
     # Both frames reached the state callback; only the valid one answered.
     assert received == [CORRUPT_ANSWER, READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty() -> (
+    None
+):
+    """Three corrupt frames exhaust the retries and the error reaches the caller."""
+    received: list[bytes] = []
+    session = _make_matcher_session(received)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(CORRUPT_ANSWER))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with pytest.raises(ResponseError):
+        await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert session.client.write_gatt_char.await_count == 3
+    assert session._notify_future is None
+    assert session._response_matcher is None
 
 
 def _short_timeout(_seconds: float) -> object:
