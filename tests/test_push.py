@@ -91,9 +91,15 @@ async def test_operation_lock():
 
 @pytest.mark.asyncio
 async def test_operation_lock_with_retry_bluetooth_connection_error():
-    """Test the operation_lock and retry_bluetooth_connection_error function."""
-
-    counter = 0
+    """Retry outside the operation lock: every attempt of every call runs
+    under the lock, exactly one at a time, the lock is released between
+    attempts, and the final error reaches the caller once the attempts are
+    exhausted."""
+    CALLS = 10
+    real_sleep = asyncio.sleep
+    active = 0
+    max_active = 0
+    calls: list[int] = []
 
     class MockPushLock:
         def __init__(self):
@@ -103,41 +109,57 @@ async def test_operation_lock_with_retry_bluetooth_connection_error():
         def name(self):
             return "lock"
 
+        async def _async_handle_disconnected(self, exc: Exception) -> None:
+            """The retry wrapper awaits this hook on every retryable failure."""
+
         @retry_bluetooth_connection_error
         @operation_lock
-        async def do_something(self):
-            nonlocal counter
-            counter += 1
+        async def do_something(self, idx: int) -> None:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(idx)
             try:
-                await asyncio.sleep(0.001)
+                # Yield while inside the lock so an exclusion failure would
+                # let a second call enter and be recorded in max_active. The
+                # binding taken before the patch keeps this a real yield.
+                await real_sleep(0)
                 raise TimeoutError
             finally:
-                counter -= 1
+                active -= 1
 
     lock = MockPushLock()
-    tasks = []
-    for _ in range(10):
-        tasks.append(asyncio.create_task(lock.do_something()))
+    # Patch out the retry backoff sleep so the test stays event driven even
+    # if the backoff policy widens to cover TimeoutError.
+    with patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()):
+        tasks = [asyncio.create_task(lock.do_something(idx)) for idx in range(CALLS)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for _ in range(10):
-        await asyncio.sleep(0)
-        assert counter == 1
-
-    await asyncio.sleep(0.1)
-    for _ in range(10):
-        await asyncio.sleep(0)
-        assert counter == 0
-
-    for task in tasks:
-        task.cancel()
-    await asyncio.sleep(0)
+    # Every call ran its full attempt count and surfaced the final error.
+    assert [type(result) for result in results] == [TimeoutError] * CALLS
+    assert len(calls) == CALLS * DEFAULT_ATTEMPTS
+    assert all(calls.count(idx) == DEFAULT_ATTEMPTS for idx in range(CALLS))
+    # The lock serialized the attempts: no two calls were ever inside at once.
+    assert max_active == 1
+    assert active == 0
+    # Retrying outside the lock releases it between attempts, so a call's
+    # attempts are not contiguous: another call gets in before the retry.
+    blocks = [
+        calls[i : i + DEFAULT_ATTEMPTS] for i in range(0, len(calls), DEFAULT_ATTEMPTS)
+    ]
+    assert not any(len(set(block)) == 1 for block in blocks)
 
 
 @pytest.mark.asyncio
 async def test_retry_bluetooth_connection_error_with_operation_lock():
-    """Test the operation_lock and retry_bluetooth_connection_error function."""
-
-    counter = 0
+    """The operation lock outside the retry wrapper: a call holds the lock
+    across its whole retry loop, so its attempts run back to back before the
+    next call starts, and the final error reaches the caller."""
+    CALLS = 10
+    real_sleep = asyncio.sleep
+    active = 0
+    max_active = 0
+    calls: list[int] = []
 
     class MockPushLock:
         def __init__(self):
@@ -147,34 +169,46 @@ async def test_retry_bluetooth_connection_error_with_operation_lock():
         def name(self):
             return "lock"
 
+        async def _async_handle_disconnected(self, exc: Exception) -> None:
+            """The retry wrapper awaits this hook on every retryable failure."""
+
         @operation_lock
         @retry_bluetooth_connection_error
-        async def do_something(self):
-            nonlocal counter
-            counter += 1
+        async def do_something(self, idx: int) -> None:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(idx)
             try:
-                await asyncio.sleep(0.001)
+                # Yield while inside the lock so an exclusion failure would
+                # let a second call enter and be recorded in max_active. The
+                # binding taken before the patch keeps this a real yield.
+                await real_sleep(0)
                 raise TimeoutError
             finally:
-                counter -= 1
+                active -= 1
 
     lock = MockPushLock()
-    tasks = []
-    for _ in range(10):
-        tasks.append(asyncio.create_task(lock.do_something()))
+    # Patch out the retry backoff sleep so the test stays event driven even
+    # if the backoff policy widens to cover TimeoutError.
+    with patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()):
+        tasks = [asyncio.create_task(lock.do_something(idx)) for idx in range(CALLS)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for _ in range(10):
-        await asyncio.sleep(0)
-        assert counter == 1
-
-    await asyncio.sleep(0.1)
-    for _ in range(10):
-        await asyncio.sleep(0)
-        assert counter == 0
-
-    for task in tasks:
-        task.cancel()
-    await asyncio.sleep(0)
+    # Every call ran its full attempt count and surfaced the final error.
+    assert [type(result) for result in results] == [TimeoutError] * CALLS
+    assert len(calls) == CALLS * DEFAULT_ATTEMPTS
+    assert all(calls.count(idx) == DEFAULT_ATTEMPTS for idx in range(CALLS))
+    # The lock serialized the attempts: no two calls were ever inside at once.
+    assert max_active == 1
+    assert active == 0
+    # Holding the lock across the retry loop keeps a call's attempts
+    # contiguous: each consecutive block of DEFAULT_ATTEMPTS entries in the
+    # call order belongs to a single call.
+    blocks = [
+        calls[i : i + DEFAULT_ATTEMPTS] for i in range(0, len(calls), DEFAULT_ATTEMPTS)
+    ]
+    assert all(len(set(block)) == 1 for block in blocks)
 
 
 def test_needs_battery_workaround():
