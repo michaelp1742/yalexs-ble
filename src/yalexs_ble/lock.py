@@ -459,6 +459,7 @@ class Lock:
         command: bytearray,
         command_name: str,
         response_timeout: float,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> bool:
         """Run a mechanical operation; True = byte[15] reported success.
 
@@ -467,6 +468,11 @@ class Lock:
         command (opcode + operation byte) and then only the 0xBB op-response
         with the same opcode. The matcher values are captured from the command
         bytes here, BEFORE the session encrypts the buffer in place.
+
+        write_success_callback belongs to the operation, not to this instance:
+        it fires the moment the command's GATT write completes, which is the
+        caller's single state-action moment, so only a caller that issued this
+        command can reach it.
         """
         assert self.session is not None  # nosec
         opcode = command[0x01]
@@ -478,11 +484,14 @@ class Lock:
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=response_timeout,
             progress=OperationProgress(),
+            write_success_callback=write_success_callback,
         )
         return response[0x0F] == OperationError.COMM_SUCCESS
 
     @raise_if_not_connected
-    async def force_securemode(self) -> bool:
+    async def force_securemode(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
@@ -492,12 +501,15 @@ class Lock:
             ),
             "force_securemode",
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
         return result
 
     @raise_if_not_connected
-    async def force_lock(self) -> bool:
+    async def force_lock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
@@ -505,12 +517,15 @@ class Lock:
             self.session.build_command(Commands.LOCK),
             "force_lock",
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
         return result
 
     @raise_if_not_connected
-    async def force_unlock(self) -> bool:
+    async def force_unlock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
@@ -518,6 +533,7 @@ class Lock:
             self.session.build_command(Commands.UNLOCK),
             "force_unlock",
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
         return result
