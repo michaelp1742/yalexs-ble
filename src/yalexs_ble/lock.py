@@ -130,6 +130,45 @@ def _settings_response_matcher(
     return matches
 
 
+def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
+    """Match the acknowledgement of the written command.
+
+    The acknowledgement echoes the request: 0xAA, the written opcode in
+    byte[1], and the command's operation byte in byte[4] (plain operations
+    carry 0x00 there, securemode 0x04, unlatch 0x0A). Any other frame is not
+    this command's acknowledgement; it stays on the state-callback path and
+    the wait continues.
+
+    The 0x00 and 0x04 echoes are field captured. The 0x0A echo is inferred
+    from the same rule, since no unlatch has been captured: a lock that
+    answered an unlatch with a zero byte[4] would fail this match and the
+    operation would time out at the acknowledgement stage.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return (
+            len(data) > 0x04
+            and data[0] == 0xAA
+            and data[1] == opcode
+            and data[4] == operation_byte
+        )
+
+    return _matches
+
+
+def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match the op-response that completes a mechanical operation.
+
+    The op-response (0xBB + the sent opcode) is emitted when the motor stops
+    and carries the operation result in byte[15].
+    """
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x0F and data[0] == 0xBB and data[1] == opcode
+
+    return _matches
+
+
 class Lock:
     def __init__(
         self,
