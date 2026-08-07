@@ -167,6 +167,13 @@ class Session:
         _LOGGER.info("%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex)
         if self._notify_future is None:
             return
+        if self._notify_future.done():
+            # The wait ended before this frame arrived: its timeout cancelled
+            # the future, and the waiting task has not resumed yet to disarm
+            # the slot. Resolving a future that is already done raises
+            # InvalidStateError into the notify dispatcher, so the slot is left
+            # to the waiter's own cleanup.
+            return
         _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
         self._notify_future.set_exception(ex)
         self._notify_future = None
@@ -178,7 +185,7 @@ class Session:
             "%s: Receiving response via notify: %s (waiting=%s)",
             self.name,
             data.hex(),
-            bool(self._notify_future),
+            self._notify_future is not None and not self._notify_future.done(),
         )
         if len(data) != RESPONSE_FRAME_LEN:
             # This gate must sit ahead of decrypt (see RESPONSE_FRAME_LEN):
@@ -221,6 +228,17 @@ class Session:
             _LOGGER.debug(
                 "%s: Response is not the awaited frame, waiting for next one",
                 self.name,
+            )
+            return
+        if self._notify_future.done():
+            # The same window as above, reached by a frame that would otherwise
+            # answer the command. The waiter reports its own timeout, and that
+            # report is all a reader of the log would otherwise see, so the
+            # frame that would have answered it is named here.
+            _LOGGER.debug(
+                "%s: dropping the answer to a wait that already ended: %s",
+                self.name,
+                decrypted_data.hex(),
             )
             return
         self._notify_future.set_result(decrypted_data)
@@ -272,13 +290,16 @@ class Session:
                         continue
                     else:
                         break
-            except TimeoutError:
-                # The wait expired with the future still armed. Disarm it so a
-                # late frame cannot land on the cancelled future or leak this
-                # command's matcher into a later wait.
-                self._notify_future = None
-                self._notify_matcher = None
-                raise
+            finally:
+                # If THIS attempt's future is still armed we are exiting
+                # abnormally (timeout / cancellation / disconnect / a write
+                # that raised): disarm it, so a frame arriving before the next
+                # command re-arms the slot does not land on a future nobody is
+                # waiting on. The next command re-arms both slots before its
+                # own write, so what leaks here is only this window.
+                if self._notify_future is future:
+                    self._notify_future = None
+                    self._notify_matcher = None
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 
