@@ -135,6 +135,20 @@ JAMMED_HOLD_TIME = 30.0
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
+# Lock statuses that do not report the lock's position: the transitionals an
+# operation stamps while it runs, and the UNKNOWN a failed operation stamps.
+# Holding one must not count as having seen the lock status this session,
+# because that suppresses the follow-up lock_status() poll in _update, which is
+# what heals the display once the operation is over.
+NOT_A_POSITION_READING = frozenset(
+    {
+        LockStatus.UNKNOWN,
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+    }
+)
+
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
 RETRY_EXCEPTIONS = (ResponseError, *BLEAK_RETRY_EXCEPTIONS)
@@ -731,22 +745,19 @@ class PushLock:
 
     async def securemode(self) -> None:
         """Set the lock into securemode."""
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
         """Lock the lock."""
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
         )
 
     async def unlock(self) -> None:
         """Unlock the lock."""
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
@@ -758,10 +769,39 @@ class PushLock:
         returned from its open dwell, so the completed state is UNLOCKED; a
         settled UNLATCHED push displays only outside an operation window.
         """
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
         )
+
+    async def _run_lock_operation(
+        self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
+    ) -> None:
+        """Run a lock operation and settle the display once the retries are done.
+
+        This sits outside the retry decorator, so an exception arriving here
+        means every attempt failed. _execute_lock_operation leaves the last
+        attempt's transitional on display through a retryable failure because
+        the next attempt re-stamps it at its own write-success; when there is no
+        next attempt that transitional would stay on display with no result
+        coming, which is the same unknown position the non-retryable exits
+        stamp.
+
+        The displayed status is the test for that: only a write-success of this
+        operation puts pending_state on display while the operation runs, since
+        the window filters everything the lock sends in between. A pending_state
+        left over from an earlier operation reads the same and wants the same
+        answer.
+        """
+        self._cancel_future_update()
+        try:
+            await self._execute_lock_operation(op_attr, pending_state, complete_state)
+        except (OperationFailedError, OperationIncompleteError, UnlatchError):
+            # These exits have already settled the display themselves.
+            raise
+        except Exception:
+            if self.lock_status == pending_state:
+                self._update_any_state([LockStatus.UNKNOWN])
+            raise
 
     def _operation_write_success(self) -> None:
         """The command write reached the lock: the single state-action moment.
@@ -829,14 +869,14 @@ class PushLock:
             )
             return current
         now = time.monotonic()
-        if incoming is LockStatus.JAMMED:
+        if incoming == LockStatus.JAMMED:
             # Admitted jam evidence, whatever the bearer (our own op-response
             # applied after the window closes, a settled 0x07 push, a poll
             # answer, a foreign failure op-response): every event sets a new
             # hold end.
             self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
             return incoming
-        if current is LockStatus.JAMMED and now < self._jammed_hold_deadline:
+        if current == LockStatus.JAMMED and now < self._jammed_hold_deadline:
             # Display hold: after a jam the polled register fabricates a plain
             # locked/unlocked position and no remote signal marks the jam's
             # end, so JAMMED stays pinned until the deadline or until a new
@@ -1088,6 +1128,19 @@ class PushLock:
                 # display hold deadline (see _admit_lock_status), so short-
                 # circuiting an unchanged value would let the hold lapse.
                 admitted = self._admit_lock_status(state, lock_state.lock)
+                if admitted is not state or admitted in NOT_A_POSITION_READING:
+                    # The seen set suppresses the follow-up lock_status() poll
+                    # in _update, so it may only record a reading we hold. A
+                    # reading the policy discarded is not a reading we hold, and
+                    # a transitional or UNKNOWN is not a reading of the lock at
+                    # all, so in both cases the poll has to stay armed.
+                    #
+                    # _admit_lock_status returns current, which is the same
+                    # singleton as the incoming value when the two are equal, so
+                    # an equal-but-filtered reading counts as admitted here.
+                    # That is deliberate and harmless: the displayed value
+                    # already is the reading.
+                    self._seen_this_session.discard(state_type)
                 if lock_state.lock != admitted:
                     changes["lock"] = admitted
             elif isinstance(state, DoorStatus):
@@ -1412,10 +1465,17 @@ class PushLock:
         # policy is deliberate: patching a single site would let the other
         # bypass the filter. This also pins the JAMMED display hold: after a jam
         # the polled register fabricates a plain locked/unlocked position, and a
-        # coincident poll must not clear JAMMED. Only a freshly fetched status
-        # is evidence -- a carried-forward cached value must not re-arm the hold
-        # (see _admit_lock_status), so this is applied only when this cycle
-        # actually read a lock status.
+        # coincident poll must not clear JAMMED.
+        #
+        # The gate is the cycle having read a status at all, so a cycle that
+        # polled nothing carries its cached value forward untouched. It is not
+        # a gate on the value being fresh: the UNKNOWN carry-forward above
+        # replaces a polled UNKNOWN with the cached status before this runs, so
+        # a cached JAMMED reaching here re-arms its own hold for another
+        # JAMMED_HOLD_TIME. Separating the fetched value from the merged one is
+        # the frame-admission restructure that follows this work; until then a
+        # lock answering UNKNOWN holds JAMMED on display for as long as it keeps
+        # answering UNKNOWN.
         if lock_status_fetched:
             admitted = self._admit_lock_status(state.lock, cached_state.lock)
             if admitted != state.lock:

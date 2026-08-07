@@ -148,6 +148,12 @@ class Session:
         # can fall into a gap between the two wait stages.
         self._ack_future: asyncio.Future[bytes] | None = None
         self._ack_matcher: Callable[[bytes], bool] | None = None
+        # The progress record of the operation whose staged wait is in flight,
+        # None between operations. Held for both stages, so it doubles as the
+        # mark of a staged wait: the acknowledgement's own arming is cleared the
+        # moment it arrives, and the op-response stage that follows looks
+        # exactly like a plain wait.
+        self._operation_progress: OperationProgress | None = None
         self._state_callback = state_callback
         self._disconnected_futures = disconnected_futures
         self._first_request = True
@@ -237,25 +243,23 @@ class Session:
         try:
             self._validate_response(data)
         except ResponseError as ex:
-            if (
-                self._notify_future is not None
-                and self._response_matcher is None
-                and self._ack_matcher is None
-            ):
-                # A plain wait with no matcher armed: this frame was the
-                # response, so deliver the error and let the caller decide
-                # on a retry.
+            if self._operation_progress is None and self._notify_future is not None:
+                # A plain wait: deliver the error and let the caller decide on a
+                # retry, as it always has. Re-writing a settings command is
+                # harmless, and the matcher goes with the future so the retry
+                # arms its own.
                 _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
                 self._notify_future.set_exception(ex)
                 self._notify_future = None
+                self._response_matcher = None
                 return
-            # A typed wait is in flight. Surfacing the error would divert
-            # the staged wait (and on the plain path re-send the command);
-            # skip the bad frame and keep waiting -- the stage timeout is
-            # the backstop. Not expected in practice: the BLE link layer's
+            # A staged operation wait is in flight. Surfacing the error would
+            # end the wait and re-send a mechanical command whose result is
+            # unknown, so skip the bad frame and keep waiting; the stage timeout
+            # is the backstop. Not expected in practice: the BLE link layer's
             # CRC and retransmission keep corrupted frames away from us.
             _LOGGER.debug(
-                "%s: Invalid frame during a typed wait, still waiting", self.name
+                "%s: Invalid frame during an operation wait, still waiting", self.name
             )
             return
         if (
@@ -266,6 +270,14 @@ class Session:
             self._ack_future.set_result(decrypted_data)
             self._ack_future = None
             self._ack_matcher = None
+            if self._operation_progress is not None:
+                # Recorded where the acknowledgement is observed rather than
+                # where the staged wait resumes: a disconnect can resolve in the
+                # same event-loop turn and cancel that wait before it ever
+                # resumes, and an acknowledgement recorded nowhere is classified
+                # as a drop before the acknowledgement, which is retryable and
+                # re-sends a command the lock has already taken.
+                self._operation_progress.acknowledged = True
             return
         if self._notify_future is None:
             return
@@ -379,6 +391,7 @@ class Session:
         self._ack_matcher = ack_matcher
         self._notify_future = result_future
         self._response_matcher = response_matcher
+        self._operation_progress = progress
         try:
             _LOGGER.debug(
                 "%s: Writing command to %s: %s",
@@ -406,18 +419,16 @@ class Session:
             )
             if result_future in done:
                 # The op-response supersedes the acknowledgement stage: it
-                # either beat the acknowledgement entirely, or both resolved
-                # in the same event-loop turn -- in which case the
-                # acknowledgement DID arrive and progress must record it.
-                if ack_future in done:
-                    progress.acknowledged = True
+                # either beat the acknowledgement entirely, or both resolved in
+                # the same event-loop turn. Either way the op-response is the
+                # answer, and whether an acknowledgement also arrived was
+                # already recorded where it was received.
                 return result_future.result()
             if ack_future not in done:
                 raise TimeoutError(
                     f"{self.name}: No acknowledgement to {command_name} within "
                     f"{RESPONSE_TIMEOUT}s"
                 )
-            progress.acknowledged = True
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
             result_remaining = response_timeout - (time.monotonic() - attempt_start)
             try:
@@ -430,6 +441,8 @@ class Session:
                     "command being issued"
                 ) from err
         finally:
+            if self._operation_progress is progress:
+                self._operation_progress = None
             if self._ack_future is ack_future:
                 self._ack_future = None
                 self._ack_matcher = None

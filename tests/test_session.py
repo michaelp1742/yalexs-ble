@@ -109,6 +109,35 @@ async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty()
     assert session._response_matcher is None
 
 
+@pytest.mark.asyncio
+async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> None:
+    """A frame that fails the checksum ends the wait, and the write is repeated.
+
+    The corrupt frame resolves the future with a ResponseError, so the matcher
+    must be cleared with it -- otherwise the retry re-arms the wait with the
+    previous command's matcher still in place. The staged operation wait skips
+    corrupt frames instead; this is the plain path, where re-writing a settings
+    command costs nothing.
+    """
+    received: list[bytes] = []
+    session = _make_matcher_session(received)
+    matcher = _settings_response_matcher(
+        Commands.READSETTING.value, SettingType.AUTOLOCK.value
+    )
+    frames = [CORRUPT_ANSWER, READ_ANSWER]
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(frames.pop(0)))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session.execute(bytearray(18), "auto_lock_status", matcher)
+
+    assert result == READ_ANSWER
+    assert session.client.write_gatt_char.await_count == 2
+    # Both frames reached the state callback; only the valid one answered.
+    assert received == [CORRUPT_ANSWER, READ_ANSWER]
+
+
 def _short_timeout(_seconds: float) -> object:
     """Replacement for util.asyncio_timeout that expires almost immediately."""
     return asyncio.timeout(0.01)
@@ -465,7 +494,10 @@ async def test_stage_deadlines_run_from_the_command_issue(
         await _spin_until(lambda: progress.command_written)
         clock["now"] += 2.5  # the acknowledgement lands 3.0 s into the attempt
         session._notify(0, bytearray(ack))
-        await _spin_until(lambda: progress.acknowledged)
+        # The op-response must land in the op-response stage, so wait for that
+        # stage to arm its own bound rather than for progress.acknowledged,
+        # which is set as the frame is received and so is already true here.
+        await _spin_until(lambda: len(op_wait_timeouts) == 2)
         session._notify(0, bytearray(op_response))
 
     feeder = asyncio.create_task(feed())
@@ -570,6 +602,41 @@ async def test_execute_operation_disconnect_after_ack_is_operation_incomplete() 
             progress=progress,
         )
     await feeder
+
+
+@pytest.mark.asyncio
+async def test_ack_and_disconnect_in_one_turn_is_operation_incomplete() -> None:
+    """Ack and disconnect in ONE event-loop turn -> non-retryable.
+
+    The interrupt cancels the staged wait before it resumes, so nothing in the
+    wait body observes the acknowledgement. It still has to be recorded, or the
+    drop is classified as a pre-acknowledgement disconnect and the command is
+    re-sent to a lock that already took it.
+    """
+    session, _ = _make_session()
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.LOCK, 0x04)
+    ack = _with_checksum(_ACK_SECUREMODE)
+
+    async def feed() -> None:
+        await _spin_until(lambda: progress.command_written)
+        # Both resolutions land in the same turn, with no await between them.
+        session._notify(0, bytearray(ack))
+        _fire_disconnect(session)
+
+    feeder = asyncio.create_task(feed())
+    with pytest.raises(OperationIncompleteError):
+        await session.execute_operation(
+            command,
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=progress,
+        )
+    await feeder
+
+    assert progress.acknowledged is True
 
 
 @pytest.mark.asyncio

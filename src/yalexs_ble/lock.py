@@ -226,6 +226,11 @@ class Lock:
         # Retained so a follow-up can expose the failure reason as a
         # diagnostic.
         self._last_op_error: int | None = None
+        # The opcode of the operation this instance is awaiting an op-response
+        # for, None between operations. An op-response on any other opcode was
+        # produced by an operation started at the lock, in the app, or by
+        # auto-lock, and nothing on our side reports its result.
+        self._awaited_operation_opcode: int | None = None
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -328,8 +333,13 @@ class Lock:
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
                     error = VALUE_TO_OPERATION_ERROR.get(result)
-                    if result in MECHANICAL_OPERATION_ERRORS:
-                        # The known failure class: the motor stalled, a jam.
+                    solicited = state[1] == self._awaited_operation_opcode
+                    if solicited and result in MECHANICAL_OPERATION_ERRORS:
+                        # The known failure class of an operation we issued: the
+                        # motor stalled, a jam. The caller is told by the
+                        # OperationFailedError this op-response goes on to
+                        # raise, which carries the same decoded cause, so this
+                        # record is for the frame stream only.
                         _LOGGER.debug(
                             "%s: Operation failed with result 0x%02X (%s)",
                             self.name,
@@ -337,8 +347,11 @@ class Lock:
                             error.name if error else "unknown",
                         )
                     else:
-                        # Any other result is unexpected in a lock/unlock
-                        # op-response; keep the decoded cause visible.
+                        # Either the result is unexpected in a lock/unlock
+                        # op-response, or no operation of ours is awaiting this
+                        # opcode, which makes it an operation started at the
+                        # lock, in the app, or by auto-lock. Nothing else
+                        # reports either case, so this is their only record.
                         _LOGGER.warning(
                             "%s: Operation failed with result 0x%02X (%s)",
                             self.name,
@@ -527,15 +540,19 @@ class Lock:
         operation_byte = command[0x04]
         if progress is None:
             progress = OperationProgress()
-        response = await self.session.execute_operation(
-            command,
-            command_name,
-            ack_matcher=_ack_matcher(opcode, operation_byte),
-            response_matcher=_operation_response_matcher(opcode),
-            response_timeout=response_timeout,
-            progress=progress,
-            write_success_callback=write_success_callback,
-        )
+        self._awaited_operation_opcode = opcode
+        try:
+            response = await self.session.execute_operation(
+                command,
+                command_name,
+                ack_matcher=_ack_matcher(opcode, operation_byte),
+                response_matcher=_operation_response_matcher(opcode),
+                response_timeout=response_timeout,
+                progress=progress,
+                write_success_callback=write_success_callback,
+            )
+        finally:
+            self._awaited_operation_opcode = None
         result = response[0x0F]
         if result != OperationError.COMM_SUCCESS:
             error = VALUE_TO_OPERATION_ERROR.get(result)

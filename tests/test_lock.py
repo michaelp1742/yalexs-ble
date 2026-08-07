@@ -185,20 +185,29 @@ def test_parse_unlock_command_response_jammed() -> None:
 
 
 @pytest.mark.parametrize(
-    ("result_byte", "expected_level"),
-    [(0x1F, "DEBUG"), (0x32, "WARNING")],
-    ids=["mechanical", "non-mechanical"],
+    ("awaited_opcode", "result_byte", "expected_level"),
+    [
+        (Commands.LOCK.value, 0x1F, "DEBUG"),
+        (Commands.LOCK.value, 0x32, "WARNING"),
+        (None, 0x1F, "WARNING"),
+    ],
+    ids=["solicited-mechanical", "solicited-non-mechanical", "unsolicited-mechanical"],
 )
 def test_parse_op_response_failure_log_level(
+    awaited_opcode: int | None,
     result_byte: int,
     expected_level: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A mechanical result logs at DEBUG, the known failure class; any other
-    result is unexpected in a lock/unlock op-response and logs at WARNING.
-    Both display JAMMED, since every failure class needs manual intervention
-    at the lock."""
+    """The mechanical result of an operation we issued logs at DEBUG, because
+    OperationFailedError carries the same cause to the caller. Any other result
+    is unexpected in a lock/unlock op-response, and a mechanical result with no
+    operation of ours awaiting that opcode came from the lock, the app or
+    auto-lock and has no other record, so both log at WARNING. All of them
+    display JAMMED, since every failure class needs manual intervention at the
+    lock."""
     lock = _make_lock()
+    lock._awaited_operation_opcode = awaited_opcode
 
     frame = bytearray.fromhex("bb0b001b00000000000000000000001f0000")
     frame[0x0F] = result_byte
