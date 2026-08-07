@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bleak.exc import BleakError
 
 from yalexs_ble import util
 from yalexs_ble.const import Commands, SettingType
@@ -159,6 +160,125 @@ async def test_locked_write_clears_slot_on_timeout() -> None:
 
     assert session._notify_future is None
     assert session._notify_matcher is None
+
+
+@pytest.mark.asyncio
+async def test_locked_write_clears_slot_when_the_write_errors() -> None:
+    """A write that raises disarms the notify slot on the way out.
+
+    Both slots are armed before the GATT write, so a write error exits with
+    this attempt's own future still in them. Only a timeout used to disarm.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    matcher = _settings_response_matcher(
+        Commands.READSETTING.value, SettingType.AUTOLOCK.value
+    )
+    session.client.write_gatt_char = AsyncMock(side_effect=BleakError("disconnected"))
+
+    with pytest.raises(BleakError):
+        await session._locked_write(bytearray(18), "auto_lock_status", matcher)
+
+    assert session._notify_future is None
+    assert session._notify_matcher is None
+
+
+@pytest.mark.asyncio
+async def test_locked_write_clears_slot_when_the_wait_is_cancelled() -> None:
+    """Cancelling the waiting task disarms the notify slot on the way out.
+
+    A cancellation from outside (a caller timeout, a shutdown) leaves the
+    future cancelled; a frame arriving before the next command re-arms the
+    slot would land on it. Only a timeout used to disarm.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    matcher = _settings_response_matcher(
+        Commands.READSETTING.value, SettingType.AUTOLOCK.value
+    )
+    written = asyncio.Event()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        written.set()
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    task = asyncio.create_task(
+        session._locked_write(bytearray(18), "auto_lock_status", matcher)
+    )
+    await written.wait()
+    armed = session._notify_future
+    assert armed is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session._notify_future is None
+    assert session._notify_matcher is None
+
+
+@pytest.mark.asyncio
+async def test_a_frame_delivered_after_the_wait_ended_is_dropped() -> None:
+    """A frame that arrives once the wait has ended does not resolve it.
+
+    A timeout ends the wait by cancelling the task, which cancels the future
+    it is suspended on, and the task disarms the slot only when it resumes on
+    the next pass of the loop. A notification dispatched in between finds the
+    slot armed and the future already done, and answering it there would raise
+    InvalidStateError into the notify dispatcher. Cancelling the task directly
+    puts the slot in that state.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    written = asyncio.Event()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        written.set()
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    task = asyncio.create_task(session._locked_write(bytearray(18), "auto_lock_status"))
+    await written.wait()
+    armed = session._notify_future
+    assert armed is not None
+    task.cancel()
+    assert armed.cancelled()
+
+    session._notify(0, bytearray(READ_ANSWER))
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The frame still reached the state callback; only the answer was dropped.
+    assert received == [READ_ANSWER]
+    assert session._notify_future is None
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_frame_delivered_after_the_wait_ended_is_dropped() -> None:
+    """The error path drops its frame in that window too.
+
+    Same state as the test above, reached by a frame that fails validation:
+    the error has no wait left to carry it.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    written = asyncio.Event()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        written.set()
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    task = asyncio.create_task(session._locked_write(bytearray(18), "auto_lock_status"))
+    await written.wait()
+    armed = session._notify_future
+    assert armed is not None
+    task.cancel()
+    assert armed.cancelled()
+
+    session._notify(0, bytearray(CORRUPT_ANSWER))
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert received == [CORRUPT_ANSWER]
+    assert session._notify_future is None
 
 
 @pytest.mark.asyncio
