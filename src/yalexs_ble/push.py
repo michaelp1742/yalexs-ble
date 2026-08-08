@@ -47,6 +47,7 @@ from .session import (
     NoAdvertisementError,
     OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -796,6 +797,16 @@ class PushLock:
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        The op-response arrives after the latch has returned, so the
+        completed state is UNLOCKED, not UNLATCHED.
+        """
+        await self._run_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
+        )
+
     def _init_operation_state(self) -> None:
         """Initialize the per-operation fields.
 
@@ -813,9 +824,9 @@ class PushLock:
     ) -> None:
         """Run a lock operation; _finalize_operation runs on every exit.
 
-        The common body of lock(), unlock() and securemode(); it drives the
-        operation and leaves the display with the result, and failures raise
-        to the caller.
+        The common body of lock(), unlock(), securemode() and unlatch(); it
+        drives the operation and leaves the display with the result, and
+        failures raise to the caller.
         """
         self._cancel_future_update()
         self._operation_outcome = None
@@ -956,14 +967,10 @@ class PushLock:
             await getattr(lock, op_attr)(
                 write_success_callback=self._operation_write_success
             )
-        except OperationIncompleteError:
-            # Listed so it reaches the caller as itself: the arm below
-            # would convert it while a status stands recorded.
-            _LOGGER.debug(
-                "%s: %s did not complete; the result never arrived",
-                self.name,
-                op_attr,
-            )
+        except (OperationIncompleteError, UnlatchError):
+            # Listed so both types reach the caller as themselves: the arm
+            # below would convert them while a status stands recorded.
+            _LOGGER.debug("%s: %s ended without a result", self.name, op_attr)
             raise
         except Exception as ex:
             if (recorded := self._seen_intervention_status) is not None:

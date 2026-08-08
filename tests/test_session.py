@@ -24,6 +24,7 @@ from yalexs_ble.session import (
     COOLDOWN_TIME,
     OPERATION_RESPONSE_TIMEOUT,
     RESPONSE_FRAME_LEN,
+    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
     OperationIncompleteError,
@@ -1030,6 +1031,93 @@ async def test_execute_operation_ack_timeout(
     assert progress.acknowledged is False
 
 
+@pytest.mark.asyncio
+async def test_the_no_ack_wait_completes_on_the_op_response_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wait_for_ack=False waits for the op-response alone, for the whole budget.
+
+    The lock acknowledges nothing here and its op-response lands past the
+    acknowledgment budget but well inside the operation's own. With the
+    acknowledgment stage the attempt ends as a TimeoutError before that
+    result can arrive; without it the same exchange completes on the result
+    the lock sent.
+    """
+    monkeypatch.setattr("yalexs_ble.session.ACK_TIMEOUT", 0.05)
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+
+    async def run(wait_for_ack: bool) -> bytes:
+        session, client = _make_operation_session()
+        progress = OperationProgress()
+
+        async def feed() -> None:
+            await _spin_until_written(client)
+            await asyncio.sleep(0.12)
+            session._notify(0, bytearray(op_response))
+
+        feeder = asyncio.create_task(feed())
+        try:
+            return await session.execute_operation(
+                session.build_operation_command(Commands.LOCK, 0x04),
+                "force_securemode",
+                ack_matcher=_ack_matcher(0x0B, 0x04),
+                response_matcher=_operation_response_matcher(0x0B),
+                response_timeout=5.0,
+                progress=progress,
+                wait_for_ack=wait_for_ack,
+            )
+        finally:
+            feeder.cancel()
+
+    assert await run(wait_for_ack=False) == bytes(op_response)
+
+    with pytest.raises(TimeoutError) as exc_info:
+        await run(wait_for_ack=True)
+    # The acknowledgment stage, not the op-response budget: a plain
+    # TimeoutError, so the caller that allows a re-send still gets one.
+    assert not isinstance(exc_info.value, OperationIncompleteError)
+
+
+@pytest.mark.asyncio
+async def test_the_no_ack_timeout_reports_the_missing_acknowledgment() -> None:
+    """The stage-2 timeout message says when the command was never acknowledged.
+
+    With the acknowledgment stage skipped, the message suffix is the one
+    trace of whether the lock answered at all: it separates a link that
+    never delivered the command from a motor that ran long. No frames at
+    all appends it; an acknowledgment that did arrive removes it.
+    """
+    ack = _with_checksum(_ACK_SECUREMODE)
+
+    async def run(deliver_ack: bool) -> str:
+        session, client = _make_operation_session()
+        progress = OperationProgress()
+
+        async def feed() -> None:
+            await _spin_until_written(client)
+            session._notify(0, bytearray(ack))
+
+        feeder = asyncio.create_task(feed()) if deliver_ack else None
+        try:
+            with pytest.raises(OperationIncompleteError) as exc_info:
+                await session.execute_operation(
+                    session.build_operation_command(Commands.LOCK, 0x04),
+                    "force_securemode",
+                    ack_matcher=_ack_matcher(0x0B, 0x04),
+                    response_matcher=_operation_response_matcher(0x0B),
+                    response_timeout=0.2,
+                    progress=progress,
+                    wait_for_ack=False,
+                )
+        finally:
+            if feeder is not None:
+                feeder.cancel()
+        return str(exc_info.value)
+
+    assert "never acknowledged" in await run(deliver_ack=False)
+    assert "never acknowledged" not in await run(deliver_ack=True)
+
+
 def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
     """Stage 1 must outlast a dead link, so a dead link reads as a disconnect.
 
@@ -1041,17 +1129,26 @@ def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
     assert ACK_TIMEOUT > SLOW_TIMEOUT / 100
 
 
-def test_operation_response_timeout_outlasts_the_acknowledgment_budget() -> None:
-    """Stage 2's budget must exceed stage 1's.
+@pytest.mark.parametrize(
+    "budget",
+    [OPERATION_RESPONSE_TIMEOUT, UNLATCH_OPERATION_RESPONSE_TIMEOUT],
+    ids=["plain", "unlatch"],
+)
+def test_operation_response_timeout_outlasts_the_acknowledgment_budget(
+    budget: float,
+) -> None:
+    """Every op-response budget must exceed the acknowledgment budget.
 
     Both stage deadlines run from the command issue, so everything the
     acknowledgment stage consumes comes out of the op-response budget; a
     budget at or below ACK_TIMEOUT could reach stage 2 with nothing left and
-    fail the operation the moment the acknowledgment lands. The relationship
-    is the invariant; the value itself is sized off the observed op-response
-    arrival distribution and moves with it.
+    fail the operation the moment the acknowledgment lands. The unlatch
+    skips the acknowledgment stage, but ACK_TIMEOUT still bounds its GATT
+    write, so the same floor holds. The relationship is the invariant; the
+    plain budget is sized off the observed op-response arrival distribution
+    and moves with it, and the unlatch budget derives from its latch travel.
     """
-    assert OPERATION_RESPONSE_TIMEOUT > ACK_TIMEOUT
+    assert budget > ACK_TIMEOUT
 
 
 def test_operation_incomplete_error_passes_the_retry_decorator() -> None:
@@ -1644,6 +1741,7 @@ async def test_bleak_disconnect_after_ack_is_operation_incomplete() -> None:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         progress.acknowledged = True
         raise BleakError("device disconnected")
@@ -1677,6 +1775,7 @@ async def test_bleak_disconnect_in_one_turn_with_the_op_response_returns_it() ->
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         progress.acknowledged = True
         progress.result = op_response
