@@ -44,11 +44,22 @@ from .const import (
     StatusType,
 )
 from .secure_session import SecureSession
-from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+from .session import (
+    OPERATION_RESPONSE_TIMEOUT,
+    AuthError,
+    DisconnectedError,
+    OperationProgress,
+    Session,
+    YaleXSBLEError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+
+# byte[4] of a Lock command: 0x04 turns the plain lock into securemode. The
+# same opcode+optype mechanism carries the other operation variants.
+SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -356,10 +367,10 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
+                # Operation acknowledgement: it echoes the request type and
+                # carries no result nor resultant state
+                return ()
             if state[1] in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,
@@ -484,36 +495,73 @@ class Lock:
         )
         return self._lock_info
 
+    async def _execute_operation_command(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_timeout: float,
+    ) -> bool:
+        """Run a mechanical operation; True = byte[15] reported success.
+
+        Completes only on the operation's own op-response (or an error): the
+        staged session wait accepts the acknowledgement that echoes this
+        command (opcode + operation byte) and then only the 0xBB op-response
+        with the same opcode. The matcher values are captured from the command
+        bytes here, BEFORE the session encrypts the buffer in place.
+        """
+        assert self.session is not None  # nosec
+        opcode = command[0x01]
+        operation_byte = command[0x04]
+        response = await self.session.execute_operation(
+            command,
+            command_name,
+            ack_matcher=_ack_matcher(opcode, operation_byte),
+            response_matcher=_operation_response_matcher(opcode),
+            response_timeout=response_timeout,
+            progress=OperationProgress(),
+        )
+        return response[0x0F] == OperationError.COMM_SUCCESS
+
     @raise_if_not_connected
-    async def force_securemode(self) -> None:
+    async def force_securemode(self) -> bool:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
+        result = await self._execute_operation_command(
+            self.session.build_operation_command(
+                Commands.LOCK, SECUREMODE_OPERATION_BYTE
+            ),
             "force_securemode",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
+        return result
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
+    async def force_lock(self) -> bool:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.LOCK), "force_lock"
+        result = await self._execute_operation_command(
+            self.session.build_command(Commands.LOCK),
+            "force_lock",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
+        return result
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
+    async def force_unlock(self) -> bool:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.UNLOCK), "force_unlock"
+        result = await self._execute_operation_command(
+            self.session.build_command(Commands.UNLOCK),
+            "force_unlock",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
+        return result
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -555,17 +603,35 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
-    async def securemode(self) -> None:
+    async def securemode(self) -> bool:
+        """Set securemode; True unless the lock reported the operation failed.
+
+        The lock's own status is read first, and a lock already in securemode
+        skips the operation and reports True.
+        """
         if (await self.lock_status()) != LockStatus.SECUREMODE:
-            await self.force_securemode()
+            return await self.force_securemode()
+        return True
 
-    async def lock(self) -> None:
+    async def lock(self) -> bool:
+        """Lock; True unless the lock reported the operation failed.
+
+        The lock's own status is read first, and a lock already locked skips
+        the operation and reports True.
+        """
         if (await self.lock_status()) != LockStatus.LOCKED:
-            await self.force_lock()
+            return await self.force_lock()
+        return True
 
-    async def unlock(self) -> None:
+    async def unlock(self) -> bool:
+        """Unlock; True unless the lock reported the operation failed.
+
+        The lock's own status is read first, and a lock already unlocked
+        skips the operation and reports True.
+        """
         if (await self.lock_status()) != LockStatus.UNLOCKED:
-            await self.force_unlock()
+            return await self.force_unlock()
+        return True
 
     async def _execute_command(
         self,
