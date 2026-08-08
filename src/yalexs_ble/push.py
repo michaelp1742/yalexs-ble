@@ -45,6 +45,7 @@ from .session import (
     NoAdvertisementError,
     OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -739,6 +740,19 @@ class PushLock:
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        Which hardware has a retractable latch is not advertised yet; that
+        capability hint arrives with the integration work that exposes the
+        action. The op-response arrives when the latch has returned from its
+        open dwell, so the completed state is UNLOCKED; a settled UNLATCHED
+        push displays only outside an operation window.
+        """
+        await self._run_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
+        )
+
     async def _run_lock_operation(
         self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
     ) -> None:
@@ -761,8 +775,9 @@ class PushLock:
         self._cancel_future_update()
         try:
             await self._execute_lock_operation(op_attr, pending_state, complete_state)
-        except OperationIncompleteError:
-            # This exit has already settled the display and armed its own heal.
+        except (OperationIncompleteError, UnlatchError):
+            # These exits have already settled the display and armed their own
+            # heal.
             raise
         except Exception:
             if self.lock_status == pending_state:
@@ -921,14 +936,18 @@ class PushLock:
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
             success = await getattr(lock, op_attr)(self._operation_write_success)
-        except OperationIncompleteError:
+        except (OperationIncompleteError, UnlatchError) as err:
             # Non-retryable: this propagates to the caller. If our write
             # succeeded, a transitional is on display with no result coming,
             # so the state is unknown; a jam reported inside the window is a
-            # position and takes that place.
+            # position and takes that place. An UnlatchError carries that same
+            # unknown position with no window ever opened: it is raised from
+            # the write attempt onward, so a write call that errored before
+            # the write-success hook ran may still have fired the latch, and
+            # the position on display is no longer evidence.
             if self._seen_jam:
                 self._display_jam_seen_in_window(op_attr)
-            elif self._operation_window_open:
+            elif self._operation_window_open or isinstance(err, UnlatchError):
                 self._close_operation_window()
                 self._update_any_state([LockStatus.UNKNOWN], arm_resync=False)
             self._pending_op_state = None
