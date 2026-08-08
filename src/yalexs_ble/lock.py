@@ -209,6 +209,8 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        ack_callback: Callable[[], None] | None = None,
+        op_response_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -221,6 +223,21 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # Invoked when an operation acknowledgement (0xAA echoing LOCK/UNLOCK) is
+        # parsed, so the consumer can timestamp it. The acknowledgement is consumed
+        # mid-wait by the session's typed matcher and never surfaces as a return
+        # value, so this hook is the only way to observe it.
+        self._ack_callback = ack_callback
+        # Invoked when a LOCK/UNLOCK op-response (0xBB) is parsed, success or
+        # failure, whichever side issued the command. In the captured traffic
+        # op-responses answering our own commands were the normal case. The
+        # only unsolicited op-responses observed were failure reports from
+        # lock-started operations, and for one of those four frames the
+        # absence of another connected central is only suggestive. An external
+        # success settles through a status push and produces no op-response.
+        # So this is the record of an operation ending, not a channel that
+        # reports every operation started elsewhere.
+        self._op_response_callback = op_response_callback
         # byte[15] of the most recent op-response: 0x00 success, non-zero =
         # OperationError enum value (MECH_* = jam). None until the first op.
         # Retained so a follow-up can expose the failure reason as a
@@ -321,6 +338,24 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
+    def _run_stream_hook(self, hook: Callable[[], None] | None, hook_name: str) -> None:
+        """Run a notify-stream hook, containing anything it raises.
+
+        The hooks run on the parse path, and Session._notify parses a frame
+        before it resolves either wait future, so an exception escaping here
+        would cost the frame its state update and abandon the staged wait of
+        an operation whose motor may be running. A raising hook is a bug in
+        the caller, which is why it is surfaced at error level.
+        """
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            _LOGGER.exception(
+                "%s: %s raised, continuing to parse the frame", self.name, hook_name
+            )
+
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
         # Every frame arriving here is exactly RESPONSE_FRAME_LEN bytes: the
         # session admits no other length, so the fixed offsets below need no
@@ -332,6 +367,9 @@ class Lock:
             # motor stops. The operation result is byte[15]: 0x00 = success,
             # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
             if state[1] in (Commands.LOCK.value, Commands.UNLOCK.value):
+                self._run_stream_hook(
+                    self._op_response_callback, "op_response_callback"
+                )
                 result = state[0x0F]
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
@@ -390,6 +428,7 @@ class Lock:
             if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
                 # Operation acknowledgement: it echoes the request type and
                 # carries no result nor resultant state
+                self._run_stream_hook(self._ack_callback, "ack_callback")
                 return ()
             if state[1] in (
                 Commands.READSETTING.value,
@@ -531,7 +570,9 @@ class Lock:
         write_success_callback belongs to the operation, not to this instance:
         it fires the moment the command's GATT write completes, which is the
         caller's single state-action moment, so only a caller that issued this
-        command can reach it.
+        command can reach it. The acknowledgement and op-response hooks are
+        instance state by contrast: they observe the notify stream and must
+        fire for operations we did not issue.
 
         Raises OperationFailedError when the op-response carries a non-zero
         result in byte[15]: the exchange completed and the lock named the
