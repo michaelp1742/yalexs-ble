@@ -173,6 +173,12 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 # How long to wait before retrying battery after a timeout (5 minutes)
 BATTERY_TIMEOUT_COOLDOWN = 300
 
+# How long to defer battery polling after a mechanical operation so the poll
+# does not sample the motor's voltage sag (distinct from
+# BATTERY_TIMEOUT_COOLDOWN, which backs off after a battery request timed
+# out).
+POST_OPERATION_BATTERY_COOLDOWN = 30.0
+
 # How often to re-poll battery state in always_connected mode (10 minutes)
 BATTERY_REFRESH_INTERVAL = 600
 
@@ -1024,6 +1030,22 @@ class PushLock:
             return current
         return incoming
 
+    def _defer_battery_poll_past_motor_sag(self) -> None:
+        """Push any scheduled battery poll past the motor's voltage sag.
+
+        Called once per operation attempt, on every exit: deferring a poll
+        when the motor never ran costs nothing, so the error exits are not
+        special-cased. External movement evidence (a settled status change, a
+        pushed jam) deliberately does not defer: it arrives at random times
+        and cannot produce the systematic low reading of a battery poll issued
+        straight behind our own operation.
+
+        """
+        self._earliest_battery_attempt_time = max(
+            self._earliest_battery_attempt_time,
+            time.monotonic() + POST_OPERATION_BATTERY_COOLDOWN,
+        )
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _execute_lock_operation(
@@ -1112,6 +1134,9 @@ class PushLock:
                 ex,
             )
             raise
+        finally:
+            # One deferral per attempt, whatever the exit.
+            self._defer_battery_poll_past_motor_sag()
         self._close_operation_window()
         self._update_any_state([complete_state], arm_resync=False)
         _LOGGER.debug("%s: Finished %s", self.name, complete_state)
@@ -1369,11 +1394,11 @@ class PushLock:
             return state, False
 
         now = time.monotonic()
-        # Skip while in cooldown after a prior battery timeout.
+        # Skip while a cooldown is live, whichever mechanism set it: a prior
+        # read timeout, or an operation's voltage sag.
         if now < self._earliest_battery_attempt_time:
             _LOGGER.debug(
-                "%s: Skipping battery request due to recent timeout "
-                "(cooldown until %.1fs)",
+                "%s: Skipping battery request (cooldown until %.1fs)",
                 self.name,
                 self._earliest_battery_attempt_time - now,
             )
