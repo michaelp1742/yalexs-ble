@@ -54,6 +54,7 @@ from yalexs_ble.session import (
     DisconnectedError,
     OperationIncompleteError,
     ResponseError,
+    UnlatchError,
 )
 
 # Shared battery-supporting lock used across tests. model is NOT in
@@ -3381,26 +3382,67 @@ async def test_early_error_before_write_leaves_no_window_and_stamps_unknown():
 
 
 @pytest.mark.asyncio
-async def test_nonretryable_after_write_stamps_unknown():
-    """A non-retryable failure raised after write-success (a transitional is on
-    display with no result coming) closes the window and stamps UNKNOWN."""
-    exc = OperationIncompleteError("no op-response")
+@pytest.mark.parametrize(
+    ("exc", "op_attr", "operation"),
+    [
+        (OperationIncompleteError("no op-response"), "force_lock", "lock"),
+        (UnlatchError("after write"), "force_unlatch", "unlatch"),
+    ],
+)
+async def test_nonretryable_after_write_stamps_unknown(exc, op_attr, operation):
+    """The two non-retryable types raised after write-success (a transitional
+    is on display with no result coming) close the window and stamp UNKNOWN.
+
+    Each type rides the operation that raises it in production: only
+    force_unlatch raises UnlatchError. The single await is the safety
+    property: both types end the attempt ladder on their first raise, and a
+    re-sent unlatch opens the door again.
+    """
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
     mock_lock = MagicMock()
 
-    async def force_lock(write_success_callback):
-        write_success_callback()  # opens window, stamps LOCKING
+    async def force_op(write_success_callback):
+        write_success_callback()  # opens the window, stamps the transitional
         raise exc
 
-    mock_lock.force_lock = force_lock
+    mock_op = AsyncMock(side_effect=force_op)
+    setattr(mock_lock, op_attr, mock_op)
 
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         pytest.raises(type(exc)),
     ):
-        await push_lock.lock()
+        await getattr(push_lock, operation)()
+
+    assert mock_op.await_count == 1
+    assert push_lock._operation_window_open is False
+    assert push_lock._pending_op_state is None
+    assert push_lock.lock_status == LockStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_unlatch_error_without_a_window_still_stamps_unknown():
+    """An UnlatchError with no window open leaves the position unknown.
+
+    force_unlatch converts every failure from the write attempt onward, so a
+    write call that raised arrives here with the write-success hook never run
+    and the window never opened. The request PDU may still have left the
+    radio, in which case the latch fired and the door is open, so the position
+    on display is no longer evidence.
+    """
+    push_lock = _operational_push_lock()
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    mock_lock = MagicMock()
+    mock_lock.force_unlatch = AsyncMock(side_effect=UnlatchError("errored write"))
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(UnlatchError),
+    ):
+        await push_lock.unlatch()
 
     assert push_lock._operation_window_open is False
     assert push_lock._pending_op_state is None
@@ -4222,7 +4264,9 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         command: bytearray,
         command_name: str,
         response_timeout: float = 0.0,
+        progress: object | None = None,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> None:
         handed.append(write_success_callback)
         if write_success_callback is not None:
@@ -4450,6 +4494,39 @@ async def test_exhausted_retries_after_write_success_stamp_unknown() -> None:
     assert LockStatus not in push_lock._seen_this_session
     # The attempts ran out with no result, so this exit schedules the poll itself.
     assert push_lock._force_lock_status_poll is True
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_unlatch_stamps_unlatching_then_unlocked():
+    """The new public unlatch() maps to force_unlatch, stamping UNLATCHING at
+    write-success and UNLOCKED on success: the op-response arrives when the
+    latch has returned from its open dwell, so UNLATCHED is never the
+    completed state."""
+    push_lock = _operational_push_lock()
+    order: list[str | LockStatus] = []
+
+    def cb(lock_state, lock_info, connection_info):
+        order.append(lock_state.lock)
+
+    push_lock.register_callback(cb)
+
+    mock_lock = MagicMock()
+
+    async def force_unlatch(write_success_callback):
+        order.append("write_success")
+        write_success_callback()
+
+    mock_lock.force_unlatch = force_unlatch
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.unlatch()
+
+    assert order == ["write_success", LockStatus.UNLATCHING, LockStatus.UNLOCKED]
+    assert push_lock.lock_status == LockStatus.UNLOCKED
+    push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
 
 

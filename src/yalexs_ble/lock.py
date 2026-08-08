@@ -46,10 +46,13 @@ from .const import (
 from .secure_session import SecureSession
 from .session import (
     OPERATION_RESPONSE_TIMEOUT,
+    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
+    OperationIncompleteError,
     OperationProgress,
     Session,
+    UnlatchError,
     YaleXSBLEError,
 )
 
@@ -57,7 +60,9 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
 
-# byte[4] of a Lock command: 0x04 turns the plain lock into securemode.
+# byte[4] of an operation command selects the variant: 0x0A on Unlock is an
+# unlatch (retract the latch), 0x04 on Lock is securemode.
+UNLATCH_OPERATION_BYTE = 0x0A
 SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
@@ -502,7 +507,9 @@ class Lock:
         command: bytearray,
         command_name: str,
         response_timeout: float,
+        progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> None:
         """Run a mechanical operation, returning when the lock reports it done.
 
@@ -513,14 +520,21 @@ class Lock:
         assert self.session is not None  # nosec
         opcode = command[0x01]
         operation_byte = command[0x04]
+        if progress is None:
+            # Only the unlatch reads the record: write_attempted gates its
+            # never-re-send conversion. Lock, unlock and securemode convert
+            # nothing on it, so they let the callee own a throwaway rather
+            # than push the construction into three call sites.
+            progress = OperationProgress()
         await self.session.execute_operation(
             command,
             command_name,
             ack_matcher=_ack_matcher(opcode, operation_byte),
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=response_timeout,
-            progress=OperationProgress(),
+            progress=progress,
             write_success_callback=write_success_callback,
+            wait_for_ack=wait_for_ack,
         )
 
     @raise_if_not_connected
@@ -569,6 +583,61 @@ class Lock:
             write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
+
+    @raise_if_not_connected
+    async def force_unlatch(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
+        """Force the lock to unlatch (momentary "open door" / retract the latch).
+
+        The Unlock opcode with operation byte 0x0A (there is no dedicated
+        unlatch opcode); its op-response is a normal Unlock (0xBB 0A) frame.
+
+        A repeated unlatch fires the latch again, opening the door again, so
+        once the command write has been ATTEMPTED no failure may re-send it: a
+        write call that errors can still have delivered the request (the PDU
+        leaves the radio and only the ATT response is lost), so every failure
+        from the write attempt onward converts to the non-retryable
+        UnlatchError (OperationIncompleteError, already non-retryable,
+        propagates as itself). Failures before the write attempt (connect,
+        session setup, encryption) stay retryable.
+
+        That same rule makes the acknowledgment a don't care here, so this is
+        the one operation that waits on its op-response alone.
+        """
+        _LOGGER.debug("%s: Unlatching", self.name)
+        assert self.session is not None  # nosec
+        progress = OperationProgress()
+        try:
+            await self._execute_operation_command(
+                self.session.build_operation_command(
+                    Commands.UNLOCK, UNLATCH_OPERATION_BYTE
+                ),
+                "force_unlatch",
+                response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+                progress=progress,
+                write_success_callback=write_success_callback,
+                wait_for_ack=False,
+            )
+        except OperationIncompleteError:
+            # Already non-retryable: the result never arrived. Ordered ahead
+            # of the broad clause below so the type reaches the caller
+            # unwrapped.
+            raise
+        except Exception as err:
+            # Broad on purpose: no failure of any kind may reach the retry
+            # wrapper once the write was attempted. Every path re-raises;
+            # cancellation is a BaseException and passes through. AuthError
+            # is converted too, so auth failure handling waits for the next
+            # update cycle.
+            if progress.write_attempted:
+                raise UnlatchError(
+                    f"{self.name}: Unlatch failed after the command write was "
+                    f"attempted, and a repeated unlatch opens the door again, "
+                    f"so it was not retried: {err}"
+                ) from err
+            raise
+        _LOGGER.debug("%s: Finished unlatching", self.name)
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -621,6 +690,12 @@ class Lock:
     async def unlock(self) -> None:
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        """Unlatch; this always runs the operation, since a momentary
+        action leaves no state a status read could test.
+        """
+        await self.force_unlatch()
 
     async def _execute_command(
         self,

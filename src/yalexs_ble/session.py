@@ -40,6 +40,11 @@ ACK_TIMEOUT = 8.0
 # operation with a longer motion passes its own budget.
 OPERATION_RESPONSE_TIMEOUT = 12.0
 
+# The operation budget for an unlatch: an unlatch is an unlock that also
+# fires the latch, so the latch's pull in, hold, and release stack on
+# the mechanical movement the plain budget covers.
+UNLATCH_OPERATION_RESPONSE_TIMEOUT = 20.0
+
 
 class YaleXSBLEError(Exception):
     """Base class for YaleXSBLE errors."""
@@ -71,6 +76,15 @@ class OperationIncompleteError(YaleXSBLEError):
     The command reached the lock, so the motor may have run, but the
     op-response was lost. Deliberately not a retryable type: it ends the
     retry attempts with the result unknown.
+    """
+
+
+class UnlatchError(YaleXSBLEError):
+    """An unlatch failed after its command write was attempted.
+
+    The command may have reached the lock, and a repeated unlatch opens the
+    door again, so nothing may re-send it. Deliberately not a retryable
+    type, so it passes through the retry decorator to the caller unchanged.
     """
 
 
@@ -425,15 +439,17 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         """Write a mechanical command and run the staged wait.
 
-        Starting (or restarting) an operation initialises its timers: both
-        stage deadlines run from the attempt start. Stage 1 (ACK_TIMEOUT)
-        covers the GATT write and the typed acknowledgment; stage 2 (the
-        operation's response_timeout, also from attempt start) covers the
-        op-response, the physical end of movement. Only an op-response, or an
+        Both stage deadlines run from the attempt start: the acknowledgment
+        budget ACK_TIMEOUT covers the write and the acknowledgment, and
+        response_timeout covers the op-response. Only an op-response, or an
         error, ends the wait.
+
+        With wait_for_ack False the acknowledgment stage is skipped; the GATT
+        write keeps the same bound either way.
         """
         if not self.client.is_connected:
             raise BleakError("disconnected")
@@ -477,37 +493,40 @@ class Session:
                         self.name,
                         command_name,
                     )
-            _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
-            ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
-            done, _ = await asyncio.wait(
-                (ack_future, result_future),
-                timeout=max(ack_remaining, 0),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if result_future in done:
-                # The op-response supersedes the acknowledgment stage: it
-                # either beat the acknowledgment entirely, or both resolved in
-                # the same event-loop turn. Either way the op-response is the
-                # answer, and whether an acknowledgment also arrived was
-                # already recorded where it was received. The matcher keys on
-                # the opcode alone, so the frame taken here can also be a
-                # previous same-opcode command's late op-response. That
-                # residual is accepted: requiring the acknowledgment first
-                # would instead drop a genuine op-response whose
-                # acknowledgment was lost.
-                if not progress.acknowledged:
-                    _LOGGER.info(
-                        "%s: %s completed on its op-response; no "
-                        "acknowledgment was received",
-                        self.name,
-                        command_name,
-                    )
-                return result_future.result()
-            if ack_future not in done:
-                raise TimeoutError(
-                    f"{self.name}: No acknowledgment to {command_name} within "
-                    f"{ACK_TIMEOUT}s of the command being issued"
+            if wait_for_ack:
+                _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
+                ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
+                done, _ = await asyncio.wait(
+                    (ack_future, result_future),
+                    timeout=max(ack_remaining, 0),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if result_future in done:
+                    # The op-response supersedes the acknowledgment stage: it
+                    # either beat the acknowledgment entirely, or both
+                    # resolved in the same event-loop turn. Either way the
+                    # op-response is the answer, and whether an acknowledgment
+                    # also arrived was already recorded where it was received.
+                    # The matcher keys on the opcode alone, so the frame taken
+                    # here can also be a previous same-opcode command's late
+                    # op-response. That residual is accepted: requiring the
+                    # acknowledgment first would instead drop a genuine
+                    # op-response whose acknowledgment was lost.
+                    # The no-acknowledgment INFO belongs to this stage: with
+                    # the stage skipped the acknowledgment is a don't care.
+                    if not progress.acknowledged:
+                        _LOGGER.info(
+                            "%s: %s completed on its op-response; no "
+                            "acknowledgment was received",
+                            self.name,
+                            command_name,
+                        )
+                    return result_future.result()
+                if ack_future not in done:
+                    raise TimeoutError(
+                        f"{self.name}: No acknowledgment to {command_name} "
+                        f"within {ACK_TIMEOUT}s of the command being issued"
+                    )
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
             result_remaining = response_timeout - (monotonic() - attempt_start)
             try:
@@ -525,10 +544,15 @@ class Session:
                         command_name,
                     )
                     return recorded
+                never_acknowledged = (
+                    ""
+                    if progress.acknowledged
+                    else "; the command was never acknowledged"
+                )
                 raise OperationIncompleteError(
-                    f"{self.name}: {command_name} was acknowledged but no "
-                    f"op-response arrived within {response_timeout}s of the "
-                    "command being issued"
+                    f"{self.name}: No op-response to {command_name} arrived "
+                    f"within {response_timeout}s of the command being issued"
+                    f"{never_acknowledged}"
                 ) from err
         finally:
             # Unconditional: the session lock serializes operations, so the
@@ -668,18 +692,16 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         """Execute a mechanical operation command with the staged wait.
 
-        Error policy by stage (the caller's retry decorator sees the types).
-        The acknowledgment carries no mechanical delay, so its absence
-        signals a delivery problem and predicts a missing op-response: write
-        and acknowledgment failures keep their retryable types (TimeoutError
-        / DisconnectedError / BleakError) and the retry re-sends the command
-        early rather than waiting out the op-response budget. Once the
-        operation is acknowledged, a timeout or disconnect raises the
-        non-retryable OperationIncompleteError, ending the attempt ladder: the
-        result is unknown and the caller decides.
+        With the acknowledgment stage in place, failures up to the
+        acknowledgment keep their retryable types, so the caller's retry
+        decorator re-sends early; the acknowledgment has no mechanical
+        delay, so its absence means delivery failed.
+        Later failures raise OperationIncompleteError, which ends the retry
+        attempts with the result unknown.
 
         response_timeout is the budget for the whole exchange, measured from
         the moment the command is issued. Size it above ACK_TIMEOUT: the
@@ -687,6 +709,15 @@ class Session:
         wait, so a budget at or below ACK_TIMEOUT leaves that wait no time
         at all. OPERATION_RESPONSE_TIMEOUT is that budget for the operations
         sized here, and an operation with a longer motion passes its own.
+
+        wait_for_ack=False skips the acknowledgment wait, for a caller
+        whose failure handling must never re-send: a lost acknowledgment
+        would otherwise end an operation whose result could still arrive.
+        It does not by itself stop a re-send: a post-write disconnect with
+        nothing acknowledged still raises its retryable type, so such a
+        caller converts on progress.write_attempted the way
+        Lock.force_unlatch does. The acknowledgment is still matched and
+        recorded when it lands; only the wait on it is dropped.
         """
         await self._wait_for_cooldown()
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
@@ -711,6 +742,7 @@ class Session:
                     response_timeout,
                     progress,
                     write_success_callback,
+                    wait_for_ack,
                 )
         except DisconnectedError as err:
             result = self._outcome_after_disconnect(progress, command_name, err)
