@@ -82,6 +82,13 @@ FIRST_CONNECTION_DISCONNECT_TIME = 2.1
 # update its state or it will return a stale state.
 LOCK_STALE_STATE_DEBOUNCE_DELAY = 6.1
 
+# Minimum settle margin after an observed op-response. The op-response is the
+# true end of movement, so this arm binds whenever the op-response lands more
+# than 2.0 s after the acknowledgement, which is where the 6.1 s measured from
+# the acknowledgement has already run out. Below that gap the acknowledgement
+# arm is the later of the two and this one does nothing.
+POST_OP_RESPONSE_DEBOUNCE_DELAY = 4.1
+
 # How long to wait before processing an advertisement change
 ADV_UPDATE_COALESCE_SECONDS = 0.05
 
@@ -426,6 +433,7 @@ class PushLock:
         self._next_disconnect_delay = idle_disconnect_delay
         self._first_update_future: asyncio.Future[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._init_operation_anchors()
         # The operation in flight, from the caller's view: the pending
         # transitional to stamp at write-success (only one LockOperation is
         # ever in play, the operation lock enforces it) and whether the
@@ -451,7 +459,6 @@ class PushLock:
         self._jam_hold_wakeup = _DeadlineWakeup(
             self.loop, lambda: self._jammed_hold_deadline, self._jam_hold_ended
         )
-        self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._slow_params_set = False
@@ -583,6 +590,20 @@ class PushLock:
         self._lock_key = key
         self._lock_key_index = slot
 
+    def _init_operation_anchors(self) -> None:
+        """Set the three moments of the mechanical exchange to "never".
+
+        Command issued (EE write), acknowledgement received (AA, up to ~2 s
+        later on a slow connection interval), and op-response / motor stop
+        (BB 0A/0B). Kept distinct because on a slow link they are seconds
+        apart: the acknowledgement is NOT a proxy for the command. They are
+        deliberately not cleared on reconnect, so a settle window outlives the
+        connection it started on.
+        """
+        self._last_lock_operation_start_time = NEVER_TIME
+        self._last_lock_operation_acknowledged_time = NEVER_TIME
+        self._last_lock_operation_complete_time = NEVER_TIME
+
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the ble device."""
         self._ble_device = ble_device
@@ -605,6 +626,8 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            ack_callback=self._ack_callback,
+            op_response_callback=self._op_response_callback,
         )
 
     def _disconnected_callback(self) -> None:
@@ -870,6 +893,26 @@ class PushLock:
             self._update_any_state([self._pending_op_state], arm_resync=False)
         self._operation_window_open = True
 
+    def _ack_callback(self) -> None:
+        """Record when an operation acknowledgement arrived.
+
+        Keyed on the opcode, not on whose command it answers. Our own
+        operations are the expected source; whether another central's operation
+        is ever echoed to us as an acknowledgement is unverified, but if one is,
+        the only effect here is a conservative extension of the stale-state
+        guard, which is harmless.
+        """
+        self._last_lock_operation_acknowledged_time = time.monotonic()
+
+    def _op_response_callback(self) -> None:
+        """Record when an op-response was observed, ours or external.
+
+        An operation started at the lock, in the app, or by auto-lock never
+        stamps the start or acknowledgement anchors, so this is the only
+        stale-guard anchor it produces.
+        """
+        self._last_lock_operation_complete_time = time.monotonic()
+
     def _close_operation_window(self) -> None:
         """Close the operation window and drop the pending transitional."""
         self._operation_window_open = False
@@ -998,6 +1041,9 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
+            # Command-issue anchor, re-stamped per attempt so a retry moves the
+            # stale-state floor forward with it.
+            self._last_lock_operation_start_time = time.monotonic()
             # Hand the write-success hook to this operation alone. The window it
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
@@ -1047,9 +1093,9 @@ class PushLock:
             # debounce rather than the resync delay because a cancel does not
             # stop the lock: the command that was written is still driving the
             # motor, and a read taken immediately returns the pre-operation
-            # position. The stale-state guard does not defer this cycle
-            # either, since its anchor is stamped only when an operation
-            # completes, so the wait is booked here instead.
+            # position. The stale-state guard defers the cycle as well once an
+            # acknowledgement has been recorded; a cancel arriving before that
+            # leaves this delay as the only wait.
             self._force_lock_status_poll = True
             self._schedule_future_update_with_debounce(LOCK_STALE_STATE_DEBOUNCE_DELAY)
             raise
@@ -1906,11 +1952,23 @@ class PushLock:
             )
             self._schedule_future_update_with_debounce(UPDATE_IN_PROGRESS_DEFER_SECONDS)
             return
-        if (
-            seconds_time_lock_op := (now - self._last_lock_operation_complete_time)
-        ) < LOCK_STALE_STATE_DEBOUNCE_DELAY:
+        # Stale-state guard, gating every poll path uniformly: the floor is the
+        # field-proven 6.1 s from the acknowledgement (command issue is the
+        # dropped-acknowledgement fallback), extended to 4.1 s past the op-response
+        # when the op-response arrived late -- the op-response is the true end of
+        # movement (ours via operation completion, external ops via
+        # _op_response_callback).
+        stale_deadline = max(
+            max(
+                self._last_lock_operation_start_time,
+                self._last_lock_operation_acknowledged_time,
+            )
+            + LOCK_STALE_STATE_DEBOUNCE_DELAY,
+            self._last_lock_operation_complete_time + POST_OP_RESPONSE_DEBOUNCE_DELAY,
+        )
+        if now < stale_deadline:
             _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
-            self._schedule_future_update_with_debounce(seconds_time_lock_op)
+            self._schedule_future_update_with_debounce(stale_deadline - now)
             return
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 

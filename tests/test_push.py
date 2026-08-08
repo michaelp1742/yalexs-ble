@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import time
 from collections.abc import Callable
@@ -37,6 +38,7 @@ from yalexs_ble.push import (
     LOCK_STALE_STATE_DEBOUNCE_DELAY,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
+    POST_OP_RESPONSE_DEBOUNCE_DELAY,
     RESYNC_DELAY,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
@@ -3255,8 +3257,9 @@ async def test_cancellation_heals_sooner_than_the_keep_alive() -> None:
     link is still up, so this heal is deliberately not the keep-alive one. It
     is armed at the settle debounce rather than the resync delay, because the
     written command is still driving the motor and an immediate read would
-    return the pre-operation position. The stale-state guard does not defer
-    this cycle, since its anchor is stamped only when an operation completes.
+    return the pre-operation position. The stale-state guard defers the cycle
+    as well once an acknowledgement has been recorded; a cancel arriving
+    before that leaves this delay as the only wait.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:45")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
@@ -3924,3 +3927,165 @@ async def test_battery_only_cycle_does_not_move_hold_deadline():
     # Deadline untouched; display still JAMMED (carried forward, not re-armed).
     assert push_lock._jammed_hold_deadline == deadline
     assert final_state.lock == LockStatus.JAMMED
+
+
+# ---------------------------------------------------------------------------
+# The stale-state guard and its three anchors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ack_and_op_response_callbacks_stamp_their_anchors():
+    """_ack_callback stamps only the acknowledgement anchor and
+    _op_response_callback only the completion anchor; an external op (no command
+    on our side) stamps neither the start nor the acknowledgement anchor."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:32")
+    assert push_lock._last_lock_operation_start_time == NEVER_TIME
+    assert push_lock._last_lock_operation_acknowledged_time == NEVER_TIME
+    assert push_lock._last_lock_operation_complete_time == NEVER_TIME
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=2000.0):
+        push_lock._ack_callback()
+    assert push_lock._last_lock_operation_acknowledged_time == 2000.0
+    assert push_lock._last_lock_operation_start_time == NEVER_TIME  # not the command
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=2005.0):
+        push_lock._op_response_callback()
+    assert push_lock._last_lock_operation_complete_time == 2005.0
+    # An external op-response stamps neither the start nor the ack anchor.
+    assert push_lock._last_lock_operation_start_time == NEVER_TIME
+    assert push_lock._last_lock_operation_acknowledged_time == 2000.0
+
+
+@pytest.mark.asyncio
+async def test_get_lock_instance_wires_only_the_stream_observers():
+    """_get_lock_instance stores the two stream observers and nothing else.
+
+    The acknowledgement and op-response hooks fire on any matching frame,
+    including operations we did not issue, so they belong to the connection.
+    The write-success hook belongs to a single operation and is handed over at
+    the call site instead, so a Lock built here carries no way to open the
+    operation window on its own.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:33")
+    push_lock._ble_device = MagicMock()
+
+    lock = push_lock._get_lock_instance()
+
+    assert lock._ack_callback == push_lock._ack_callback
+    assert lock._op_response_callback == push_lock._op_response_callback
+    assert not hasattr(lock, "_write_success_callback")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "ack", "complete", "expected_delay"),
+    [
+        # Acknowledgement arm dominates: max(start, ack) + 6.1.
+        (996.0, 997.0, 990.0, 3.1),
+        # Command-issue arm dominates over a stale acknowledgement.
+        (998.0, 995.0, 990.0, 4.1),
+        # Op-response arm dominates: complete + 4.1.
+        (990.0, 991.0, 999.0, 3.1),
+    ],
+)
+async def test_deferred_update_reschedules_to_the_max_anchor_arm(
+    start, ack, complete, expected_delay
+):
+    """Within the stale window the update reschedules by exactly
+    max(max(start, ack) + 6.1, complete + 4.1) - now."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:34")
+    push_lock._last_lock_operation_start_time = start
+    push_lock._last_lock_operation_acknowledged_time = ack
+    push_lock._last_lock_operation_complete_time = complete
+
+    with (
+        patch("yalexs_ble.push.time.monotonic", return_value=1000.0),
+        patch.object(
+            push_lock, "_schedule_future_update_with_debounce"
+        ) as mock_reschedule,
+    ):
+        push_lock._deferred_update()
+
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(expected_delay)
+
+
+@pytest.mark.asyncio
+async def test_external_op_response_alone_defers_poll():
+    """An external op-response (op_response_callback, with the start and
+    acknowledgement anchors never stamped) alone defers the next poll by 4.1 s."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:35")
+    # A fake "now" comfortably after NEVER_TIME so the untouched start/ack
+    # anchors (still NEVER_TIME) stay firmly in the past.
+    now = NEVER_TIME + 90000.0
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=now):
+        push_lock._op_response_callback()
+        # The external op produced no start or acknowledgement anchor.
+        assert push_lock._last_lock_operation_start_time == NEVER_TIME
+        assert push_lock._last_lock_operation_acknowledged_time == NEVER_TIME
+        with patch.object(
+            push_lock, "_schedule_future_update_with_debounce"
+        ) as mock_reschedule:
+            push_lock._deferred_update()
+
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(
+        POST_OP_RESPONSE_DEBOUNCE_DELAY
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_anchors_proceeds_immediately():
+    """With every anchor at NEVER_TIME (about a day in the past) the deadline is
+    far behind now, so _deferred_update starts the update instead of deferring."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:36")
+    assert push_lock._last_lock_operation_start_time == NEVER_TIME
+    assert push_lock._last_lock_operation_acknowledged_time == NEVER_TIME
+    assert push_lock._last_lock_operation_complete_time == NEVER_TIME
+
+    push_lock._execute_deferred_update = AsyncMock()  # type: ignore[method-assign]
+
+    with patch.object(
+        push_lock, "_schedule_future_update_with_debounce"
+    ) as mock_reschedule:
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    mock_reschedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_operation_restamps_start_anchor_per_attempt():
+    """The start anchor is stamped immediately before each operation attempt, so
+    a retry re-stamps it and the stale-state floor tracks the latest attempt."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
+    start_stamps: list[float] = []
+    attempts = 0
+
+    async def force_lock(write_success_callback):
+        nonlocal attempts
+        attempts += 1
+        start_stamps.append(push_lock._last_lock_operation_start_time)
+        if attempts == 1:
+            raise DisconnectedError("dropped before write")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    monotonic = itertools.count(1000.0, 1.0)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+        patch("yalexs_ble.push.time.monotonic", side_effect=monotonic),
+    ):
+        await push_lock.lock()
+
+    assert attempts == 2
+    # Each attempt stamped a start anchor; the retry re-stamped it strictly
+    # later, so the final anchor is the second attempt's.
+    assert len(start_stamps) == 2
+    assert start_stamps[1] > start_stamps[0]
+    assert push_lock._last_lock_operation_start_time == start_stamps[1]
