@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import struct
 import time
@@ -43,6 +44,7 @@ from yalexs_ble.push import (
     LOCK_STALE_STATE_DEBOUNCE_DELAY,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
+    POST_OP_RESPONSE_DEBOUNCE_DELAY,
     RESYNC_DELAY,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
@@ -4871,3 +4873,233 @@ async def test_battery_only_cycle_does_not_move_hold_deadline():
     assert push_lock._jammed_hold_deadline == deadline
     assert push_lock._lock_state is not None
     assert push_lock._lock_state.lock == LockStatus.JAMMED
+
+
+# ---------------------------------------------------------------------------
+# The stale-state floor and the moments that set it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ack_and_op_response_callbacks_hold_the_next_read():
+    """Each observed moment holds the next read off the lock for its own delay.
+
+    The acknowledgement holds for the full settle debounce and the op-response
+    for the shorter one, and the floor only ever moves forward: an op-response
+    arriving inside the window the acknowledgement claimed leaves that window
+    standing.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:32")
+    assert push_lock._earliest_update_time == NEVER_TIME
+    # A fake clock ahead of NEVER_TIME, which is a day behind the real one.
+    now = NEVER_TIME + 90000.0
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=now):
+        push_lock._ack_callback()
+    assert push_lock._earliest_update_time == now + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=now + 1.0):
+        push_lock._op_response_callback()
+    assert push_lock._earliest_update_time == now + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=now + 10.0):
+        push_lock._op_response_callback()
+    assert (
+        push_lock._earliest_update_time == now + 10.0 + POST_OP_RESPONSE_DEBOUNCE_DELAY
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_lock_instance_wires_only_the_stream_observers():
+    """_get_lock_instance stores the two stream observers and nothing else.
+
+    The acknowledgement and op-response hooks fire on any matching frame,
+    including operations we did not issue, so they belong to the connection.
+    The write-success hook belongs to a single operation and is handed over at
+    the call site instead, so a Lock built here carries no way to open the
+    operation window on its own.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:33")
+    push_lock._ble_device = MagicMock()
+
+    lock = push_lock._get_lock_instance()
+
+    assert lock._ack_callback == push_lock._ack_callback
+    assert lock._op_response_callback == push_lock._op_response_callback
+    # Lock holds no write-success hook of its own: it is a parameter of the
+    # operation call, so there is no attribute here to assert against.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stamps", "expected_delay"),
+    [
+        # The acknowledgement's window outlasts an op-response inside it.
+        ((("ack", -4.0), ("op_response", -3.0)), 2.1),
+        # An op-response more than 2 s later carries the floor past it.
+        ((("ack", -5.0), ("op_response", -1.0)), 3.1),
+        # A command issued after a stale acknowledgement holds from itself.
+        ((("ack", -5.0), ("command", -2.0)), 4.1),
+    ],
+    ids=["acknowledgement-holds", "late-op-response-holds", "command-holds"],
+)
+async def test_deferred_update_reschedules_to_the_standing_floor(
+    stamps, expected_delay
+):
+    """Within the hold the update reschedules by exactly the floor minus now."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:34")
+    # A fake clock ahead of NEVER_TIME, which is a day behind the real one.
+    now = NEVER_TIME + 90000.0
+    delays = {
+        "ack": LOCK_STALE_STATE_DEBOUNCE_DELAY,
+        "op_response": POST_OP_RESPONSE_DEBOUNCE_DELAY,
+        "command": LOCK_STALE_STATE_DEBOUNCE_DELAY,
+    }
+    for moment, offset in stamps:
+        with patch("yalexs_ble.push.time.monotonic", return_value=now + offset):
+            push_lock._hold_update(delays[moment])
+
+    with (
+        patch("yalexs_ble.push.time.monotonic", return_value=now),
+        patch.object(push_lock, "_schedule_future_update") as mock_reschedule,
+    ):
+        push_lock._deferred_update()
+
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(expected_delay)
+
+
+@pytest.mark.asyncio
+async def test_external_op_response_alone_defers_poll():
+    """An op-response we issued no command for holds the next poll on its own."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:35")
+    # A fake "now" comfortably after NEVER_TIME, so an unstamped floor stays
+    # firmly in the past.
+    now = NEVER_TIME + 90000.0
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=now):
+        push_lock._op_response_callback()
+        with patch.object(push_lock, "_schedule_future_update") as mock_reschedule:
+            push_lock._deferred_update()
+
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(
+        POST_OP_RESPONSE_DEBOUNCE_DELAY
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_hold_proceeds_immediately():
+    """With the floor still at NEVER_TIME, about a day in the past, the update
+    starts instead of deferring."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:36")
+    assert push_lock._earliest_update_time == NEVER_TIME
+
+    push_lock._execute_deferred_update = AsyncMock()  # type: ignore[method-assign]
+
+    with patch.object(push_lock, "_schedule_future_update") as mock_reschedule:
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    mock_reschedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
+    """A motion that outlasts the stale-state deadline keeps its own outcome.
+
+    A cycle booked while an operation runs waits for the floor, 6.1 s past the
+    acknowledgement. An unlatch answers about 10 s after the command, so that
+    moment falls due with the latch still out. Queueing the cycle there
+    would poll the instant the op-response landed, reading the position the
+    lock still reports from before the operation and putting it on display in
+    place of the outcome the operation just applied.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    gate = asyncio.Event()
+
+    async def force_unlatch(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()  # opens the window, stamps UNLATCHING
+        # The command's own hold has already run out, mid-motion.
+        push_lock._earliest_update_time = time.monotonic() - 1.0
+        await gate.wait()  # the motor is still running
+        push_lock._op_response_callback()
+
+    mock_lock = _answering_lock(push_lock)
+    mock_lock.force_unlatch = force_unlatch
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        op = asyncio.create_task(push_lock.unlatch())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if push_lock._operation_window_open:
+                break
+        assert push_lock._operation_lock.locked()
+
+        # The keep-alive falls due mid-operation: _keep_alive schedules the
+        # update, and _deferred_update is where it lands.
+        push_lock._deferred_update()
+        assert push_lock._update_task is None
+        handle = push_lock._cancel_deferred_update
+        assert handle is not None
+        assert handle.when() - push_lock.loop.time() == pytest.approx(
+            DEADLINE_WAKEUP_RETRY_DELAY, abs=0.1
+        )
+
+        gate.set()
+        await op
+
+    # The operation's own outcome is what the display carries.
+    assert push_lock.lock_status == LockStatus.UNLOCKED
+    mock_lock.lock_status.assert_not_awaited()
+
+    # The retry finds the floor pushed out again, by the settle this time: our
+    # own operation ends there, later than the op-response that preceded it.
+    with patch.object(push_lock, "_schedule_future_update") as mock_reschedule:
+        push_lock._deferred_update()
+
+    assert push_lock._update_task is None
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(
+        LOCK_STALE_STATE_DEBOUNCE_DELAY, abs=0.1
+    )
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_execute_operation_holds_the_next_read_per_attempt():
+    """The floor is stamped immediately before each operation attempt, so a
+    retry moves it forward and it tracks the latest attempt."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
+    start_stamps: list[float] = []
+    attempts = 0
+
+    async def force_lock(write_success_callback):
+        nonlocal attempts
+        attempts += 1
+        start_stamps.append(push_lock._earliest_update_time)
+        if attempts == 1:
+            raise DisconnectedError("dropped before write")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    # A fake clock ahead of NEVER_TIME, which is a day behind the real one.
+    monotonic = itertools.count(NEVER_TIME + 90000.0, 1.0)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+        patch("yalexs_ble.push.time.monotonic", side_effect=monotonic),
+    ):
+        await push_lock.lock()
+
+    assert attempts == 2
+    # Each attempt moved the floor, the retry strictly further out than the
+    # first attempt left it.
+    assert len(start_stamps) == 2
+    assert start_stamps[1] > start_stamps[0]
