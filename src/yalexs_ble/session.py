@@ -90,6 +90,32 @@ class OperationIncompleteError(YaleXSBLEError):
     """
 
 
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed.
+
+    The op-response arrived and its result byte named a failure, so the
+    exchange completed and the outcome is known: the operation failed, not
+    the link. A MECH_* code (0x1E to 0x23) is a motor stall, a jam; any
+    other code names its own cause. Every failure class needs manual
+    intervention at the lock, so all of them display as JAMMED.
+    Deliberately NOT a ResponseError and NOT in the bleak retry set:
+    re-driving a failed mechanism is not a recovery, so the failure passes
+    the retry decorator to the caller unchanged.
+    """
+
+    def __init__(self, message: str, result: int) -> None:
+        super().__init__(message)
+        self.result = result
+
+    def __reduce__(self) -> tuple[type[OperationFailedError], tuple[str, int]]:
+        # BaseException rebuilds a copied or pickled exception by calling the
+        # class with self.args, which carries the message alone, so the
+        # default would call this __init__ an argument short. Both arguments
+        # are named here instead. The message stays the only member of args,
+        # so str() is unchanged.
+        return (self.__class__, (str(self), self.result))
+
+
 class UnlatchError(YaleXSBLEError):
     """An unlatch failed once its command write had been attempted.
 
