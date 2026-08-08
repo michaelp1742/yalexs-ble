@@ -46,10 +46,13 @@ from .const import (
 from .secure_session import SecureSession
 from .session import (
     OPERATION_RESPONSE_TIMEOUT,
+    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
+    OperationIncompleteError,
     OperationProgress,
     Session,
+    UnlatchError,
     YaleXSBLEError,
 )
 
@@ -57,8 +60,10 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
 
-# byte[4] of a Lock command: 0x04 turns the plain lock into securemode. The
-# same opcode+optype mechanism carries the other operation variants.
+# byte[4] of an Unlock command: 0x0A turns the plain unlock into an unlatch
+# (retract the latch). Same opcode+optype mechanism securemode uses on the
+# Lock opcode (0x04).
+UNLATCH_OPERATION_BYTE = 0x0A
 SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
@@ -466,7 +471,9 @@ class Lock:
         command: bytearray,
         command_name: str,
         response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
+        progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bool:
         """Run a mechanical operation; True = byte[15] reported success.
 
@@ -484,14 +491,17 @@ class Lock:
         assert self.session is not None  # nosec
         opcode = command[0x01]
         operation_byte = command[0x04]
+        if progress is None:
+            progress = OperationProgress()
         response = await self.session.execute_operation(
             command,
             command_name,
             ack_matcher=_ack_matcher(opcode, operation_byte),
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=response_timeout,
-            progress=OperationProgress(),
+            progress=progress,
             write_success_callback=write_success_callback,
+            wait_for_ack=wait_for_ack,
         )
         return response[0x0F] == OperationError.COMM_SUCCESS
 
@@ -540,6 +550,69 @@ class Lock:
             write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
+        return result
+
+    @raise_if_not_connected
+    async def force_unlatch(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> bool:
+        """Force the lock to unlatch (momentary "open door" / retract the latch).
+
+        The Unlock opcode with operation byte 0x0A (there is no dedicated
+        unlatch opcode); its op-response is a normal Unlock (0xBB 0A) frame.
+
+        A repeated unlatch fires the latch again, opening the door again, so
+        once the command write has been ATTEMPTED no failure may re-send it: a
+        write call that errors can still have delivered the request (the PDU
+        leaves the radio and only the ATT response is lost), so every failure
+        from the write attempt onward converts to the non-retryable
+        UnlatchError (OperationIncompleteError, already non-retryable,
+        propagates as itself). Failures before the write attempt (connect,
+        session setup, encryption) stay retryable.
+
+        That same rule makes the acknowledgement a don't care here, so this is
+        the one operation that waits on its op-response alone.
+        """
+        _LOGGER.debug("%s: Unlatching", self.name)
+        assert self.session is not None  # nosec
+        progress = OperationProgress()
+        try:
+            result = await self._execute_operation_command(
+                self.session.build_operation_command(
+                    Commands.UNLOCK, UNLATCH_OPERATION_BYTE
+                ),
+                "force_unlatch",
+                response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+                progress=progress,
+                write_success_callback=write_success_callback,
+                wait_for_ack=False,
+            )
+        except OperationIncompleteError:
+            # Already non-retryable: the result never arrived. Ordered ahead
+            # of the broad clause below so the type reaches the caller
+            # unwrapped.
+            raise
+        except Exception as err:
+            # Broad on purpose, and every path here re-raises, so no failure
+            # is discarded. The rule is stronger than any list of retryable
+            # types: after a write attempt no failure of any kind may reach
+            # the retry wrapper, because a retry re-sends the unlatch.
+            # Converting to UnlatchError, which is not in the retry set,
+            # enforces that even when the retry set widens. Cancellation is a
+            # BaseException and passes through untouched. An AuthError raised
+            # after the write is converted here too, so the auth failure
+            # history does not advance and no failed AuthState is published
+            # from this path. The reauth ladder advances on the next update
+            # cycle instead.
+            if progress.write_attempted:
+                raise UnlatchError(
+                    f"{self.name}: Unlatch failed after the command write was "
+                    "attempted; not retried because the command may have "
+                    "reached the lock and a repeated unlatch fires the latch "
+                    "again"
+                ) from err
+            raise
+        _LOGGER.debug("%s: Finished unlatching", self.name)
         return result
 
     @raise_if_not_connected
@@ -611,6 +684,16 @@ class Lock:
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             return await self.force_unlock()
         return True
+
+    async def unlatch(self) -> bool:
+        """Unlatch; True unless the lock reported the operation failed.
+
+        Unlatch is a momentary "open door" action, not a steady state, so it
+        always fires: lock() and unlock() short-circuit when the lock is
+        already in the target state, and there is no "unlatched" steady state
+        to test.
+        """
+        return await self.force_unlatch()
 
     async def _execute_command(
         self, opcode: int, cmd_byte: int, command_name: str

@@ -45,6 +45,7 @@ from .session import (
     NoAdvertisementError,
     OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -768,6 +769,17 @@ class PushLock:
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        The op-response arrives when the latch has returned from its open
+        dwell, so the completed state is UNLOCKED; a settled UNLATCHED push
+        displays only outside an operation window.
+        """
+        await self._run_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
+        )
+
     async def _run_lock_operation(
         self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
     ) -> None:
@@ -791,6 +803,12 @@ class PushLock:
         pending_state left from before the window opened reads the same and
         wants the same answer.
 
+        An UnlatchError is the one exit the display cannot answer for. It is
+        raised from the write attempt onward, so the latch may have fired
+        while the write-success hook never ran and the pre-operation position
+        is still on display, reading as a position the operation left alone.
+        The exception type is the evidence there.
+
         A cancelled operation does not take that arm, since CancelledError is a
         BaseException: a cancel is not evidence the lock did or did not move.
         """
@@ -798,8 +816,10 @@ class PushLock:
         self._operation_outcome = None
         try:
             await self._execute_lock_operation(op_attr, pending_state, complete_state)
-        except Exception:
-            if self._operation_outcome is None and self.lock_status == pending_state:
+        except Exception as err:
+            if self._operation_outcome is None and (
+                self.lock_status == pending_state or isinstance(err, UnlatchError)
+            ):
                 self._operation_outcome = LockStatus.UNKNOWN
             raise
         finally:
@@ -954,12 +974,16 @@ class PushLock:
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
             success = await getattr(lock, op_attr)(self._operation_write_success)
-        except OperationIncompleteError:
+        except (OperationIncompleteError, UnlatchError):
             # Non-retryable: this propagates to the caller. No outcome is
             # recorded because this exit has no evidence of the position: our
             # write may have succeeded, leaving a transitional on display with
             # no result coming, which _run_lock_operation answers with the
-            # unknown position.
+            # unknown position. An UnlatchError is raised from the write
+            # attempt onward, so the latch may have fired even where the
+            # write-success hook never ran; _run_lock_operation answers that
+            # one the same way, from the exception type rather than from the
+            # display.
             _LOGGER.debug(
                 "%s: %s did not complete; the result never arrived",
                 self.name,
@@ -1138,7 +1162,7 @@ class PushLock:
         and arming one from inside an operation creates a cycle that waits on
         the operation lock and runs the instant the operation ends, inside the
         settle window. Those states are read by the operation's own follow-up
-        status poll instead (see _schedule_keep_alive_poll).
+        status poll instead (see _settle_operation).
         """
         _LOGGER.debug("%s: State changed: %s", self.name, states)
         lock_state = self._get_current_state()
