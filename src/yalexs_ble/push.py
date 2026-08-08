@@ -43,6 +43,7 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     UnlatchError,
@@ -965,7 +966,21 @@ class PushLock:
             # Hand the write-success hook to this operation alone. The window it
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
-            success = await getattr(lock, op_attr)(self._operation_write_success)
+            await getattr(lock, op_attr)(self._operation_write_success)
+        except OperationFailedError:
+            # The op-response arrived and its result byte named a failure
+            # (mechanical codes are a motor stall, the rest name their own
+            # cause): the exchange completed, the operation did not. The
+            # parser's JAMMED emission fell inside our own window, so the
+            # operation records it as the outcome and the settle applies it,
+            # then propagates: the display carries the jam, the exception tells
+            # the caller the operation did not happen.
+            self._operation_outcome = LockStatus.JAMMED
+            _LOGGER.debug(
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
+            )
+            self._complete_operation(time.monotonic())
+            raise
         except (OperationIncompleteError, UnlatchError):
             # Non-retryable: this propagates to the caller. No outcome is
             # recorded because this exit has no evidence of the position: our
@@ -1008,18 +1023,8 @@ class PushLock:
                 ex,
             )
             raise
-        if not success:
-            # Our own op-response reported a failure (byte[15] != 0). The parser
-            # already logged the named cause and emitted JAMMED, but that
-            # emission fell inside our own window, so the operation records the
-            # outcome itself and the settle applies it.
-            self._operation_outcome = LockStatus.JAMMED
-            _LOGGER.debug(
-                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
-            )
-        else:
-            self._operation_outcome = complete_state
-            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        self._operation_outcome = complete_state
+        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
         self._complete_operation(time.monotonic())
 
     @property
