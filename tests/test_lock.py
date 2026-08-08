@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
@@ -38,6 +39,7 @@ from yalexs_ble.lock import (
 from yalexs_ble.session import (
     ACK_TIMEOUT,
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
     Session,
@@ -306,6 +308,64 @@ def test_parse_lock_activity_is_no_update(
     assert result is not None
     assert list(result) == []
     assert "Unknown state" not in caplog.text
+
+
+def test_mechanical_operation_errors_is_the_whole_mech_range() -> None:
+    """The hand-written set holds exactly the MECH_* codes, and nothing else.
+
+    A member dropped from it stops being a known mechanical failure: its log
+    line is promoted to warning and reads as a result the decode has no story
+    for. Derived here from the enum names so a drop fails rather than passes
+    quietly.
+    """
+    assert {
+        error for error in OperationError if error.name.startswith("MECH_")
+    } == MECHANICAL_OPERATION_ERRORS
+
+
+@pytest.mark.parametrize(
+    ("awaited_opcode", "result_byte", "expected_level"),
+    [
+        *(
+            (Commands.LOCK.value, error.value, "DEBUG")
+            for error in sorted(MECHANICAL_OPERATION_ERRORS)
+        ),
+        (Commands.LOCK.value, 0x32, "WARNING"),
+        (None, 0x1F, "WARNING"),
+    ],
+)
+def test_parse_op_response_failure_log_level(
+    awaited_opcode: int | None,
+    result_byte: int,
+    expected_level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The mechanical result of an operation we issued logs at DEBUG, because
+    OperationFailedError carries the same cause to the caller. A result we have
+    no decode story for, and a mechanical result with no operation of ours
+    awaiting that opcode (which came from the lock, the app or auto-lock and
+    has no other record), both log at WARNING. All of them display JAMMED,
+    since every failure class needs manual intervention at the lock.
+
+    Every member of MECHANICAL_OPERATION_ERRORS is driven through, so dropping
+    one from the set fails here rather than silently promoting its log line.
+    """
+    lock = _make_lock()
+    lock._awaited_operation_opcode = awaited_opcode
+
+    frame = bytearray.fromhex("bb0b001b00000000000000000000001f0000")
+    frame[0x0F] = result_byte
+    with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
+        result = lock._parse_state(bytes(frame))
+
+    assert result is not None
+    assert list(result) == [LockStatus.JAMMED]
+    records = [
+        record
+        for record in caplog.records
+        if "Operation failed with result" in record.message
+    ]
+    assert [record.levelname for record in records] == [expected_level]
 
 
 def test_parse_non_mech_error_is_jammed_and_logs_decoded_name(
@@ -930,20 +990,13 @@ def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -
     return _with_checksum(frame)
 
 
-async def _drive_operation(
-    lock: Lock,
-    op_attr: str,
-    opcode: int,
-    ack: bytes,
-    result_byte: int = OperationError.COMM_SUCCESS,
-) -> bool:
+async def _drive_operation(lock: Lock, op_attr: str, opcode: int, ack: bytes) -> None:
     """Run a force_* method, feeding its ack then op-response through notify.
 
     The acknowledgement has to be matched before the op-response is fed. A
     command carrying the wrong operation byte, or a matcher that never
     matches, would otherwise still complete on the op-response alone and the
-    operation would look correct. The op-response carries result_byte in
-    byte[15], so a failure report can be driven through the same path.
+    operation would look correct.
     """
     session = lock.session
     assert session is not None
@@ -953,12 +1006,11 @@ async def _drive_operation(
         session._notify(0, bytearray(ack))
         assert session._ack_future is None, "the acknowledgement was not matched"
         await asyncio.sleep(0)
-        session._notify(0, bytearray(_op_response_frame(opcode, result_byte)))
+        session._notify(0, bytearray(_op_response_frame(opcode)))
 
     feeder = asyncio.create_task(feed())
-    result: bool = await getattr(lock, op_attr)()
+    await getattr(lock, op_attr)()
     await feeder
-    return result
 
 
 def test_parse_operation_ack_reports_no_state(
@@ -1055,35 +1107,16 @@ async def test_force_operations_complete_on_ack_then_op_response(
     logs); the unlatch one has no capture and is built to the same layout.
     byte[4] is the operation byte the command must have carried, so the
     acknowledgement only matches if the right command went out.
-    byte[15]=COMM_SUCCESS in the op-response makes the method report success.
+    byte[15]=COMM_SUCCESS in the op-response makes the method return rather
+    than raise OperationFailedError.
     """
     lock = _make_connected_lock_with_session()
 
-    result = await _drive_operation(lock, op_attr, opcode, ack)
+    await _drive_operation(lock, op_attr, opcode, ack)
 
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_force_lock_reported_failure_returns_false() -> None:
-    """A failing result byte in the op-response makes force_lock return False.
-
-    Drives the failure through the real decode path: the acknowledgement is
-    matched, then the 0xBB op-response lands with a motor fault in byte[15],
-    and the return value must come from that byte rather than from the frame
-    merely arriving.
-    """
-    lock = _make_connected_lock_with_session()
-
-    result = await _drive_operation(
-        lock,
-        "force_lock",
-        Commands.LOCK,
-        bytes.fromhex("aa0b00490000000000000000000000000200"),
-        result_byte=OperationError.MECH_TIMEOUT,
-    )
-
-    assert result is False
+    # The operation ran to its op-response and reported success, so nothing was
+    # left awaited on this instance.
+    assert lock._awaited_operation_opcode is None
 
 
 @pytest.mark.asyncio
@@ -1113,10 +1146,8 @@ async def test_an_op_response_for_another_opcode_does_not_complete_the_wait() ->
         session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
 
     feeder = asyncio.create_task(feed())
-    result = await lock.force_lock()
+    await lock.force_lock()
     await feeder
-
-    assert result is True
 
 
 def test_operation_response_timeout_outlasts_the_acknowledgement_budget() -> None:
@@ -1142,23 +1173,24 @@ def test_operation_response_timeout_outlasts_the_acknowledgement_budget() -> Non
     ],
     ids=["securemode", "lock", "unlock"],
 )
-@pytest.mark.parametrize("force_result", [True, False], ids=["success", "failure"])
-async def test_convenience_wrappers_return_the_operation_result(
-    wrapper: str, target_status: LockStatus, force_attr: str, force_result: bool
+async def test_convenience_wrappers_run_the_operation_outside_the_target_state(
+    wrapper: str, target_status: LockStatus, force_attr: str
 ) -> None:
-    """securemode(), lock() and unlock() return what the force_* call reported.
+    """A wrapper finding the lock outside its target state runs the operation.
 
-    The wrappers are the exported convenience surface, so a direct consumer
-    learns about a reported failure only if the underlying bool comes back
-    through them.
+    The wrappers return None either way; a reported failure surfaces as the
+    OperationFailedError the force_* call raises, so the delegation is the
+    whole contract.
     """
     lock = _make_lock()
 
     with (
         patch.object(lock, "lock_status", AsyncMock(return_value=LockStatus.UNKNOWN)),
-        patch.object(lock, force_attr, AsyncMock(return_value=force_result)),
+        patch.object(lock, force_attr, AsyncMock()) as mock_force,
     ):
-        assert (await getattr(lock, wrapper)()) is force_result
+        await getattr(lock, wrapper)()
+
+    mock_force.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1174,7 +1206,7 @@ async def test_convenience_wrappers_return_the_operation_result(
 async def test_convenience_wrappers_skip_the_operation_in_the_target_state(
     wrapper: str, target_status: LockStatus, force_attr: str
 ) -> None:
-    """A wrapper finding the lock already in its target state reports True.
+    """A wrapper finding the lock already in its target state issues nothing.
 
     No operation is issued, so nothing could have failed and the caller's
     goal state holds.
@@ -1185,7 +1217,7 @@ async def test_convenience_wrappers_skip_the_operation_in_the_target_state(
         patch.object(lock, "lock_status", AsyncMock(return_value=target_status)),
         patch.object(lock, force_attr, AsyncMock()) as mock_force,
     ):
-        assert (await getattr(lock, wrapper)()) is True
+        await getattr(lock, wrapper)()
 
     mock_force.assert_not_awaited()
 
@@ -1255,11 +1287,10 @@ async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         nonlocal captured_command, captured_timeout
         captured_command = command
         captured_timeout = response_timeout
-        return True
 
     lock._execute_operation_command = _capture  # type: ignore[method-assign]
 
@@ -1295,9 +1326,8 @@ async def test_unlatch_is_the_only_operation_that_skips_the_ack_wait() -> None:
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         waited[command_name] = wait_for_ack
-        return True
 
     lock._execute_operation_command = _capture  # type: ignore[method-assign]
 
@@ -1331,7 +1361,7 @@ async def test_force_unlatch_failure_before_write_stays_retryable() -> None:
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         raise DisconnectedError("dropped before the write")
 
     lock._execute_operation_command = _fail  # type: ignore[method-assign]
@@ -1356,7 +1386,7 @@ async def test_force_unlatch_failure_after_write_converts_to_unlatch_error() -> 
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         progress.command_written = True
@@ -1387,7 +1417,7 @@ async def test_force_unlatch_errored_write_converts_to_unlatch_error() -> None:
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         raise BleakError("link dropped during the write")
@@ -1433,7 +1463,7 @@ async def test_force_unlatch_converts_every_post_write_failure(
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         raise error
@@ -1445,13 +1475,22 @@ async def test_force_unlatch_converts_every_post_write_failure(
 
 
 @pytest.mark.asyncio
-async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
-    """OperationIncompleteError is already non-retryable, so it propagates as
-    itself even after the write and is not re-wrapped as UnlatchError. The
-    identity assertion is what pins the passthrough clause: wrapping the type
-    would break it.
+@pytest.mark.parametrize(
+    "error",
+    [
+        OperationIncompleteError("acked but no op-response"),
+        OperationFailedError("op failed", 0x1F),
+    ],
+    ids=["incomplete", "failed"],
+)
+async def test_force_unlatch_operation_result_errors_are_not_converted(
+    error: Exception,
+) -> None:
+    """Both operation-result types are already non-retryable, so each
+    propagates as itself even after the write; neither is re-wrapped as
+    UnlatchError. The identity assertion is what pins the two-member
+    passthrough tuple: wrapping either type would break it.
     """
-    error = OperationIncompleteError("acked but no op-response")
     lock = _make_lock()
     lock.session = MagicMock()
     lock.secure_session = MagicMock()
@@ -1464,7 +1503,7 @@ async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
         progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         assert progress is not None
         progress.write_attempted = True
         progress.command_written = True
@@ -1474,3 +1513,49 @@ async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
     with pytest.raises(type(error)) as excinfo:
         await lock.force_unlatch()
     assert excinfo.value is error
+
+
+@pytest.mark.asyncio
+async def test_force_lock_failure_op_response_raises_operation_failed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure op-response (byte[15] != 0) raises OperationFailedError.
+
+    The exchange completed and the lock named the cause, so the exception
+    carries the result byte and is not converted or retried. The frame is
+    built here, with byte[15] = 0x1F MECH_POSITION, the result a jammed lock
+    reports. The failure record logs at DEBUG, which joins the awaited-opcode
+    arming to its consumer: the parser saw the opcode armed when the frame
+    landed, and an unarmed field routes the same record to WARNING.
+    """
+    lock = _make_connected_lock_with_session()
+    session = lock.session
+    assert session is not None
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(0, bytearray(_ack_frame(Commands.LOCK, 0x00)))
+        await asyncio.sleep(0)
+        session._notify(
+            0,
+            bytearray(_op_response_frame(Commands.LOCK, OperationError.MECH_POSITION)),
+        )
+
+    feeder = asyncio.create_task(feed())
+    with (
+        caplog.at_level("DEBUG", logger="yalexs_ble.lock"),
+        pytest.raises(OperationFailedError) as excinfo,
+    ):
+        await lock.force_lock()
+    await feeder
+    assert excinfo.value.result == OperationError.MECH_POSITION
+    records = [
+        record
+        for record in caplog.records
+        if "Operation failed with result" in record.message
+    ]
+    assert [record.levelname for record in records] == ["DEBUG"]
+    # Cleared on the way out of the failure too: left set, every later external
+    # op-response on that opcode would read as one of ours and log at debug for
+    # the instance's life.
+    assert lock._awaited_operation_opcode is None
