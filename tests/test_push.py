@@ -50,7 +50,9 @@ from yalexs_ble.push import (
 from yalexs_ble.session import (
     AuthError,
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
+    OperationProgress,
     ResponseError,
     UnlatchError,
 )
@@ -2586,7 +2588,7 @@ async def test_execute_lock_operation_success_stamps_complete_state(
     """
     push_lock = _operational_push_lock()
     mock_lock = MagicMock()
-    setattr(mock_lock, op_attr, AsyncMock(return_value=True))
+    setattr(mock_lock, op_attr, AsyncMock())
 
     with patch.object(
         push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
@@ -2598,21 +2600,51 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
 
 @pytest.mark.asyncio
-async def test_execute_lock_operation_failure_displays_jammed() -> None:
-    """A force_* returning False (its op-response reported a failure) never
-    stamps the completed status; the operation applies JAMMED once its window
-    closes (the parser already logged the named cause and emitted JAMMED)."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:21")
+async def test_failure_op_response_applies_jammed_after_window():
+    """The parser emits JAMMED for our own failure op-response mid-window (the
+    state callback runs before session resolves the future), so it is dropped;
+    the OperationFailedError path re-applies JAMMED after closing the window
+    and propagates the failure.
+
+    The op-response result driving it is 0x1F MECH_POSITION, which the Lock
+    parser turns into LockStatus.JAMMED.
+    """
+    push_lock = _operational_push_lock()
+    events: list[LockStatus] = []
+
+    def cb(lock_state, lock_info, connection_info):
+        events.append(lock_state.lock)
+
+    push_lock.register_callback(cb)
+
     mock_lock = MagicMock()
-    mock_lock.force_unlock = AsyncMock(return_value=False)
 
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    async def force_lock(write_success_callback):
+        write_success_callback()  # opens window, stamps LOCKING
+        # Parser emission of the failure op-response lands inside our window.
+        push_lock._state_callback([LockStatus.JAMMED])
+        # op-response byte[15] != 0
+        raise OperationFailedError("force_lock reported failure", 0x1F)
+
+    mock_lock.force_lock = force_lock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
     ):
-        await push_lock.unlock()
+        await push_lock.lock()
 
-    mock_lock.force_unlock.assert_awaited_once()
+    # LOCKING at write-success; the mid-window JAMMED produced no event; JAMMED
+    # applied once, only after the window closed.
+    assert events == [LockStatus.LOCKING, LockStatus.JAMMED]
     assert push_lock.lock_status == LockStatus.JAMMED
+    # The exchange completed, so the failure path runs _complete_operation and
+    # the settle stamps the floor: the disconnect timer and the earliest next
+    # read both move despite the jam.
+    assert push_lock._last_operation_complete_time != NEVER_TIME
+    assert push_lock._earliest_update_time != NEVER_TIME
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
 
 
 @pytest.mark.asyncio
@@ -2626,12 +2658,15 @@ async def test_reported_failure_stamps_the_stale_state_floor() -> None:
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:22")
     mock_lock = MagicMock()
-    mock_lock.force_lock = AsyncMock(return_value=False)
+    mock_lock.force_lock = AsyncMock(
+        side_effect=OperationFailedError("reported failure", 0x1F)
+    )
     assert push_lock._earliest_update_time == NEVER_TIME
 
     before = time.monotonic()
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
     ):
         await push_lock.lock()
     after = time.monotonic()
@@ -2680,7 +2715,6 @@ async def test_lock_stamps_transitional_only_at_write_success():
     async def force_lock(write_success_callback):
         order.append(("write_success", None))
         write_success_callback()
-        return True
 
     mock_lock.force_lock = force_lock
 
@@ -2886,7 +2920,6 @@ async def test_retry_restamps_at_write_success_without_unknown():
         write_success_callback()  # opens window, stamps LOCKING
         if attempts == 1:
             raise DisconnectedError("dropped before ack")
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -3049,13 +3082,12 @@ async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     gate = asyncio.Event()
     calls = 0
 
-    async def gated_force_lock(write_success_callback: Callable[[], None]) -> bool:
+    async def gated_force_lock(write_success_callback: Callable[[], None]) -> None:
         nonlocal calls
         calls += 1
         write_success_callback()
         if calls == 1:
             await gate.wait()  # hold op1 open while op2 queues behind it
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = gated_force_lock
@@ -3296,14 +3328,13 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         command: bytearray,
         command_name: str,
         response_timeout: float = 0.0,
-        progress: object | None = None,
+        progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> bool:
+    ) -> None:
         handed.append(write_success_callback)
         if write_success_callback is not None:
             write_success_callback()
-        return True
 
     lock._execute_operation_command = _capture  # type: ignore[method-assign]
 
@@ -3321,7 +3352,6 @@ async def test_execute_lock_operation_hands_the_hook_to_the_operation():
 
     async def force_lock(write_success_callback):
         received.append(write_success_callback)
-        return True
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -3520,7 +3550,6 @@ async def test_unlatch_stamps_unlatching_then_unlocked():
     async def force_unlatch(write_success_callback):
         order.append("write_success")
         write_success_callback()
-        return True
 
     mock_lock.force_unlatch = force_unlatch
 
@@ -3609,18 +3638,16 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("force_result", "error", "jam", "delay"),
+    ("error", "jam", "delay"),
     [
-        (True, None, False, KEEP_ALIVE_TIME),
-        (False, None, False, KEEP_ALIVE_TIME),
+        (None, False, KEEP_ALIVE_TIME),
+        (OperationFailedError("reported failure", 0x1F), False, KEEP_ALIVE_TIME),
         (
-            None,
             OperationIncompleteError("no op-response"),
             False,
             LOCK_STALE_STATE_DEBOUNCE_DELAY,
         ),
         (
-            None,
             DisconnectedError("dropped after the jam was reported"),
             True,
             KEEP_ALIVE_TIME,
@@ -3629,29 +3656,26 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     ids=["success", "reported-failure", "no-result", "jam-ends-the-ladder"],
 )
 async def test_every_operation_exit_books_the_status_poll(
-    force_result: bool | None, error: Exception | None, jam: bool, delay: float
+    error: Exception | None, jam: bool, delay: float
 ) -> None:
     """Every way an operation can end schedules the follow-up status poll.
 
     Success, a reported failure, a result that never came, and a jam that ends
-    the attempt ladder all leave through the same settle, so all four book a
-    poll. The delay follows the status each one leaves on display: a
-    position is polled at the keep-alive interval, the cadence an
-    always-connected lock polls at anyway, and the UNKNOWN of a result that
-    never came is polled at the settle debounce, because only a read can
-    replace it.
+    the attempt ladder all leave through the same settle, so all four book the
+    poll. The delay follows the status each one leaves on display: a position
+    is polled at the keep-alive interval, the cadence an always-connected lock
+    polls at anyway, and the UNKNOWN of a result that never came is polled at
+    the settle debounce, because only a read can replace it.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:44")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
-    async def force_lock(write_success_callback: Callable[[], None]) -> bool:
+    async def force_lock(write_success_callback: Callable[[], None]) -> None:
         write_success_callback()  # opens the window, stamps LOCKING
         if jam:
             push_lock._update_any_state([LockStatus.JAMMED])
         if error is not None:
             raise error
-        assert force_result is not None
-        return force_result
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
