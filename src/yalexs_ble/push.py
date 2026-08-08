@@ -728,7 +728,7 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
-            await getattr(lock, op_attr)()
+            success = await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
             # The retry_bluetooth_connection_error wrapper calls
@@ -741,9 +741,24 @@ class PushLock:
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        if success:
+            self._update_any_state([complete_state])
+            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        else:
+            # Our own op-response reported a failure (byte[15] != 0), so the
+            # transitional stamped at the start describes an operation that is
+            # no longer running. The parser logged the named cause and emitted
+            # JAMMED from that same frame; applying it here as well makes the
+            # displayed status the outcome the operation itself reports.
+            self._update_any_state([LockStatus.JAMMED])
+            _LOGGER.debug(
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
+            )
         now = time.monotonic()
+        # Stamped on success and failure alike: either way the op-response
+        # marks the end of the motor's movement, and the reported state is
+        # settling from this moment, which is what the stale-state debounce
+        # in _deferred_update measures from.
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)
 
