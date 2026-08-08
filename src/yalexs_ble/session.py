@@ -86,6 +86,16 @@ class OperationIncompleteError(YaleXSBLEError):
     """
 
 
+class UnlatchError(YaleXSBLEError):
+    """An unlatch failed once its command write had been attempted.
+
+    From the moment the write is attempted the command may have reached the
+    lock, and a repeated unlatch fires the latch again, opening the door
+    again, so no failure from that point on may re-send it. Deliberately NOT a
+    ResponseError so it passes the retry decorator to the caller unchanged.
+    """
+
+
 @dataclass
 class OperationProgress:
     """How far a mechanical command travelled, for stage-aware error policy.
@@ -411,6 +421,7 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         """Write a mechanical command and run the staged wait.
 
@@ -420,6 +431,11 @@ class Session:
         operation's response_timeout, also from attempt start) covers the
         op-response, the physical end of movement. Only an op-response, or an
         error, ends the wait.
+
+        With wait_for_ack False the acknowledgement stage is skipped and the
+        op-response is awaited for the whole budget. The GATT write keeps its
+        own ACK_TIMEOUT bound either way: that one bounds the local write
+        exchange, which carries no mechanical delay.
         """
         if not self.client.is_connected:
             raise BleakError("disconnected")
@@ -468,25 +484,26 @@ class Session:
                         self.name,
                         command_name,
                     )
-            _LOGGER.debug("%s: Waiting for acknowledgement", self.name)
-            ack_remaining = ACK_TIMEOUT - (time.monotonic() - attempt_start)
-            done, _ = await asyncio.wait(
-                (ack_future, result_future),
-                timeout=max(ack_remaining, 0),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if result_future in done:
-                # The op-response supersedes the acknowledgement stage: it
-                # either beat the acknowledgement entirely, or both resolved in
-                # the same event-loop turn. Either way the op-response is the
-                # answer, and whether an acknowledgement also arrived was
-                # already recorded where it was received.
-                return result_future.result()
-            if ack_future not in done:
-                raise TimeoutError(
-                    f"{self.name}: No acknowledgement to {command_name} within "
-                    f"{ACK_TIMEOUT}s of the command being issued"
+            if wait_for_ack:
+                _LOGGER.debug("%s: Waiting for acknowledgement", self.name)
+                ack_remaining = ACK_TIMEOUT - (time.monotonic() - attempt_start)
+                done, _ = await asyncio.wait(
+                    (ack_future, result_future),
+                    timeout=max(ack_remaining, 0),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if result_future in done:
+                    # The op-response supersedes the acknowledgement stage: it
+                    # either beat the acknowledgement entirely, or both
+                    # resolved in the same event-loop turn. Either way the
+                    # op-response is the answer, and whether an acknowledgement
+                    # also arrived was already recorded where it was received.
+                    return result_future.result()
+                if ack_future not in done:
+                    raise TimeoutError(
+                        f"{self.name}: No acknowledgement to {command_name} "
+                        f"within {ACK_TIMEOUT}s of the command being issued"
+                    )
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
             result_remaining = response_timeout - (time.monotonic() - attempt_start)
             try:
@@ -507,9 +524,9 @@ class Session:
                     )
                     return recorded
                 raise OperationIncompleteError(
-                    f"{self.name}: {command_name} was acknowledged but no "
-                    f"op-response arrived within {response_timeout}s of the "
-                    "command being issued"
+                    f"{self.name}: no op-response to {command_name} arrived "
+                    f"within {response_timeout}s of the command being issued "
+                    f"(acknowledged: {progress.acknowledged})"
                 ) from err
         finally:
             # Unconditional: the session lock serialises operations, so the
@@ -622,6 +639,7 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         """Execute a mechanical operation command with the staged wait.
 
@@ -636,10 +654,18 @@ class Session:
         result is unknown and the caller decides.
 
         response_timeout is the budget for the whole exchange, measured from
-        the moment the command is issued, and must exceed ACK_TIMEOUT: the
-        remainder left once the operation is acknowledged is the op-response
-        wait, so a value at or below ACK_TIMEOUT leaves that wait no time at
-        all.
+        the moment the command is issued. What is left for the op-response is
+        that budget minus the time already spent, so it must leave room beyond
+        the acknowledgement the operation waits for.
+
+        wait_for_ack=False drops the acknowledgement stage and waits only for
+        the op-response, for the whole budget. The early delivery signal is
+        worth having only where the caller may re-send, so an operation that
+        forbids a re-send once the command is written gains nothing from it
+        and would pay for it with the op-response: an acknowledgement lost on
+        a link that is otherwise working would end the operation before the
+        result it is waiting for could arrive. The acknowledgement is still
+        matched and recorded when it lands; only the wait on it is dropped.
         """
         await self._wait_for_cooldown()
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
@@ -664,6 +690,7 @@ class Session:
                     response_timeout,
                     progress,
                     write_success_callback,
+                    wait_for_ack,
                 )
         except DisconnectedError as err:
             if (result := progress.result) is not None:
