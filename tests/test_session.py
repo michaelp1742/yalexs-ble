@@ -905,6 +905,53 @@ async def test_execute_operation_ack_timeout(
     assert progress.acknowledged is False
 
 
+@pytest.mark.asyncio
+async def test_the_no_ack_wait_completes_on_the_op_response_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wait_for_ack=False waits for the op-response alone, for the whole budget.
+
+    The lock acknowledges nothing here and its op-response lands past the
+    acknowledgement budget but well inside the operation's own. With the
+    acknowledgement stage the attempt ends as a TimeoutError before that
+    result can arrive; without it the same exchange completes on the result
+    the lock sent.
+    """
+    monkeypatch.setattr("yalexs_ble.session.ACK_TIMEOUT", 0.05)
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+
+    async def run(wait_for_ack: bool) -> bytes:
+        session, client = _make_session()
+        progress = OperationProgress()
+
+        async def feed() -> None:
+            await _spin_until_written(client)
+            await asyncio.sleep(0.12)
+            session._notify(0, bytearray(op_response))
+
+        feeder = asyncio.create_task(feed())
+        try:
+            return await session.execute_operation(
+                session.build_operation_command(Commands.LOCK, 0x04),
+                "force_securemode",
+                ack_matcher=_ack_matcher(0x0B, 0x04),
+                response_matcher=_operation_response_matcher(0x0B),
+                response_timeout=5.0,
+                progress=progress,
+                wait_for_ack=wait_for_ack,
+            )
+        finally:
+            feeder.cancel()
+
+    assert await run(wait_for_ack=False) == bytes(op_response)
+
+    with pytest.raises(TimeoutError) as exc_info:
+        await run(wait_for_ack=True)
+    # The acknowledgement stage, not the op-response budget: a plain
+    # TimeoutError, so the caller that allows a re-send still gets one.
+    assert not isinstance(exc_info.value, OperationIncompleteError)
+
+
 def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
     """Stage 1 must outlast a dead link, so a dead link reads as a disconnect.
 
@@ -1374,6 +1421,7 @@ async def test_bleak_disconnect_after_ack_is_operation_incomplete() -> None:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         progress.acknowledged = True
         raise BleakError("device disconnected")
@@ -1407,6 +1455,7 @@ async def test_bleak_disconnect_in_one_turn_with_the_op_response_returns_it() ->
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         progress.acknowledged = True
         progress.result = op_response
