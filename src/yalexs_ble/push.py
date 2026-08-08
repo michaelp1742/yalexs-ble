@@ -82,6 +82,12 @@ FIRST_CONNECTION_DISCONNECT_TIME = 2.1
 # update its state or it will return a stale state.
 LOCK_STALE_STATE_DEBOUNCE_DELAY = 6.1
 
+# How long to hold a read off the lock from an observed op-response. The
+# op-response is the end of the movement itself, so it needs less margin than
+# the 6.1 s measured from a command that has not answered yet. It is the hold
+# an operation another central ran gets, since nothing else here marks one.
+POST_OP_RESPONSE_DEBOUNCE_DELAY = 4.1
+
 # How long to wait before processing an advertisement change
 ADV_UPDATE_COALESCE_SECONDS = 0.05
 
@@ -615,6 +621,8 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            ack_callback=self._ack_callback,
+            op_response_callback=self._op_response_callback,
         )
 
     def _disconnected_callback(self) -> None:
@@ -920,6 +928,30 @@ class PushLock:
             self._update_any_state([self._pending_op_state], arm_resync=False)
         self._operation_window_open = True
 
+    def _ack_callback(self) -> None:
+        """Hold a read off the lock from the acknowledgement of a command.
+
+        Keyed on the opcode, not on whose command it answers. Our own
+        operations are the expected source; whether another central's operation
+        is ever echoed to us as an acknowledgement is unverified, but if one is,
+        the only effect here is a longer hold, which costs a later read.
+
+        The acknowledgement is a moment of its own because the command issue is
+        up to ~2 s ahead of it on a slow connection interval, so it is not a
+        proxy for the command.
+        """
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+
+    def _op_response_callback(self) -> None:
+        """Hold a read off the lock from an op-response, ours or external.
+
+        An operation started at the lock, in the app, or by auto-lock issues no
+        command through us, and whether it is echoed to us as an
+        acknowledgement is unverified, so this is the moment to count on for
+        one.
+        """
+        self._hold_update(POST_OP_RESPONSE_DEBOUNCE_DELAY)
+
     def _close_operation_window(self) -> None:
         """Close the operation window and drop everything it recorded.
 
@@ -1003,7 +1035,7 @@ class PushLock:
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
         self._force_lock_status_poll = True
-        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
         self._schedule_future_update_with_debounce(
             KEEP_ALIVE_TIME
             if self.lock_status in POSITION_READINGS
@@ -1153,6 +1185,9 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
+            # Re-stamped per attempt, so a retry moves the floor forward with
+            # it rather than leaving the first attempt's window to expire.
+            self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
             # Hand the write-success hook to this operation alone. The window it
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
@@ -1949,6 +1984,17 @@ class PushLock:
             ) from ex
         finally:
             self._first_update_future = None
+
+    def _hold_update(self, seconds: float) -> None:
+        """Hold any update cycle off the lock for seconds from now.
+
+        Forward only, because the moments that set the floor interleave: an
+        op-response asking for its shorter hold must not pull a read forward
+        into a window the acknowledgement before it already claimed.
+        """
+        self._earliest_update_time = max(
+            self._earliest_update_time, time.monotonic() + seconds
+        )
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""
