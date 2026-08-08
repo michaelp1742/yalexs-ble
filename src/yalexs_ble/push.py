@@ -112,6 +112,11 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long to wait and check again while an operation is in flight: an
+# update cycle created then would run the instant the operation ends, while
+# the lock still reports a stale state.
+DEADLINE_WAKEUP_RETRY_DELAY = 1.0
+
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
@@ -729,6 +734,9 @@ class PushLock:
             await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
+            # The attempt ended here, so the stale-state debounce measures
+            # from this moment on a failure as it does on success.
+            self._last_lock_operation_complete_time = time.monotonic()
             # The retry_bluetooth_connection_error wrapper calls
             # _async_handle_disconnected for RETRY_EXCEPTIONS /
             # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
@@ -1495,6 +1503,18 @@ class PushLock:
         ) < LOCK_STALE_STATE_DEBOUNCE_DELAY:
             _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
             self._schedule_future_update_with_debounce(seconds_time_lock_op)
+            return
+        if self._operation_lock.locked():
+            # The debounce above is measured from the last operation to have
+            # finished, so an operation still running does not answer it. A
+            # cycle created here would wait on the operation lock and read the
+            # lock the instant that operation ended, inside the window the
+            # debounce exists to keep it out of. Check again shortly instead.
+            _LOGGER.debug(
+                "%s: Rescheduling update until the operation lock is released",
+                self.name,
+            )
+            self._schedule_future_update_with_debounce(DEADLINE_WAKEUP_RETRY_DELAY)
             return
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
