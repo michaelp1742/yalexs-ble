@@ -43,6 +43,7 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     UnlatchError,
@@ -773,7 +774,7 @@ class PushLock:
         self._cancel_future_update()
         try:
             await self._execute_lock_operation(op_attr, pending_state, complete_state)
-        except (OperationIncompleteError, UnlatchError):
+        except (OperationFailedError, OperationIncompleteError, UnlatchError):
             # These exits have already settled the display and armed their own
             # heal.
             raise
@@ -808,6 +809,19 @@ class PushLock:
         """Close the operation window and drop the pending transitional."""
         self._operation_window_open = False
         self._pending_op_state = None
+
+    def _end_lock_operation(self) -> None:
+        """Close out an operation that ran to its op-response.
+
+        Reached on success and on a reported failure alike: either way the
+        op-response marks the end of the motor's movement, and the reported
+        state is settling from this moment, which is what the stale-state
+        debounce in _deferred_update measures from.
+        """
+        now = time.monotonic()
+        self._last_lock_operation_complete_time = now
+        self._complete_operation(now)
+        self._schedule_keep_alive_poll()
 
     def _display_jam_seen_in_window(self, op_attr: str) -> None:
         """Close the window and put the jam it filtered out on display.
@@ -933,7 +947,22 @@ class PushLock:
             # Hand the write-success hook to this operation alone. The window it
             # opens is closed only on the paths below, so nothing that did not
             # come through here can open it.
-            success = await getattr(lock, op_attr)(self._operation_write_success)
+            await getattr(lock, op_attr)(self._operation_write_success)
+        except OperationFailedError:
+            # The op-response arrived and its result byte named a failure
+            # (mechanical codes are a motor stall, the rest name their own
+            # cause): the exchange completed, the operation did not. The
+            # parser's JAMMED emission fell inside our own window,
+            # so the operation applies it itself once the window is closed,
+            # then propagates: the display carries the jam, the exception
+            # tells the caller the operation did not happen.
+            self._close_operation_window()
+            self._update_any_state([LockStatus.JAMMED], arm_resync=False)
+            _LOGGER.debug(
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
+            )
+            self._end_lock_operation()
+            raise
         except (OperationIncompleteError, UnlatchError) as err:
             # Non-retryable: this propagates to the caller. If our write
             # succeeded, a transitional is on display with no result coming,
@@ -987,17 +1016,7 @@ class PushLock:
                 ex,
             )
             raise
-        if not success:
-            self._close_operation_window()
-            # Our own op-response reported a failure (byte[15] != 0). The parser
-            # already logged the named cause and emitted JAMMED, but that
-            # emission fell inside our own window, so the operation applies
-            # its outcome itself now the window is closed.
-            self._update_any_state([LockStatus.JAMMED], arm_resync=False)
-            _LOGGER.debug(
-                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
-            )
-        elif self._seen_jam:
+        if self._seen_jam:
             # The exchange completed and reported success, but the lock also
             # reported a jam while the command was in flight. complete_state is
             # inferred from the command; the jam is a reading of the mechanism,
@@ -1007,14 +1026,7 @@ class PushLock:
             self._close_operation_window()
             self._update_any_state([complete_state], arm_resync=False)
             _LOGGER.debug("%s: Finished %s", self.name, complete_state)
-        now = time.monotonic()
-        # Stamped on success and failure alike: either way the op-response
-        # marks the end of the motor's movement, and the reported state is
-        # settling from this moment, which is what the stale-state debounce
-        # in _deferred_update measures from.
-        self._last_lock_operation_complete_time = now
-        self._complete_operation(now)
-        self._schedule_keep_alive_poll()
+        self._end_lock_operation()
 
     @property
     def auto_lock_durations(self) -> list[int]:
