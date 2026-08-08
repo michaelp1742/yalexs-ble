@@ -112,6 +112,14 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long to wait before checking again when an update falls due while an
+# operation is running. No update cycle may be created during an operation,
+# because the cycle would wait on the operation lock and run the instant the
+# operation ends, inside the settle window. The check backs off briefly
+# instead and lets the retry find the operation finished or the moment still
+# passed.
+DEADLINE_WAKEUP_RETRY_DELAY = 1.0
+
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
@@ -728,7 +736,7 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
-            await getattr(lock, op_attr)()
+            success = await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
             # The retry_bluetooth_connection_error wrapper calls
@@ -741,9 +749,24 @@ class PushLock:
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        if success:
+            self._update_any_state([complete_state])
+            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        else:
+            # Our own op-response reported a failure (byte[15] != 0), so the
+            # transitional stamped at the start describes an operation that is
+            # no longer running. The parser logged the named cause and emitted
+            # JAMMED from that same frame; applying it here as well makes the
+            # displayed status the outcome the operation itself reports.
+            self._update_any_state([LockStatus.JAMMED])
+            _LOGGER.debug(
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
+            )
         now = time.monotonic()
+        # Stamped on success and failure alike: either way the op-response
+        # marks the end of the motor's movement, and the reported state is
+        # settling from this moment, which is what the stale-state debounce
+        # in _deferred_update measures from.
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)
 
@@ -1492,6 +1515,20 @@ class PushLock:
         ) < LOCK_STALE_STATE_DEBOUNCE_DELAY:
             _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
             self._schedule_future_update_with_debounce(seconds_time_lock_op)
+            return
+        if self._operation_lock.locked():
+            # The debounce above is measured from the last operation to have
+            # finished, so an operation still running does not answer it. A
+            # cycle created here would wait on the operation lock and read the
+            # lock the instant that operation ended, inside the window the
+            # debounce exists to keep it out of. Check again shortly instead:
+            # the retry finds the operation finished and its own anchor
+            # stamped, or the moment still passed.
+            _LOGGER.debug(
+                "%s: Rescheduling update until the operation lock is released",
+                self.name,
+            )
+            self._schedule_future_update_with_debounce(DEADLINE_WAKEUP_RETRY_DELAY)
             return
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
