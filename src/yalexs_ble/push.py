@@ -885,7 +885,17 @@ class PushLock:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
                 if state.voltage <= 3.0:
-                    _LOGGER.debug(
+                    # A refused reading is not a reading, so it must not count
+                    # as having seen the battery this session: the seen mark
+                    # suppresses the next poll, and the reading it would
+                    # suppress it for was never published.
+                    self._seen_this_session.discard(BatteryState)
+                    # A checksum-clean frame reporting 3.0 V or less is
+                    # 0.75 V per cell, against a table that already treats
+                    # 1.24 V per cell as empty. That is unexpected lock
+                    # behavior, so it is surfaced rather than silently
+                    # dropped.
+                    _LOGGER.warning(
                         "%s: Battery voltage is impossible: %s",
                         self.name,
                         state.voltage,
@@ -924,6 +934,19 @@ class PushLock:
 
         self._callback_state(lock_state)
 
+    def _record_auth_success(self) -> None:
+        """Record a successful round trip with the lock.
+
+        Resets the consecutive-failure count that arms the auth latch, and
+        publishes the auth state itself. This is the only producer of
+        AuthState(successful=True); the latch in the retry decorator is the
+        only producer of the failure, so both publish through the same path.
+        _update_any_state drops a repeat, so a keep-alive cycle that changes
+        nothing publishes nothing.
+        """
+        _AUTH_FAILURE_HISTORY.auth_success(self.address)
+        self._update_any_state([AuthState(successful=True)])
+
     async def update(self) -> None:
         """Request that status be updated."""
         _LOGGER.debug("%s: Starting manual update", self.name)
@@ -937,16 +960,18 @@ class PushLock:
         await self._update()
         _LOGGER.debug("%s: Finished validate", self.name)
 
-    async def _poll_battery(
-        self, lock: Lock, state: LockState
-    ) -> tuple[LockState, bool]:
+    async def _poll_battery(self, lock: Lock) -> bool:
         """Poll battery if needed: periodic refresh, timeout cooldown, errors.
 
         Battery state requires a poll of the lock to update. In always_connected mode
         _seen_this_session never clears, so once the refresh deadline passes
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
 
-        Returns tuple of (updated_state, made_request).
+        The read is issued for its effect on the receive path, which applies
+        and publishes the value before the await here resolves, so the
+        fetched value is discarded.
+
+        Returns whether a request was made.
         """
         assert self._lock_info is not None  # nosec
         if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
@@ -955,7 +980,7 @@ class PushLock:
                 self.name,
                 self._lock_info.model,
             )
-            return state, False
+            return False
 
         now = time.monotonic()
         # Skip while in cooldown after a prior battery timeout.
@@ -966,7 +991,7 @@ class PushLock:
                 self.name,
                 self._earliest_battery_attempt_time - now,
             )
-            return state, False
+            return False
 
         # Periodic refresh: evict BatteryState once its deadline has passed.
         if (
@@ -976,14 +1001,11 @@ class PushLock:
         ):
             self._seen_this_session.discard(BatteryState)
         if BatteryState in self._seen_this_session:
-            return state, False
+            return False
 
         try:
-            battery_state = await lock.battery()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state, battery=battery_state, auth=AuthState(successful=True)
-            )
+            await lock.battery()
+            self._record_auth_success()
             # Success: disable cooldown and schedule the next refresh.
             self._earliest_battery_attempt_time = NEVER_TIME
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
@@ -1004,7 +1026,7 @@ class PushLock:
                 err,
             )
 
-        return state, True
+        return True
 
     async def _probe_lock_info(self, lock: Lock) -> LockInfo:
         """Probe the lock for info, falling back to defaults on failure."""
@@ -1131,7 +1153,12 @@ class PushLock:
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
-        """Update the lock state."""
+        """Update the lock state.
+
+        Each read publishes through the receive path as its answer lands, so
+        the return value is the live state after the cycle rather than a copy
+        this method assembled. Both callers discard it.
+        """
         has_lock_info = self._lock_info is not None
 
         _LOGGER.debug(
@@ -1140,13 +1167,17 @@ class PushLock:
         lock = await self._ensure_connected()
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
-        state = self._get_current_state()
+
+        # Each read below is issued for its effect on the receive path:
+        # session._notify hands every frame to the state path before it
+        # resolves the waiter the read is blocked on, so the answer has
+        # already been applied and published by the time the await returns.
+        # The fetched values therefore carry nothing new and are discarded.
         made_request = False
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        state, battery_requested = await self._poll_battery(lock, state)
-        if battery_requested:
+        if await self._poll_battery(lock):
             made_request = True
 
         if (
@@ -1155,14 +1186,12 @@ class PushLock:
             and self._lock_info.door_sense
         ):
             made_request = True
-            door_status = await lock.door_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, door=door_status, auth=AuthState(successful=True))
+            await lock.door_status()
+            self._record_auth_success()
 
         if await self._read_auto_lock_setting(lock):
             made_request = True
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, auth=AuthState(successful=True))
+            self._record_auth_success()
 
         # Only ask for the lock status if we haven't seen
         # it this session since notify callbacks will happen
@@ -1175,49 +1204,23 @@ class PushLock:
             not made_request and self._always_connected
         ):
             made_request = True
-            lock_status = await lock.lock_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, lock=lock_status, auth=AuthState(successful=True))
+            await lock.lock_status()
+            self._record_auth_success()
 
         _LOGGER.debug("%s: Finished update", self.name)
 
-        # Prevent regression to UNKNOWN when notify callbacks updated state
-        # during awaited operations in this update cycle.
-        # Only overwrite lock/door if this update actually fetched a value.
-        cached_state = self._get_current_state()
-        if state.lock == LockStatus.UNKNOWN and cached_state.lock != LockStatus.UNKNOWN:
-            state = replace(state, lock=cached_state.lock)
-        if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
-            state = replace(state, door=cached_state.door)
-
-        # Auto-lock is owned by the notify path: the 0xBB settings responses
-        # (read and write) publish it mid-update, while the poll's own return
-        # value is the acknowledgment constant and is discarded above. Always
-        # carry the cached value forward so this wholesale application cannot
-        # clobber a value published during the cycle.
-        state = replace(
-            state,
-            auto_lock=cached_state.auto_lock,
-            auto_lock_prev=cached_state.auto_lock_prev,
-        )
-
-        self._callback_state(state)
-
-        if state.battery and state.battery.voltage <= 3.0:
-            _LOGGER.debug(
-                "%s: Battery voltage is impossible: %s",
-                self.name,
-                state.battery.voltage,
-            )
-            # If the battery voltage is impossible, reconnect.
-            await self._execute_forced_disconnect("impossible battery voltage")
-
-        if state.lock in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
-            _LOGGER.debug("%s: Lock is in an unknown state: %s", self.name, state.lock)
-            # If the lock is in a bad state, reconnect.
-            await self._execute_forced_disconnect(
-                f"lock is in unknown state: {state.lock}"
-            )
+        current = self._get_current_state()
+        # One publish per cycle, of the live state. Every reading this cycle
+        # took was applied and published as its frame landed, so this hands
+        # back exactly what is already held and cannot change any member.
+        #
+        # It exists because a consumer may read the callback as a liveness
+        # signal rather than only as a change notification. The Home Assistant
+        # entities do: they mark themselves unavailable from their own
+        # advertisement tracking and have no path back other than this
+        # callback, so a cycle that read the same values as the last one still
+        # has to report.
+        self._callback_state(current)
 
         if not has_lock_info:
             # On first update free up the connection
@@ -1235,7 +1238,7 @@ class PushLock:
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
-        return state
+        return self._get_current_state()
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
