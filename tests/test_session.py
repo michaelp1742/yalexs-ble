@@ -85,6 +85,39 @@ async def test_execute_without_matcher_takes_first_valid_frame() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_answering_frame_reaches_the_state_path_before_the_wait() -> None:
+    """The frame answering a command is applied before the wait it resolves.
+
+    A caller that reads the lock discards what the read returns and relies on
+    the frame having been applied here, so the answering frame has to reach
+    the state path, and has to reach it while the wait is still armed. Drop
+    the hand-off for that frame and the state path never sees it; move it
+    below the resolution and the caller can resume ahead of it.
+    """
+    received: list[bytes] = []
+    armed_at_hand_off: list[bool] = []
+
+    def state_callback(data: bytes) -> None:
+        received.append(data)
+        armed_at_hand_off.append(session._notify_future is not None)
+
+    client = MagicMock(is_connected=True)
+    session = Session(client, "testlock", asyncio.Lock(), set(), state_callback)
+    session.decrypt = bytes  # type: ignore[method-assign, assignment]
+    session.cipher_encrypt = MagicMock(update=bytes)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(READ_ACK))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session.execute(bytearray(18), "auto_lock_status")
+
+    assert result == READ_ACK
+    assert received == [READ_ACK]
+    assert armed_at_hand_off == [True]
+
+
+@pytest.mark.asyncio
 async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> None:
     """A frame that fails the checksum ends the wait, and the write is repeated.
 

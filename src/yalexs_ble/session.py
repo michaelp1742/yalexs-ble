@@ -236,6 +236,14 @@ class Session:
         except ResponseError as ex:
             self._reject_frame(ex, decrypted_data)
             return
+        # Every frame is handed to the state path, the one that answers a
+        # solicited wait included, and it is handed over before the wait is
+        # resolved below. PushLock's update cycle discards what its reads
+        # return and relies on the frame having been applied here, so a change
+        # that moves this hand-off behind an await, or drops it for the frame
+        # that answers, silently stops every polled reading reaching the
+        # display. SecureSession inherits this method with no state callback
+        # and its callers do read the returned frame.
         if self._state_callback:
             self._state_callback(decrypted_data)
         if self._notify_future is None:
