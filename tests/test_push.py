@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import struct
 import time
 from collections.abc import Callable
 from typing import Any
@@ -23,6 +24,7 @@ from yalexs_ble.const import (
 from yalexs_ble.lock import Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
+    APPLE_MFR_ID,
     AUTH_FAILURE_TO_START_REAUTH,
     AUTO_LOCK_READ_FAILURE_BACKOFF,
     AUTO_LOCK_READ_FAILURE_THRESHOLD,
@@ -31,6 +33,7 @@ from yalexs_ble.push import (
     AUTO_LOCK_WRITE_ATTEMPTS,
     BATTERY_REFRESH_INTERVAL,
     DEFAULT_ATTEMPTS,
+    HAP_FIRST_BYTE,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
@@ -2181,3 +2184,77 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up(
         await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
 
     assert mock_lock.set_auto_lock.await_count == AUTO_LOCK_WRITE_ATTEMPTS
+
+
+def _advertisement(manufacturer_data: dict[int, bytes]) -> AdvertisementData:
+    """An advertisement carrying the given manufacturer payloads."""
+    return AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data=manufacturer_data,
+        platform_data=(),
+        tx_power=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "manufacturer_data",
+    [
+        # A HomeKit payload that ends before the state number it advertises.
+        {APPLE_MFR_ID: bytes([HAP_FIRST_BYTE]) + b"\x00" * 8},
+        # One byte short of the state record, which is the boundary the guard
+        # turns on: at 14 bytes the unpack still runs off the end.
+        {APPLE_MFR_ID: bytes([HAP_FIRST_BYTE]) + b"\x00" * 13},
+        # An empty payload under either identifier.
+        {APPLE_MFR_ID: b""},
+        {YALE_MFR_ID: b""},
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_short_advertisement_payload_is_skipped_not_parsed(
+    manufacturer_data: dict[int, bytes],
+) -> None:
+    """A payload too short for the fields read from it schedules nothing.
+
+    An advertisement is radio input and its length is not ours to assume. The
+    parse used to index and unpack it unconditionally, so a truncated payload
+    raised out of the callback the consumer dispatches from.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:28",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+
+    push_lock.update_advertisement(ble_device, _advertisement(manufacturer_data))
+
+    assert push_lock._cancel_deferred_update is None
+    assert push_lock._last_hk_state == -1
+
+
+@pytest.mark.asyncio
+async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> None:
+    """The guard admits a payload long enough for the fields it reads."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:29",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+    # <HHBB at byte 9: acid, then the global state number 0x1234.
+    payload = (
+        bytes([HAP_FIRST_BYTE]) + b"\x00" * 8 + struct.pack("<HHBB", 1, 0x1234, 0, 0)
+    )
+
+    push_lock.update_advertisement(ble_device, _advertisement({APPLE_MFR_ID: payload}))
+
+    assert push_lock._last_hk_state == 0x1234
+    assert push_lock._cancel_deferred_update is not None
+    push_lock._cancel_future_update()
