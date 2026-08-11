@@ -125,6 +125,12 @@ RETRYABLE_EXCEPTIONS = (*RETRY_BACKOFF_EXCEPTIONS, *RETRY_EXCEPTIONS)
 # there is no update from the lock.
 VALID_ADV_VALUES = {0, 1}
 
+# The HomeKit advertisement fields read below end at byte 15: the global state
+# number sits at [11:13] inside the <HHBB record that starts at byte 9. A
+# payload shorter than this carries no state number to read, so it is skipped
+# rather than unpacked.
+HAP_STATE_RECORD_END = 15
+
 AUTH_FAILURE_TO_START_REAUTH = 5
 
 # How long to wait before retrying battery after a timeout (5 minutes)
@@ -1298,15 +1304,17 @@ class PushLock:
         self.set_advertisement_data(ad)
         next_update = 0.0
         mfr_data = ad.manufacturer_data
-        if APPLE_MFR_ID in mfr_data:
-            first_byte = mfr_data[APPLE_MFR_ID][0]
-            if first_byte == HAP_FIRST_BYTE:
-                hk_state = get_homekit_state_num(mfr_data[APPLE_MFR_ID])
+        # An empty payload is skipped rather than indexed: the advertisement is
+        # radio input and its length is not ours to assume.
+        if apple_data := mfr_data.get(APPLE_MFR_ID):
+            first_byte = apple_data[0]
+            if first_byte == HAP_FIRST_BYTE and len(apple_data) >= HAP_STATE_RECORD_END:
+                hk_state = get_homekit_state_num(apple_data)
                 # Sometimes the yale data is glued on to the end of the HomeKit data
                 # but in that case it seems wrong so we don't process it
                 #
-                # if len(mfr_data[APPLE_MFR_ID]) > 20 and YALE_MFR_ID not in mfr_data:
-                # mfr_data[YALE_MFR_ID] = mfr_data[APPLE_MFR_ID][20:]
+                # if len(apple_data) > 20 and YALE_MFR_ID not in mfr_data:
+                # mfr_data[YALE_MFR_ID] = apple_data[20:]
                 if self._last_hk_state == -1:
                     # We haven't seen a HomeKit state yet so we schedule an update
                     next_update = FIRST_UPDATE_COALESCE_SECONDS
@@ -1327,10 +1335,11 @@ class PushLock:
         # static 0x00 header of the 18-byte format causes repeated
         # connections if it differs from the 1-byte value.
         is_first_advertisement = self._last_adv_value == -1
-        if YALE_MFR_ID in mfr_data and (
-            len(mfr_data[YALE_MFR_ID]) == 1 or is_first_advertisement
+        # As above, an empty payload is skipped rather than indexed.
+        if (yale_data := mfr_data.get(YALE_MFR_ID)) and (
+            len(yale_data) == 1 or is_first_advertisement
         ):
-            current_value = mfr_data[YALE_MFR_ID][0]
+            current_value = yale_data[0]
             if not next_update:
                 if is_first_advertisement:
                     # We haven't seen a valid value yet so we schedule an update
