@@ -22,6 +22,16 @@ _LOGGER = logging.getLogger(__name__)
 
 COOLDOWN_TIME = 0.25
 
+# Every frame the lock sends is 18 bytes: a 16-byte encrypted block plus two
+# trailing plain bytes, and the checksum runs over all 18. The gate is strict
+# equality, not a floor. A shorter payload must not reach the cipher: the CBC
+# context consumes ciphertext in 16-byte blocks, so a partial block stays
+# buffered inside it and every later frame on the connection decrypts
+# misaligned, a state only a reconnect's set_key rebuilds. A longer payload
+# would otherwise validate on its first 18 decrypted bytes and be passed on
+# with a tail that was never decrypted.
+RESPONSE_FRAME_LEN = 0x12
+
 
 class YaleXSBLEError(Exception):
     """Base class for YaleXSBLE errors."""
@@ -144,6 +154,24 @@ class Session:
         async with self._lock:
             return await self._locked_write(command, command_name, response_matcher)
 
+    def _reject_frame(self, ex: ResponseError, frame: bytes | bytearray) -> None:
+        """Dispose of a frame that failed admission.
+
+        The frame is withheld from the state callback. A solicited wait still
+        receives the error, so _locked_write re-sends its command; an
+        unsolicited frame has no waiter and is dropped.
+        """
+        # The drop line carries the frame hex at INFO: these frames should not
+        # occur at all, so a drop and its evidence are visible without turning
+        # debug on, where the frames themselves are logged.
+        _LOGGER.info("%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex)
+        if self._notify_future is None:
+            return
+        _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
+        self._notify_future.set_exception(ex)
+        self._notify_future = None
+        self._notify_matcher = None
+
     def _notify(self, char: int, data: bytearray) -> None:
         self._last_callback_time = time.monotonic()
         _LOGGER.debug(
@@ -152,21 +180,33 @@ class Session:
             data.hex(),
             bool(self._notify_future),
         )
+        if len(data) != RESPONSE_FRAME_LEN:
+            # This gate must sit ahead of decrypt (see RESPONSE_FRAME_LEN):
+            # dropping the payload here keeps the cipher aligned, so the
+            # session stays usable for the next good frame.
+            self._reject_frame(
+                ResponseError(
+                    f"{len(data)} bytes is not an "
+                    f"{RESPONSE_FRAME_LEN}-byte response frame"
+                ),
+                data,
+            )
+            return
         decrypted_data = self.decrypt(data)
-        if self._state_callback:
-            self._state_callback(decrypted_data)
         _LOGGER.debug(
             "%s: Decrypted response via notify: %s", self.name, decrypted_data.hex()
         )
-        if self._notify_future is None:
-            return
         try:
-            self._validate_response(data)
+            # Runs on every frame, not only while a wait is armed: the state
+            # callback below drives the consumer's state, so an unsolicited
+            # frame has to clear the same bar as a solicited one.
+            self._validate_response(decrypted_data)
         except ResponseError as ex:
-            _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
-            self._notify_future.set_exception(ex)
-            self._notify_future = None
-            self._notify_matcher = None
+            self._reject_frame(ex, decrypted_data)
+            return
+        if self._state_callback:
+            self._state_callback(decrypted_data)
+        if self._notify_future is None:
             return
         if self._notify_matcher is not None and not self._notify_matcher(
             decrypted_data

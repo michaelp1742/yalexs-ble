@@ -1,14 +1,16 @@
-"""Session-level tests for the solicited-response matcher."""
+"""Session-level tests for frame admission and the solicited-response matcher."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from yalexs_ble import util
 from yalexs_ble.const import Commands, SettingType
 from yalexs_ble.lock import _settings_response_matcher
-from yalexs_ble.session import ResponseError, Session
+from yalexs_ble.session import RESPONSE_FRAME_LEN, ResponseError, Session
 
 # Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
 # acknowledgment and, ~40 ms later, the 0xBB frame carrying the stored value
@@ -96,8 +98,9 @@ async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> No
 
     assert result == READ_ANSWER
     assert session.client.write_gatt_char.await_count == 2
-    # Both frames reached the state callback; only the valid one answered.
-    assert received == [CORRUPT_ANSWER, READ_ANSWER]
+    # The corrupt frame was withheld from the state callback; only the valid
+    # one reached it, and only it answered.
+    assert received == [READ_ANSWER]
 
 
 @pytest.mark.asyncio
@@ -207,3 +210,105 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
 
     assert result == READ_ANSWER
     assert session._notify_future is None
+
+
+SESSION_KEY = bytes(range(16))
+
+
+def _make_encrypted_session(received: list[bytes]) -> Session:
+    """Create a Session with the real CBC contexts rather than pass-through."""
+    client = MagicMock(is_connected=True)
+    session = Session(client, "testlock", asyncio.Lock(), set(), received.append)
+    session.set_key(SESSION_KEY)
+    return session
+
+
+def _lock_side_frames(*plaintexts: bytes) -> list[bytes]:
+    """Encrypt frames the way the lock does, as one chained stream.
+
+    The first 16 bytes are one CBC block and the last two travel in the clear,
+    and the context chains across frames, which is why a frame that reaches
+    our decryptor out of step desynchronizes every frame after it.
+    """
+    encryptor = Cipher(algorithms.AES(SESSION_KEY), modes.CBC(bytes(0x10))).encryptor()
+    return [encryptor.update(p[0:0x10]) + p[0x10:0x12] for p in plaintexts]
+
+
+@pytest.mark.asyncio
+async def test_a_short_frame_is_dropped_before_it_can_poison_the_cipher() -> None:
+    """A wrong-length payload never reaches the cipher, so the stream survives.
+
+    The CBC context consumes ciphertext in 16-byte blocks. A partial block
+    would stay buffered inside it and every later frame on the connection
+    would decrypt misaligned, which only a reconnect's set_key could undo. The
+    frame after the runt must still decode.
+    """
+    received: list[bytes] = []
+    session = _make_encrypted_session(received)
+    first, second = _lock_side_frames(READ_ACK, READ_ANSWER)
+
+    session._notify(0, bytearray(first))
+    session._notify(0, bytearray(b"\x00" * 10))
+    session._notify(0, bytearray(second))
+
+    assert received == [READ_ACK, READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_an_unsolicited_invalid_frame_is_withheld_from_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A frame arriving with no wait armed is validated too, and dropped.
+
+    The state callback drives the consumer's state whether or not a command is
+    outstanding, so an unsolicited frame has to clear the same bar.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.session"):
+        session._notify(0, bytearray(CORRUPT_ANSWER))
+        session._notify(0, bytearray(len(CORRUPT_ANSWER) // 2))
+
+    assert received == []
+    assert "dropping invalid frame" in caplog.text
+    # The rejection reaches the user through _locked_write's exhausted
+    # retries, so it names the length it wanted as well as the one it got.
+    assert "9 bytes is not an 18-byte response frame" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_frame_length_gate_is_strict_equality() -> None:
+    """A longer payload is refused as well as a shorter one.
+
+    A frame carrying more than the response length would otherwise validate on
+    its first 18 decrypted bytes and be passed on with a tail that was never
+    decrypted.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+
+    session._notify(0, bytearray(READ_ANSWER + READ_ANSWER))
+
+    assert len(READ_ANSWER) == RESPONSE_FRAME_LEN
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_a_session_without_a_state_callback_still_answers_its_wait() -> None:
+    """The secure session carries no state callback, and admission assumes none.
+
+    Its handshake frames go through the same length gate and checksum as every
+    other frame, and must still resolve the wait that asked for them.
+    """
+    client = MagicMock(is_connected=True)
+    session = Session(client, "testlock", asyncio.Lock(), set())
+    session.decrypt = bytes  # type: ignore[method-assign, assignment]
+    session.cipher_encrypt = MagicMock(update=bytes)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(READ_ANSWER))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    assert await session.execute(bytearray(18), "auto_lock_status") == READ_ANSWER

@@ -245,14 +245,16 @@ class Lock:
         raise BleakError(f"Missing characteristic {char_uuid}")
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+        # Every frame arriving here is exactly RESPONSE_FRAME_LEN bytes: the
+        # session admits no other length, so the fixed offsets below need no
+        # length check of their own. Anything that ever routes frames here
+        # from somewhere other than Session._notify has to gate them the same
+        # way first.
         if state[0] == 0xBB:
             # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
             # motor stops. The operation result is byte[15]: 0x00 = success,
             # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
-            if (
-                state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
-                and len(state) > 0x0F
-            ):
+            if state[1] in (Commands.LOCK.value, Commands.UNLOCK.value):
                 result = state[0x0F]
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
