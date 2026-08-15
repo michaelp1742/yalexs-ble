@@ -267,8 +267,11 @@ async def test_a_rejection_during_a_failing_write_is_not_left_unretrieved() -> N
     """
     received: list[bytes] = []
     session = _make_session(received)
+    orphaned: list[asyncio.Future[bytes]] = []
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
+        assert session._notify_future is not None
+        orphaned.append(session._notify_future)
         session._notify(0, bytearray(9))
         raise BleakError("write failed")
 
@@ -277,6 +280,13 @@ async def test_a_rejection_during_a_failing_write_is_not_left_unretrieved() -> N
         await session.execute(bytearray(18), "auto_lock_status")
 
     assert session._notify_future is None
+    # _log_traceback is the flag asyncio checks on GC to emit "exception was
+    # never retrieved"; set_exception raises it and only a retrieval clears
+    # it, so False here proves the finally block consumed the error. It must
+    # be read before exception() below, which would clear it itself.
+    (future,) = orphaned
+    assert future._log_traceback is False
+    assert isinstance(future.exception(), ResponseError)
 
 
 @pytest.mark.asyncio

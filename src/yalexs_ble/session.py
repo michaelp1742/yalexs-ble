@@ -275,11 +275,12 @@ class Session:
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
 
+        future: asyncio.Future[bytes] | None = None
         try:
             # The loop never exhausts: the last attempt re-raises, so the only
             # ways out are break and raise.
             for attempt in range(3):  # pragma: no branch
-                future: asyncio.Future[bytes] = self.loop.create_future()
+                future = self.loop.create_future()
                 self._notify_future = future
                 self._notify_matcher = response_matcher
                 _LOGGER.debug(
@@ -313,9 +314,15 @@ class Session:
             # the future is never awaited. Retrieve it so asyncio does not
             # log "exception was never retrieved" with no context. suppress
             # covers the pending and cancelled states, where there is
-            # nothing to retrieve.
-            with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
-                future.exception()
+            # nothing to retrieve. The None check guards only create_future
+            # itself raising on the first attempt, which would otherwise turn
+            # into a NameError here that masks the real error; no test can
+            # reach it.
+            if future is not None:  # pragma: no branch
+                with contextlib.suppress(
+                    asyncio.CancelledError, asyncio.InvalidStateError
+                ):
+                    future.exception()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 

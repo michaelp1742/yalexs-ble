@@ -1290,8 +1290,9 @@ class PushLock:
         mfr_data = ad.manufacturer_data
         # An empty payload is skipped rather than indexed: the advertisement is
         # radio input and its length is not ours to assume. Each refusal is
-        # logged at debug so a chronically truncated advertiser stays
-        # diagnosable instead of merely inert.
+        # logged at debug — not INFO like the notify gate — because
+        # advertisements repeat every few seconds, so a chronic condition
+        # would flood any stronger level; debug keeps it diagnosable.
         if apple_data := mfr_data.get(APPLE_MFR_ID):
             first_byte = apple_data[0]
             if first_byte == HAP_FIRST_BYTE:
