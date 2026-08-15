@@ -271,7 +271,9 @@ class Session:
         )
 
         try:
-            for attempt in range(3):
+            # The loop never exhausts: the last attempt re-raises, so the only
+            # ways out are break and raise.
+            for attempt in range(3):  # pragma: no branch
                 future: asyncio.Future[bytes] = self.loop.create_future()
                 self._notify_future = future
                 self._notify_matcher = response_matcher

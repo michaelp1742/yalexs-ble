@@ -219,6 +219,24 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
     assert session._notify_future is None
 
 
+@pytest.mark.asyncio
+async def test_the_command_builders_emit_exactly_one_response_frame() -> None:
+    """Both builders and the admission gate share the one frame length.
+
+    The gate refuses anything that is not RESPONSE_FRAME_LEN bytes, so a
+    command builder drifting from it would emit frames the link itself
+    rejects.
+    """
+    session = _make_session([])
+    cmd = session.build_operation_command(0x0B, 0x05)
+
+    assert len(cmd) == RESPONSE_FRAME_LEN
+    assert cmd[0x00] == 0xEE
+    assert cmd[0x01] == 0x0B
+    assert cmd[0x04] == 0x05
+    assert cmd[0x10] == 0x02
+
+
 SESSION_KEY = bytes(range(16))
 
 
