@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -220,15 +221,38 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
     assert session._notify_future is None
 
 
-def test_the_simple_checksum_refuses_a_short_buffer() -> None:
-    """The checksum helper defends its own input.
+@pytest.mark.parametrize("checksum", [util._simple_checksum, util._security_checksum])
+def test_the_checksum_helpers_refuse_a_short_buffer(
+    checksum: Callable[[bytes], int],
+) -> None:
+    """Both checksum helpers defend their own input.
 
     A slice over a short buffer would silently checksum whatever bytes are
-    there — potentially summing to a "valid" 0 — so the helper raises
-    instead of leaning on the notify gate being its only caller.
+    there — potentially summing to a "valid" result — so the helpers raise
+    instead of leaning on the notify gate being their only caller.
     """
     with pytest.raises(ValueError, match="checksum needs 18 bytes, got 17"):
-        util._simple_checksum(b"\x00" * 17)
+        checksum(b"\x00" * 17)
+
+
+@pytest.mark.asyncio
+async def test_a_frame_with_an_unknown_flag_is_withheld_from_state() -> None:
+    """A valid checksum alone does not admit a frame with an unknown flag.
+
+    The flag check used to run only while a wait was armed; an unsolicited
+    frame carrying an opcode byte the protocol does not use is now withheld
+    from the state callback like any other admission failure.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    frame = bytearray(RESPONSE_FRAME_LEN)
+    frame[0x00] = 0xCC
+    frame[0x03] = util._simple_checksum(frame)
+    assert util._simple_checksum(frame) == 0
+
+    session._notify(0, frame)
+
+    assert received == []
 
 
 @pytest.mark.asyncio

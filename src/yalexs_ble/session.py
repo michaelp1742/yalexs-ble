@@ -191,11 +191,13 @@ class Session:
             bool(self._notify_future),
         )
         if not data:
-            # An empty notification carries nothing to decrypt or judge, and
-            # it must not fail an armed wait: the real response is still in
-            # flight, and failing the wait would re-send the command while it
-            # is, so the lock would decrypt the duplicate as garbage. Drop it
-            # without touching the wait.
+            # An empty notification is a transport artifact, not a frame off
+            # the lock: the stack emits them on its own, so one carries no
+            # signal about the link or the command in flight, and it was a
+            # no-op here before the length gate existed. A truncated frame is
+            # different — it is evidence the response itself was corrupted —
+            # so it fails the armed wait below and triggers a re-send, while
+            # this is dropped without touching the wait.
             _LOGGER.debug("%s: Dropping empty notification", self.name)
             return
         if len(data) != RESPONSE_FRAME_LEN:
