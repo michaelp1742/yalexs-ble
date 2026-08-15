@@ -1783,7 +1783,7 @@ async def test_set_auto_lock_write_resets_read_backoff() -> None:
 
 
 def _auto_lock_push_lock(address: str, *, always_connected: bool) -> PushLock:
-    """A named PushLock for the auto lock read outcome tests."""
+    """A named PushLock with the canonical test key and slot."""
     push_lock = PushLock(
         address=address,
         key="0800200c9a66",
@@ -2222,13 +2222,7 @@ async def test_a_short_advertisement_payload_is_skipped_not_parsed(
     parse used to index and unpack it unconditionally, so a truncated payload
     raised out of the callback the consumer dispatches from.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:28",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:28", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
 
     push_lock.update_advertisement(ble_device, _advertisement(manufacturer_data))
@@ -2240,13 +2234,7 @@ async def test_a_short_advertisement_payload_is_skipped_not_parsed(
 @pytest.mark.asyncio
 async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> None:
     """The guard admits a payload long enough for the fields it reads."""
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:29",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
     # <HHBB at byte 9: acid, then the global state number 0x1234.
     payload = (

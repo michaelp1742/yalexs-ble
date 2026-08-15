@@ -385,7 +385,11 @@ class Lock:
                             .decode()
                             .split("\0")[0]
                         )
-                    except BleakError as err:
+                    # The read is radio input too: the BLE controller bug
+                    # noted above corrupts packets, so the bytes may not be
+                    # UTF-8. A bad read degrades to the fallback for that
+                    # characteristic, like a failed one.
+                    except (BleakError, UnicodeDecodeError) as err:
                         _LOGGER.warning(
                             "%s: Failed to read characteristic %s: %s",
                             self.name,

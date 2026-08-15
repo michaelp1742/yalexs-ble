@@ -115,12 +115,6 @@ RETRYABLE_EXCEPTIONS = (*RETRY_BACKOFF_EXCEPTIONS, *RETRY_EXCEPTIONS)
 # there is no update from the lock.
 VALID_ADV_VALUES = {0, 1}
 
-# The HomeKit advertisement fields read below end at byte 15: the global state
-# number sits at [11:13] inside the <HHBB record that starts at byte 9. A
-# payload shorter than this carries no state number to read, so it is skipped
-# rather than unpacked.
-HAP_STATE_RECORD_END = 15
-
 AUTH_FAILURE_TO_START_REAUTH = 5
 
 # How long to wait before retrying battery after a timeout (5 minutes)
@@ -1298,8 +1292,9 @@ class PushLock:
         # radio input and its length is not ours to assume.
         if apple_data := mfr_data.get(APPLE_MFR_ID):
             first_byte = apple_data[0]
-            if first_byte == HAP_FIRST_BYTE and len(apple_data) >= HAP_STATE_RECORD_END:
-                hk_state = get_homekit_state_num(apple_data)
+            if first_byte == HAP_FIRST_BYTE and (
+                (hk_state := get_homekit_state_num(apple_data)) is not None
+            ):
                 # Sometimes the yale data is glued on to the end of the HomeKit data
                 # but in that case it seems wrong so we don't process it
                 #
@@ -1536,7 +1531,19 @@ class PushLock:
             _LOGGER.exception("%s: Unknown error updating", self.name)
 
 
-def get_homekit_state_num(data: bytes) -> int:
-    """Get the homekit state number from the manufacturer data."""
-    _acid, gsn, _cn, _cv = struct.unpack("<HHBB", data[9:15])
+# The HomeKit state record inside the advertisement payload: acid, the global
+# state number, cn, cv, starting at byte 9.
+_HAP_STATE_RECORD = struct.Struct("<HHBB")
+_HAP_STATE_RECORD_OFFSET = 9
+
+
+def get_homekit_state_num(data: bytes) -> int | None:
+    """Get the homekit state number from the manufacturer data.
+
+    Returns None when the payload ends before the record does: the
+    advertisement is radio input and its length is not ours to assume.
+    """
+    if len(data) < _HAP_STATE_RECORD_OFFSET + _HAP_STATE_RECORD.size:
+        return None
+    _acid, gsn, _cn, _cv = _HAP_STATE_RECORD.unpack_from(data, _HAP_STATE_RECORD_OFFSET)
     return gsn

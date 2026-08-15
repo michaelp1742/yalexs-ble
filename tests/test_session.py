@@ -23,12 +23,18 @@ READ_ANSWER = bytes.fromhex("bb0400fb2800000008070807000000000000")
 CORRUPT_ANSWER = bytes.fromhex("bb0400002800000008070807000000000000")
 
 
-def _make_session(received: list[bytes]) -> Session:
-    """Create a Session with a mock client and pass-through crypto."""
+def _make_session(received: list[bytes], key: bytes | None = None) -> Session:
+    """Create a Session with a mock client.
+
+    Pass-through crypto by default; with ``key``, the real CBC contexts.
+    """
     client = MagicMock(is_connected=True)
     session = Session(client, "testlock", asyncio.Lock(), set(), received.append)
-    session.decrypt = bytes  # type: ignore[method-assign, assignment]
-    session.cipher_encrypt = MagicMock(update=bytes)
+    if key is None:
+        session.decrypt = bytes  # type: ignore[method-assign, assignment]
+        session.cipher_encrypt = MagicMock(update=bytes)
+    else:
+        session.set_key(key)
     return session
 
 
@@ -216,14 +222,6 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
 SESSION_KEY = bytes(range(16))
 
 
-def _make_encrypted_session(received: list[bytes]) -> Session:
-    """Create a Session with the real CBC contexts rather than pass-through."""
-    client = MagicMock(is_connected=True)
-    session = Session(client, "testlock", asyncio.Lock(), set(), received.append)
-    session.set_key(SESSION_KEY)
-    return session
-
-
 def _lock_side_frames(*plaintexts: bytes) -> list[bytes]:
     """Encrypt frames the way the lock does, as one chained stream.
 
@@ -245,7 +243,7 @@ async def test_a_short_frame_is_dropped_before_it_can_poison_the_cipher() -> Non
     frame after the runt must still decode.
     """
     received: list[bytes] = []
-    session = _make_encrypted_session(received)
+    session = _make_session(received, key=SESSION_KEY)
     first, second = _lock_side_frames(READ_ACK, READ_ANSWER)
 
     session._notify(0, bytearray(first))
@@ -307,40 +305,85 @@ async def test_a_short_frame_ends_an_armed_wait_and_the_command_is_re_sent() -> 
 
 
 @pytest.mark.asyncio
-async def test_an_over_length_frame_is_logged_a_level_above_a_short_one(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An over-length payload names a transport fault, not a corrupt frame.
+async def test_an_empty_notification_leaves_an_armed_wait_armed() -> None:
+    """An empty payload is dropped without failing the wait.
 
-    Nothing on either side of the link builds a frame longer than the response
-    length, so an over-length one says the stack below is behaving in a way
-    nobody has seen. A short frame is ordinary radio corruption.
+    The real response is still in flight when the empty notification lands;
+    failing the wait would re-send the command while it is, and the lock
+    would decrypt the duplicate as garbage. The wait stays armed and the
+    real frame answers it, with no second write.
     """
     received: list[bytes] = []
     session = _make_session(received)
 
-    with caplog.at_level(logging.INFO, logger="yalexs_ble.session"):
-        session._notify(0, bytearray(READ_ANSWER + READ_ANSWER))
-        session._notify(0, bytearray(9))
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray())
+        # The empty payload must not have failed the wait.
+        assert session._notify_future is not None
+        session._notify(0, bytearray(READ_ANSWER))
 
-    drops = [r for r in caplog.records if "dropping invalid frame" in r.getMessage()]
-    assert [r.levelname for r in drops] == ["WARNING", "INFO"]
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session.execute(bytearray(18), "auto_lock_status")
+
+    assert result == READ_ANSWER
+    assert session.client.write_gatt_char.await_count == 1
+    assert received == [READ_ANSWER]
 
 
 @pytest.mark.asyncio
-async def test_the_frame_length_gate_is_strict_equality() -> None:
-    """A longer payload is refused as well as a shorter one.
+async def test_a_frame_racing_a_cancelled_wait_does_not_raise() -> None:
+    """A frame landing after the waiter gave up must not blow up the callback.
 
-    A frame carrying more than the response length would otherwise validate on
-    its first 18 bytes and be passed on with a tail the cipher never saw.
+    A timeout or a disconnect cancels the armed future from the waiting side,
+    and a notification already queued in that window then finds a future that
+    is done. Resolving it again would raise InvalidStateError out of the
+    notify callback; instead the wait is disarmed and the frame still takes
+    its normal path.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+
+    def arm_cancelled_wait() -> None:
+        future: asyncio.Future[bytes] = session.loop.create_future()
+        session._notify_future = future
+        future.cancel()
+
+    # A valid frame against a cancelled wait: state still updates.
+    arm_cancelled_wait()
+    session._notify(0, bytearray(READ_ANSWER))
+    assert received == [READ_ANSWER]
+    assert session._notify_future is None
+
+    # An invalid frame against a cancelled wait: dropped, wait disarmed.
+    arm_cancelled_wait()
+    session._notify(0, bytearray(9))
+    assert received == [READ_ANSWER]
+    assert session._notify_future is None
+
+
+@pytest.mark.asyncio
+async def test_an_over_length_frame_is_refused_and_logged_a_level_above(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The length gate is strict equality, and over-length earns more noise.
+
+    A frame carrying more than the response length would otherwise validate
+    on its first 18 bytes and be passed on with a tail the cipher never saw,
+    so it is refused like a short one. It is also logged a level above: the
+    radio truncates frames on its own, but nothing on the link builds a
+    longer one, so over-length points at the transport below.
     """
     received: list[bytes] = []
     session = _make_session(received)
     assert len(READ_ANSWER) == RESPONSE_FRAME_LEN
 
-    session._notify(0, bytearray(READ_ANSWER + READ_ANSWER))
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.session"):
+        session._notify(0, bytearray(READ_ANSWER + READ_ANSWER))
+        session._notify(0, bytearray(9))
 
     assert received == []
+    drops = [r for r in caplog.records if "dropping invalid frame" in r.getMessage()]
+    assert [r.levelname for r in drops] == ["WARNING", "INFO"]
 
 
 def _secure_on_air(frame: bytes | bytearray) -> bytes:

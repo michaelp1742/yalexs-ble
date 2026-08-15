@@ -16,21 +16,11 @@ from cryptography.hazmat.primitives.ciphers import (
 )
 
 from . import util
-from .const import READ_CHARACTERISTIC, WRITE_CHARACTERISTIC
+from .const import READ_CHARACTERISTIC, RESPONSE_FRAME_LEN, WRITE_CHARACTERISTIC
 
 _LOGGER = logging.getLogger(__name__)
 
 COOLDOWN_TIME = 0.25
-
-# Every frame the lock sends is 18 bytes: a 16-byte encrypted block plus two
-# trailing plain bytes, and the checksum runs over all 18. The gate is strict
-# equality, not a floor. A shorter payload must not reach the cipher: the
-# cipher context consumes ciphertext in 16-byte blocks, so a partial block
-# stays buffered inside it and every later frame on the connection decrypts
-# misaligned, a state only a reconnect's set_key rebuilds. A longer payload
-# would otherwise validate on its first 18 bytes and be passed on with a tail
-# the cipher never saw.
-RESPONSE_FRAME_LEN = 0x12
 
 
 class YaleXSBLEError(Exception):
@@ -122,7 +112,7 @@ class Session:
         return cmd
 
     def build_command(self, opcode: int) -> bytearray:
-        cmd = bytearray(0x12)
+        cmd = bytearray(RESPONSE_FRAME_LEN)
         cmd[0x00] = 0xEE
         cmd[0x01] = opcode
         cmd[0x10] = 0x02
@@ -133,13 +123,14 @@ class Session:
         command[0x03] = checksum
 
     def _validate_response(self, response: bytes | bytearray) -> None:
-        _LOGGER.debug(
-            "%s: Response simple checksum: %s",
-            self.name,
-            str(util._simple_checksum(response)),
-        )
-        if util._simple_checksum(response) != 0:
-            raise ResponseError(f"Simple checksum mismatch {response!r}")
+        checksum = util._simple_checksum(response)
+        _LOGGER.debug("%s: Response simple checksum: %s", self.name, checksum)
+        if checksum != 0:
+            # The frame itself is not repeated here: the drop line that logs
+            # this error already carries its hex.
+            raise ResponseError(
+                f"Simple checksum mismatch (expected 0, got {checksum})"
+            )
 
         if response[0x00] != 0xBB and response[0x00] != 0xAA:
             raise ResponseError(f"Incorrect flag in response: {response[0x00]}")
@@ -153,6 +144,18 @@ class Session:
         """Write under the lock."""
         async with self._lock:
             return await self._locked_write(command, command_name, response_matcher)
+
+    def _disarm_wait(self) -> asyncio.Future[bytes] | None:
+        """Disarm the solicited wait and return its future, if one was armed.
+
+        A caller that resolves the returned future must check done() first: a
+        timeout or a disconnect cancels the future from the waiting side, and
+        a frame that raced that cancellation must not resolve it again.
+        """
+        future = self._notify_future
+        self._notify_future = None
+        self._notify_matcher = None
+        return future
 
     def _reject_frame(
         self,
@@ -173,12 +176,8 @@ class Session:
         _LOGGER.log(
             level, "%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex
         )
-        if self._notify_future is None:
-            return
-        _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
-        self._notify_future.set_exception(ex)
-        self._notify_future = None
-        self._notify_matcher = None
+        if (future := self._disarm_wait()) is not None and not future.done():
+            future.set_exception(ex)
 
     def _notify(self, char: int, data: bytearray) -> None:
         self._last_callback_time = time.monotonic()
@@ -188,21 +187,35 @@ class Session:
             data.hex(),
             bool(self._notify_future),
         )
+        if not data:
+            # An empty notification carries nothing to decrypt or judge, and
+            # it must not fail an armed wait: the real response is still in
+            # flight, and failing the wait would re-send the command while it
+            # is, so the lock would decrypt the duplicate as garbage. Drop it
+            # without touching the wait.
+            _LOGGER.debug("%s: Dropping empty notification", self.name)
+            return
         if len(data) != RESPONSE_FRAME_LEN:
-            # This gate must sit ahead of decrypt (see RESPONSE_FRAME_LEN):
-            # dropping the payload here keeps the cipher aligned, so the
-            # session stays usable for the next good frame.
+            # Strict equality, and it must sit ahead of decrypt: the cipher
+            # context consumes ciphertext in 16-byte blocks, so a partial
+            # block fed to it stays buffered inside and desynchronizes every
+            # later frame on the connection, a state only a reconnect's
+            # set_key rebuilds. An over-length payload would validate on its
+            # first 18 bytes and be passed on with a tail the cipher never
+            # saw. (Dropping a truncation of genuine ciphertext still skips a
+            # block the lock chained, so the next frame decrypts garbled and
+            # is rejected too; the chain recovers on the frame after, where a
+            # poisoned context never does.)
             self._reject_frame(
                 ResponseError(
                     f"{len(data)}-byte payload is not an "
                     f"{RESPONSE_FRAME_LEN}-byte response frame"
                 ),
                 data,
-                # A short payload is a corrupt frame off the air, which the
-                # radio produces on its own. An over-length one is not: the
-                # lock builds nothing longer, so it says the transport below
-                # is doing something nobody has seen, and it is worth a level
-                # more attention.
+                # An over-length frame is worth more attention than a short
+                # one: the radio truncates frames on its own, but nothing on
+                # the link builds a longer one, so it points at the transport
+                # below.
                 logging.WARNING if len(data) > RESPONSE_FRAME_LEN else logging.INFO,
             )
             return
@@ -234,9 +247,8 @@ class Session:
                 self.name,
             )
             return
-        self._notify_future.set_result(decrypted_data)
-        self._notify_future = None
-        self._notify_matcher = None
+        if (future := self._disarm_wait()) is not None and not future.done():
+            future.set_result(decrypted_data)
 
     async def _locked_write(
         self,
@@ -258,18 +270,18 @@ class Session:
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
 
-        for attempt in range(3):
-            future: asyncio.Future[bytes] = self.loop.create_future()
-            self._notify_future = future
-            self._notify_matcher = response_matcher
-            _LOGGER.debug(
-                "%s: Writing command to %s: %s",
-                self.name,
-                self.write_characteristic,
-                command.hex(),
-            )
-            _LOGGER.debug("%s: Waiting for response", self.name)
-            try:
+        try:
+            for attempt in range(3):
+                future: asyncio.Future[bytes] = self.loop.create_future()
+                self._notify_future = future
+                self._notify_matcher = response_matcher
+                _LOGGER.debug(
+                    "%s: Writing command to %s: %s",
+                    self.name,
+                    self.write_characteristic,
+                    command.hex(),
+                )
+                _LOGGER.debug("%s: Waiting for response", self.name)
                 async with util.asyncio_timeout(10):
                     try:
                         await self.client.write_gatt_char(
@@ -283,13 +295,12 @@ class Session:
                         continue
                     else:
                         break
-            except TimeoutError:
-                # The wait expired with the future still armed. Disarm it so a
-                # late frame cannot land on the cancelled future or leak this
-                # command's matcher into a later wait.
-                self._notify_future = None
-                self._notify_matcher = None
-                raise
+        finally:
+            # A timeout or a disconnect interrupt leaves the wait armed with a
+            # future the waiter has abandoned. Disarm it so a late frame
+            # cannot leak this command's matcher into a later wait. (On the
+            # paths that resolved the wait this is a no-op.)
+            self._disarm_wait()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 

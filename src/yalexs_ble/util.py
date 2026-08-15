@@ -7,15 +7,13 @@ from bleak import BleakError
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
+from .const import RESPONSE_FRAME_LEN
+
 UNIQUE_LOCAL_NAME_LEN = 7
 
 
 def _simple_checksum(buf: bytes | bytearray) -> int:
-    cs = 0
-    for i in range(0x12):
-        cs = (cs + buf[i]) & 0xFF
-
-    return (-cs) & 0xFF
+    return (-sum(buf[:RESPONSE_FRAME_LEN])) & 0xFF
 
 
 def _bytes_to_int(buffer: bytes | bytearray) -> int:
@@ -33,7 +31,7 @@ def _int_to_bytes(value: int, length: int) -> bytes:
 def _security_checksum(buffer: bytes | bytearray) -> int:
     val1 = _bytes_to_int(buffer[0x00:0x04])
     val2 = _bytes_to_int(buffer[0x04:0x08])
-    val3 = _bytes_to_int(buffer[0x08:0x12])
+    val3 = _bytes_to_int(buffer[0x08:RESPONSE_FRAME_LEN])
 
     return (0 - (val1 + val2 + val3)) & 0xFFFFFFFF
 
