@@ -5,6 +5,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bleak import BleakError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from yalexs_ble import util
@@ -216,6 +217,41 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
     result = await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert result == READ_ANSWER
+    assert session._notify_future is None
+
+
+def test_the_simple_checksum_refuses_a_short_buffer() -> None:
+    """The checksum helper defends its own input.
+
+    A slice over a short buffer would silently checksum whatever bytes are
+    there — potentially summing to a "valid" 0 — so the helper raises
+    instead of leaning on the notify gate being its only caller.
+    """
+    with pytest.raises(ValueError, match="checksum needs 18 bytes, got 17"):
+        util._simple_checksum(b"\x00" * 17)
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_during_a_failing_write_is_not_left_unretrieved() -> None:
+    """A wait failed mid-write must not leak an unretrieved exception.
+
+    A frame can fail the wait while the GATT write itself is still in
+    flight; when the write then raises, nothing ever awaits the future the
+    ResponseError was set on. The write's own error still propagates, and
+    the finally block retrieves the orphaned exception so asyncio does not
+    log 'exception was never retrieved' later.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(9))
+        raise BleakError("write failed")
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    with pytest.raises(BleakError, match="write failed"):
+        await session.execute(bytearray(18), "auto_lock_status")
+
     assert session._notify_future is None
 
 

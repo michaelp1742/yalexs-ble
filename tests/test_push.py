@@ -2231,18 +2231,38 @@ async def test_a_short_advertisement_payload_is_skipped_not_parsed(
     assert push_lock._last_hk_state == -1
 
 
+def _hap_payload(state_num: int) -> bytes:
+    """A full HomeKit advertisement payload carrying the given state number."""
+    # <HHBB at byte 9: acid, then the global state number.
+    return (
+        bytes([HAP_FIRST_BYTE]) + b"\x00" * 8 + struct.pack("<HHBB", 1, state_num, 0, 0)
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> None:
     """The guard admits a payload long enough for the fields it reads."""
     push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
-    # <HHBB at byte 9: acid, then the global state number 0x1234.
-    payload = (
-        bytes([HAP_FIRST_BYTE]) + b"\x00" * 8 + struct.pack("<HHBB", 1, 0x1234, 0, 0)
-    )
 
-    push_lock.update_advertisement(ble_device, _advertisement({APPLE_MFR_ID: payload}))
+    push_lock.update_advertisement(
+        ble_device, _advertisement({APPLE_MFR_ID: _hap_payload(0x1234)})
+    )
 
     assert push_lock._last_hk_state == 0x1234
     assert push_lock._cancel_deferred_update is not None
     push_lock._cancel_future_update()
+
+    # A changed state number schedules another update; a repeat does not.
+    push_lock.update_advertisement(
+        ble_device, _advertisement({APPLE_MFR_ID: _hap_payload(0x1235)})
+    )
+    assert push_lock._last_hk_state == 0x1235
+    assert push_lock._cancel_deferred_update is not None
+    push_lock._cancel_future_update()
+
+    push_lock.update_advertisement(
+        ble_device, _advertisement({APPLE_MFR_ID: _hap_payload(0x1235)})
+    )
+    assert push_lock._last_hk_state == 0x1235
+    assert push_lock._cancel_deferred_update is None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -126,10 +127,12 @@ class Session:
         checksum = util._simple_checksum(response)
         _LOGGER.debug("%s: Response simple checksum: %s", self.name, checksum)
         if checksum != 0:
-            # The frame itself is not repeated here: the drop line that logs
-            # this error already carries its hex.
+            # The frame hex rides on the error, not only on the drop line:
+            # when a command exhausts its attempts this error surfaces at
+            # levels where the INFO drop line was never emitted.
             raise ResponseError(
-                f"Simple checksum mismatch (expected 0, got {checksum})"
+                f"Simple checksum mismatch (expected 0, got {checksum}) "
+                f"in frame {response.hex()}"
             )
 
         if response[0x00] != 0xBB and response[0x00] != 0xAA:
@@ -303,6 +306,14 @@ class Session:
             # cannot leak this command's matcher into a later wait. (On the
             # paths that resolved the wait this is a no-op.)
             self._disarm_wait()
+            # A frame can fail the wait while the GATT write itself is still
+            # in flight; if the write then raises, the ResponseError set on
+            # the future is never awaited. Retrieve it so asyncio does not
+            # log "exception was never retrieved" with no context. suppress
+            # covers the pending and cancelled states, where there is
+            # nothing to retrieve.
+            with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
+                future.exception()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 

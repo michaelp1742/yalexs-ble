@@ -1289,27 +1289,40 @@ class PushLock:
         next_update = 0.0
         mfr_data = ad.manufacturer_data
         # An empty payload is skipped rather than indexed: the advertisement is
-        # radio input and its length is not ours to assume.
+        # radio input and its length is not ours to assume. Each refusal is
+        # logged at debug so a chronically truncated advertiser stays
+        # diagnosable instead of merely inert.
         if apple_data := mfr_data.get(APPLE_MFR_ID):
             first_byte = apple_data[0]
-            if first_byte == HAP_FIRST_BYTE and (
-                (hk_state := get_homekit_state_num(apple_data)) is not None
-            ):
-                # Sometimes the yale data is glued on to the end of the HomeKit data
-                # but in that case it seems wrong so we don't process it
-                #
-                # if len(mfr_data[APPLE_MFR_ID]) > 20 and YALE_MFR_ID not in mfr_data:
-                # mfr_data[YALE_MFR_ID] = mfr_data[APPLE_MFR_ID][20:]
-                if self._last_hk_state == -1:
-                    # We haven't seen a HomeKit state yet so we schedule an update
-                    next_update = FIRST_UPDATE_COALESCE_SECONDS
-                elif hk_state != self._last_hk_state:
-                    next_update = HK_UPDATE_COALESCE_SECONDS
-                self._last_hk_state = hk_state
+            if first_byte == HAP_FIRST_BYTE:
+                if (hk_state := get_homekit_state_num(apple_data)) is None:
+                    _LOGGER.debug(
+                        "%s: %d-byte HomeKit advertisement ends before its"
+                        " state record; skipped",
+                        self.name,
+                        len(apple_data),
+                    )
+                else:
+                    # Sometimes the yale data is glued on to the end of the
+                    # HomeKit data but in that case it seems wrong so we
+                    # don't process it
+                    #
+                    # if len(mfr_data[APPLE_MFR_ID]) > 20
+                    #     and YALE_MFR_ID not in mfr_data:
+                    # mfr_data[YALE_MFR_ID] = mfr_data[APPLE_MFR_ID][20:]
+                    if self._last_hk_state == -1:
+                        # We haven't seen a HomeKit state yet so we schedule
+                        # an update
+                        next_update = FIRST_UPDATE_COALESCE_SECONDS
+                    elif hk_state != self._last_hk_state:
+                        next_update = HK_UPDATE_COALESCE_SECONDS
+                    self._last_hk_state = hk_state
             elif first_byte == HAP_ENCRYPTED_FIRST_BYTE:
                 # Encrypted data, we don't know how to decrypt it
                 # but we know its a state change so we schedule an update
                 next_update = HK_UPDATE_COALESCE_SECONDS
+        elif APPLE_MFR_ID in mfr_data:
+            _LOGGER.debug("%s: Empty HomeKit advertisement payload; skipped", self.name)
         # Yale YALE_MFR_ID advertisements come in two formats:
         # - 1-byte: lock state toggle (0/1), used for change detection
         # - 18-byte: 2 header bytes + the lock's 16-byte cloud ID (the
@@ -1335,6 +1348,8 @@ class PushLock:
                 ):
                     next_update = ADV_UPDATE_COALESCE_SECONDS
             self._last_adv_value = current_value
+        elif YALE_MFR_ID in mfr_data and not mfr_data[YALE_MFR_ID]:
+            _LOGGER.debug("%s: Empty Yale advertisement payload; skipped", self.name)
         if adv_debug_enabled:
             scheduled_update = None
             if self._cancel_deferred_update:

@@ -618,6 +618,7 @@ _CHAR_ORDER: tuple[str, ...] = (
 
 def _make_lock_with_mock_client(
     side_effects: dict[str, Exception] | None = None,
+    data_overrides: dict[str, bytes] | None = None,
 ) -> tuple[Lock, MagicMock]:
     """Create a Lock with a mock BLE client for lock_info tests."""
     lock = Lock(
@@ -634,6 +635,7 @@ def _make_lock_with_mock_client(
     lock.secure_session = MagicMock()
 
     effects = side_effects or {}
+    overrides = data_overrides or {}
 
     # Map each characteristic UUID to a unique mock object so
     # read_gatt_char can identify which UUID is being read.
@@ -650,7 +652,7 @@ def _make_lock_with_mock_client(
         uuid = mock_to_uuid[id(char)]
         if uuid in effects:
             raise effects[uuid]
-        return _CHAR_DATA[uuid]
+        return overrides.get(uuid, _CHAR_DATA[uuid])
 
     mock_client.read_gatt_char = read_gatt_char
     mock_client._mock_to_uuid = mock_to_uuid
@@ -683,6 +685,27 @@ async def test_lock_info_partial_failure() -> None:
 
     assert info.manufacturer == "Yale/August"
     assert info.model == "ASL-03"
+    assert info.serial == "aa:bb:cc:dd:ee:ff"
+    assert info.firmware == "2.0.0"
+
+
+@pytest.mark.asyncio
+async def test_lock_info_non_utf8_read_degrades_to_fallback() -> None:
+    """A corrupt read that is not UTF-8 degrades like a failed one.
+
+    The characteristic read is radio input too — the BLE controller bug
+    noted in lock_info corrupts packets — and decode() raises
+    UnicodeDecodeError, which is not a BleakError, so it used to escape the
+    handler and abort lock_info with the partial results discarded.
+    """
+    lock, _ = _make_lock_with_mock_client(
+        data_overrides={SERIAL_NUMBER_CHARACTERISTIC: b"\xff\xfe\xff"}
+    )
+
+    info = await lock.lock_info()
+
+    assert info.model == "ASL-03"
+    # The BLE address stands in for the unreadable serial.
     assert info.serial == "aa:bb:cc:dd:ee:ff"
     assert info.firmware == "2.0.0"
 

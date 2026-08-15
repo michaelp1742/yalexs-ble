@@ -13,6 +13,10 @@ UNIQUE_LOCAL_NAME_LEN = 7
 
 
 def _simple_checksum(buf: bytes | bytearray) -> int:
+    # The helper defends its own input rather than lean on the notify gate:
+    # a slice over a short buffer would silently checksum whatever is there.
+    if len(buf) < RESPONSE_FRAME_LEN:
+        raise ValueError(f"checksum needs {RESPONSE_FRAME_LEN} bytes, got {len(buf)}")
     return (-sum(buf[:RESPONSE_FRAME_LEN])) & 0xFF
 
 
