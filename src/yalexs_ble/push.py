@@ -874,15 +874,26 @@ class PushLock:
                     # suppresses the next poll, and the reading it would
                     # suppress it for was never published.
                     self._seen_this_session.discard(BatteryState)
+                    # The mark was the only thing holding the next poll off,
+                    # so the refusal arms the cooldown a failed read arms.
+                    # Held here, where the refusal happens, rather than
+                    # inferred back at the poll from a missing mark: a lock
+                    # reporting the same voltage would otherwise be asked,
+                    # and warned about, every cycle.
+                    self._earliest_battery_attempt_time = (
+                        time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
+                    )
                     # A checksum-clean frame reporting 3.0 V or less is
                     # 0.75 V per cell, against a table that already treats
                     # 1.24 V per cell as empty. That is unexpected lock
                     # behavior, so it is surfaced rather than silently
-                    # dropped.
+                    # dropped, and the hold it arms is named with it.
                     _LOGGER.warning(
-                        "%s: Battery voltage is impossible: %s",
+                        "%s: Battery voltage is impossible: %s; "
+                        "not asking again for %d seconds",
                         self.name,
                         state.voltage,
+                        BATTERY_TIMEOUT_COOLDOWN,
                     )
                     continue
                 if lock_state.battery != state:
@@ -990,20 +1001,17 @@ class PushLock:
         try:
             await lock.battery()
             self._record_auth_success()
-            if BatteryState in self._seen_this_session:
-                # Success: disable cooldown and schedule the next refresh.
-                self._earliest_battery_attempt_time = NEVER_TIME
-                self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
-            else:
-                # The lock answered and the state path refused the reading, so
-                # this cycle produced no value and the mark it would have left
-                # is gone. A refusal is the only thing an absent mark can mean
-                # here, because the wait is typed to the battery subtype, so
-                # the frame that answered it was a battery frame. Hold the next
-                # attempt off on the cooldown a failed read arms: without it the
-                # poll asks again, and warns again, every cycle for as long as
-                # the lock reports the same voltage.
-                self._earliest_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            # Schedule the next refresh. Whether the reading was accepted is
+            # not decided here: the state path refuses an impossible one where
+            # the frame lands and arms the cooldown itself, and the cooldown
+            # gate above is what the next cycle meets. Nothing clears that
+            # cooldown on the way out either, because reaching this line means
+            # the gate found it lapsed, so it is already in the past.
+            #
+            # The deadline set below is read only while the seen mark is
+            # present, and a refusal discards the mark, so setting it after a
+            # refused reading costs nothing.
+            self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
         except TimeoutError as err:
             _LOGGER.info(
                 "%s: Battery request timed out (%s), will retry in %d "

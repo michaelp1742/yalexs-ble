@@ -304,7 +304,7 @@ async def test_poll_battery_cooldown_skip():
 
 @pytest.mark.asyncio
 async def test_poll_battery_success():
-    """Test that _poll_battery successfully fetches battery and resets cooldown."""
+    """Test that _poll_battery fetches battery and arms no cooldown."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
         key="0800200c9a66",
@@ -314,16 +314,14 @@ async def test_poll_battery_success():
     push_lock._name = "Test Lock"
     push_lock._lock_info = TEST_LOCK_INFO
 
-    # Set cooldown to simulate previous timeout
-    push_lock._earliest_battery_attempt_time = time.monotonic() + 100.0
+    # A cooldown from an earlier failure, already lapsed, so the gate lets
+    # this poll through.
+    lapsed_cooldown = time.monotonic() - 1.0
+    push_lock._earliest_battery_attempt_time = lapsed_cooldown
 
     mock_lock = MagicMock()
     battery_state = BatteryState(voltage=6.0, percentage=80)
     mock_lock.battery = publishing_read(push_lock, battery_state)
-
-    # Call _poll_battery (cooldown should be ignored since it's in the future)
-    # Wait a moment to ensure cooldown expires
-    push_lock._earliest_battery_attempt_time = NEVER_TIME
 
     made_request = await push_lock._poll_battery(mock_lock)
 
@@ -336,8 +334,11 @@ async def test_poll_battery_success():
     assert push_lock.auth is not None
     assert push_lock.auth.successful is True
 
-    # Cooldown should be reset to NEVER_TIME
-    assert push_lock._earliest_battery_attempt_time == NEVER_TIME
+    # An accepted reading writes no cooldown, and does not clear the lapsed one
+    # either: a deadline in the past and no deadline meet the gate the same way,
+    # so the poll leaves it where it lies. Clearing it here would also wipe a
+    # cooldown the state path armed during the await.
+    assert push_lock._earliest_battery_attempt_time == lapsed_cooldown
 
 
 @pytest.mark.asyncio
@@ -2277,11 +2278,15 @@ async def test_poll_battery_skips_models_without_battery_support() -> None:
 async def test_impossible_battery_voltage_is_refused_and_surfaced(
     caplog: pytest.LogCaptureFixture, voltage: float
 ) -> None:
-    """The state path refuses a reading at or below 3.0 V and says so.
+    """The state path refuses a reading at or below 3.0 V, says so, and holds.
 
     3.0 V across four cells is 0.75 V each, against a table that already
     treats 1.24 V per cell as empty, so the frame is unexpected lock behavior
     rather than a flat battery.
+
+    The refusal arms the cooldown here rather than at the poll, so a reading
+    refused on any path holds the next attempt off, and the warning names the
+    hold it armed.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:15",
@@ -2291,25 +2296,30 @@ async def test_impossible_battery_voltage_is_refused_and_surfaced(
     )
     push_lock._name = "Test Lock"
 
+    earliest = time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
     with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
         push_lock._update_any_state([BatteryState(voltage=voltage, percentage=0)])
 
     assert push_lock.battery is None
     assert "Battery voltage is impossible" in caplog.text
+    # The hold is named where it is armed, so the suppression is attributable.
+    assert f"not asking again for {BATTERY_TIMEOUT_COOLDOWN} seconds" in caplog.text
     # Warning, not error: the lock behaved unexpectedly, the host did not fail.
     assert caplog.records[0].levelno == logging.WARNING
     # A refused reading must not suppress the next poll.
     assert BatteryState not in push_lock._seen_this_session
+    # The refusal itself arms the cooldown; the poll infers nothing.
+    assert push_lock._earliest_battery_attempt_time >= earliest
 
 
 @pytest.mark.asyncio
 async def test_a_refused_battery_reading_holds_the_next_poll_off() -> None:
-    """A refused reading arms the cooldown a failed read arms.
+    """A poll whose reading is refused comes back held off.
 
-    The refusal discards the seen mark, which is what lets a later cycle ask
-    again. The mark is also the only thing gating the poll, so a lock reporting
-    the same impossible voltage would otherwise be asked, and warned about,
-    every cycle.
+    The companion to the state-path test above, taken through the poll: the
+    refusal happens while the poll is awaiting its read, so the cooldown is
+    already armed when the poll returns and the next cycle meets it at the
+    gate. The poll itself decides nothing about the reading.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:20",
