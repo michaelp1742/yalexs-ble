@@ -863,6 +863,19 @@ class PushLock:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
                 if lock_state.lock != state:
+                    if state in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
+                        # Calibration and polarity discovery both end at the
+                        # lock by hand, so nothing here can clear either one
+                        # and the reported status stands until someone acts on
+                        # it. Recorded where the status changes rather than on
+                        # every frame that repeats it, so a lock left in one of
+                        # them says so once.
+                        _LOGGER.warning(
+                            "%s: Lock reports %s, a setup condition that ends "
+                            "at the lock by hand",
+                            self.name,
+                            state,
+                        )
                     changes["lock"] = state
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:

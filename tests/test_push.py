@@ -2410,9 +2410,15 @@ async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> No
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported", [LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06])
 async def test_update_does_not_reconnect_on_an_unknown_position(
+    caplog: pytest.LogCaptureFixture,
     reported: LockStatus,
 ) -> None:
-    """A polled 0x01 or 0x06 reaches the display and forces no reconnect."""
+    """A polled 0x01 or 0x06 reaches the display, warns, and forces no reconnect.
+
+    The reconnect that used to answer these two is gone, so the warning is the
+    only thing that records the condition. Without it a lock left in
+    calibration or polarity discovery is diagnosable from nothing.
+    """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:16",
         key="0800200c9a66",
@@ -2432,6 +2438,7 @@ async def test_update_does_not_reconnect_on_an_unknown_position(
     )
 
     with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch.object(
             push_lock, "_execute_forced_disconnect", new_callable=AsyncMock
@@ -2442,6 +2449,34 @@ async def test_update_does_not_reconnect_on_an_unknown_position(
 
     forced_disconnect.assert_not_awaited()
     assert push_lock.lock_status is reported
+    assert "a setup condition that ends at the lock by hand" in caplog.text
+    assert str(reported) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_held_setup_condition_is_recorded_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lock sitting in 0x01 reports it once, not on every frame that repeats it.
+
+    The condition is held at the lock, so the status arrives again on every
+    poll. Recording the entry rather than the reading is what keeps a wedged
+    lock from filling the log.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:17",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        push_lock._update_any_state([LockStatus.UNKNOWN_01])
+        push_lock._update_any_state([LockStatus.UNKNOWN_01])
+
+    assert push_lock.lock_status is LockStatus.UNKNOWN_01
+    assert len(caplog.records) == 1
 
 
 def _advertisement(manufacturer_data: dict[int, bytes]) -> AdvertisementData:
