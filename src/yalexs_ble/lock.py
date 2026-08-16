@@ -135,8 +135,8 @@ def _poll_response_matcher(
 ) -> Callable[[bytes], bool]:
     """Match the 0xBB frame answering one status poll.
 
-    An answer carries the polled opcode in byte[1], and where the poll selects
-    a subtype, that subtype echoed in byte[4].
+    An answer carries the polled opcode in byte[1] and declares its own status
+    type in byte[4], which the poll compares against the one it asked for.
 
     The plain wait accepts the first valid frame, so an unsolicited push
     arriving mid-wait was taken as the poll answer and read at the offsets the
@@ -144,10 +144,10 @@ def _poll_response_matcher(
     byte read as a voltage, which is the recurring near-zero battery reading
     seen in the field. Typing every status-poll wait keeps a foreign frame on
     the state callback path where it belongs, and the response timeout is the
-    backstop for a poll the lock never answers. LOCK_ACTIVITY carries the
-    record type in byte[4] rather than an echo of the request, so it matches on
-    the opcode alone; an acknowledgment echoes the request's own byte[4], which
-    is zero for that command and reads as a lock operation record, so requiring
+    backstop for a poll the lock never answers. LOCK_ACTIVITY declares a record
+    type in byte[4] rather than a status type, so it matches on the opcode
+    alone; an acknowledgment carries back the request's own byte[4], which is
+    zero for that command and reads as a lock operation record, so requiring
     the 0xBB frame keeps an acknowledgment out of that parser too.
     auto_lock_status is a poll too, but it completes on its acknowledgment by
     design (see its docstring), so it is not typed here.

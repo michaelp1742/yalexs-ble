@@ -799,7 +799,7 @@ async def test_lock_info_reads_model_first() -> None:
 # --------------------------------------------------------------------------- #
 # Typed poll waits
 # --------------------------------------------------------------------------- #
-# byte[1] echoes the polled opcode and byte[4] the status type; byte[3] is the
+# byte[1] carries the polled opcode and byte[4] the status type; byte[3] is the
 # checksum and each frame sums to zero.
 BATTERY_FRAME = bytes.fromhex("bb0200a50f00000079140000000000000200")
 LOCK_FRAME = bytes.fromhex("bb02003c0200000003000000000000000200")
@@ -848,7 +848,7 @@ def _connected_lock(
 
 
 def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
-    """0xBB plus the polled opcode plus the byte[4] subtype echo."""
+    """0xBB plus the polled opcode plus the byte[4] status type."""
     matches = _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value)
     assert matches(BATTERY_FRAME)
     # Right opcode, wrong subtype.
@@ -861,7 +861,7 @@ def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
 
 
 def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
-    """lock_activity's answer carries a record type at byte[4], not an echo.
+    """lock_activity's answer carries a record type at byte[4], not a status type.
 
     So its matcher keys on the opcode alone and must accept any byte[4].
     """
