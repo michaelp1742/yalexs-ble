@@ -61,10 +61,10 @@ TEST_LOCK_INFO = LockInfo(
 def publishing_read(push_lock: PushLock, *states: Any) -> AsyncMock:
     """Mock a Lock read that answers the way a real one does.
 
-    Session._notify hands every frame to the state path before it resolves the
-    waiter the read is blocked on, so a real read has already published its
-    answer by the time the await returns. A mock that only sets a return value
-    reproduces the call but not the answer, so reads are stubbed with this.
+    Session._notify hands every frame to _state_callback before it resolves
+    the waiter the read is blocked on, so a real read's answer is applied. A
+    mock that only sets a return value reproduces the call but not the answer,
+    so reads are stubbed with this.
     """
 
     async def _read(*args: Any, **kwargs: Any) -> None:
@@ -216,7 +216,7 @@ async def test_update_continues_after_battery_timeout():
     Requirements:
     - battery() timeout does not fail entire update
     - lock_status/door_status/auto_lock_status still get called
-    - final state has valid lock/door values (not UNKNOWN)
+    - the display has valid lock/door values (not UNKNOWN)
     - no forced disconnect due to battery timeout
     """
 
@@ -275,7 +275,7 @@ async def test_update_continues_after_battery_timeout():
 
 
 @pytest.mark.asyncio
-async def test_poll_battery_cooldown_skip():
+async def test_poll_battery_cooldown_skip(caplog: pytest.LogCaptureFixture) -> None:
     """Test that _poll_battery skips when on cooldown."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -293,11 +293,15 @@ async def test_poll_battery_cooldown_skip():
     mock_lock.battery = AsyncMock()
 
     # Call _poll_battery
-    made_request = await push_lock._poll_battery(mock_lock)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        made_request = await push_lock._poll_battery(mock_lock)
 
     # Should skip the request
     assert made_request is False
     mock_lock.battery.assert_not_called()
+    # The message names only the cooldown; the gate cannot know what armed it.
+    # Asserted up to the fixed prefix, since the remaining seconds vary.
+    assert "Skipping battery request; not asking again for" in caplog.text
     # Nothing was published
     assert push_lock.battery is None
 
@@ -329,15 +333,13 @@ async def test_poll_battery_success():
     assert made_request is True
     mock_lock.battery.assert_called_once()
 
-    # The reading reached the state through the receive path
+    # The lock's answering frame put the reading on display.
     assert push_lock.battery == battery_state
     assert push_lock.auth is not None
     assert push_lock.auth.successful is True
 
-    # An accepted reading writes no cooldown, and does not clear the lapsed one
-    # either: a deadline in the past and no deadline meet the gate the same way,
-    # so the poll leaves it where it lies. Clearing it here would also wipe a
-    # cooldown the state path armed during the await.
+    # A reading the lock answered with leaves the lapsed deadline untouched,
+    # so nothing here can wipe a cooldown armed while the read was in flight.
     assert push_lock._earliest_battery_attempt_time == lapsed_cooldown
 
 
@@ -405,10 +407,10 @@ async def test_poll_battery_bleak_dbus_error():
 async def test_update_keeps_a_value_delivered_mid_cycle_over_unknown() -> None:
     """A notify arriving mid-cycle survives when the cycle started at UNKNOWN.
 
-    1. Update starts with UNKNOWN state
-    2. Notify delivers LOCKED/CLOSED while the cycle is awaiting a read
-    3. Update skips polling lock_status (already seen this session)
-    4. The delivered values are still on display when the cycle ends
+    The cycle starts at UNKNOWN and reads no lock status of its own, since
+    one is already seen this session. A notify delivers LOCKED and CLOSED
+    while the cycle is awaiting a read, and the delivered values are still
+    on display when the cycle ends.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -476,7 +478,7 @@ async def test_update_keeps_a_value_delivered_mid_cycle_over_unknown() -> None:
 
         await update_task
 
-        # The critical assertion: the delivered values are still on display
+        # The values the lock sent mid-cycle are still on display.
         assert push_lock.lock_status == LockStatus.LOCKED, (
             f"Lock status should still be LOCKED, got {push_lock.lock_status}"
         )
@@ -2278,15 +2280,10 @@ async def test_poll_battery_skips_models_without_battery_support() -> None:
 async def test_impossible_battery_voltage_is_refused_and_surfaced(
     caplog: pytest.LogCaptureFixture, voltage: float
 ) -> None:
-    """The state path refuses a reading at or below 3.0 V, says so, and holds.
+    """A reading at or below 3.0 V is refused, reported, and starts the cooldown.
 
-    3.0 V across four cells is 0.75 V each, against a table that already
-    treats 1.24 V per cell as empty, so the frame is unexpected lock behavior
-    rather than a flat battery.
-
-    The refusal arms the cooldown here rather than at the poll, so a reading
-    refused on any path holds the next attempt off, and the warning names the
-    hold it armed.
+    The 3.0 V threshold is upstream's; the warning and the cooldown armed
+    at the refusal are what this change adds.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:15",
@@ -2302,24 +2299,23 @@ async def test_impossible_battery_voltage_is_refused_and_surfaced(
 
     assert push_lock.battery is None
     assert "Battery voltage is impossible" in caplog.text
-    # The hold is named where it is armed, so the suppression is attributable.
+    # The warning says how long the lock will not be asked again.
     assert f"not asking again for {BATTERY_TIMEOUT_COOLDOWN} seconds" in caplog.text
     # Warning, not error: the lock behaved unexpectedly, the host did not fail.
     assert caplog.records[0].levelno == logging.WARNING
     # A refused reading must not suppress the next poll.
     assert BatteryState not in push_lock._seen_this_session
-    # The refusal itself arms the cooldown; the poll infers nothing.
+    # The cooldown is armed here, where the reading is thrown away.
     assert push_lock._earliest_battery_attempt_time >= earliest
 
 
 @pytest.mark.asyncio
-async def test_a_refused_battery_reading_holds_the_next_poll_off() -> None:
-    """A poll whose reading is refused comes back held off.
+async def test_a_refused_battery_reading_starts_the_cooldown() -> None:
+    """A poll whose reading is refused comes back with the cooldown running.
 
-    The companion to the state-path test above, taken through the poll: the
-    refusal happens while the poll is awaiting its read, so the cooldown is
-    already armed when the poll returns and the next cycle meets it at the
-    gate. The poll itself decides nothing about the reading.
+    The companion to the test above, taken through _poll_battery: the lock's
+    answering frame is refused while the read is still awaiting it, so the
+    cooldown is already armed when the poll returns.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:20",
@@ -2340,7 +2336,7 @@ async def test_a_refused_battery_reading_holds_the_next_poll_off() -> None:
 
     assert push_lock.battery is None
     assert push_lock._earliest_battery_attempt_time >= earliest
-    # The cooldown, not the seen mark, is what stops the next cycle asking.
+    # The cooldown, not BatteryState in _seen_this_session, stops the next ask.
     assert await push_lock._poll_battery(mock_lock) is False
     mock_lock.battery.assert_called_once()
 
@@ -2350,9 +2346,9 @@ async def test_a_battery_frame_reaches_the_display_through_the_real_decoder() ->
     """Pin the only route from a battery frame to the display.
 
     With the fetch return discarded, Lock._parse_state's BATTERY branch is the
-    one join between a received battery frame and the published state, so this
-    drives a real captured frame through the real decoder into the push
-    layer's state path rather than stubbing either side.
+    one route between a battery frame from the lock and the published state, so
+    this drives a real captured frame through the real decoder into
+    _update_any_state rather than stubbing either side.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:17",
@@ -2382,10 +2378,10 @@ async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> No
     """Pin the only route from a door status frame to the display.
 
     door_status() asks for DOOR_ONLY, and with the fetch return discarded that
-    branch of Lock._parse_state is the one join between the answering frame
-    and the published state, so this drives a real captured frame through the
-    real decoder into the push layer's state path rather than stubbing either
-    side.
+    branch of Lock._parse_state is the one route between the lock's answering
+    frame and the published state, so this drives a real captured frame
+    through the real decoder into _update_any_state rather than stubbing
+    either side.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:18",
@@ -2409,7 +2405,7 @@ async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported", [LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06])
-async def test_update_does_not_reconnect_on_an_unknown_position(
+async def test_update_does_not_reconnect_on_a_setup_condition(
     caplog: pytest.LogCaptureFixture,
     reported: LockStatus,
 ) -> None:
@@ -2454,14 +2450,13 @@ async def test_update_does_not_reconnect_on_an_unknown_position(
 
 
 @pytest.mark.asyncio
-async def test_a_held_setup_condition_is_recorded_once(
+async def test_a_repeated_setup_condition_is_recorded_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A lock sitting in 0x01 reports it once, not on every frame that repeats it.
+    """A repeated 0x01 is recorded once, not once per frame that carries it.
 
-    The condition is held at the lock, so the status arrives again on every
-    poll. Recording the entry rather than the reading is what keeps a wedged
-    lock from filling the log.
+    The warning sits inside the lock_state.lock != state guard, so a frame
+    that repeats the held status records nothing, however many arrive.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:17",
@@ -2563,12 +2558,12 @@ async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> No
 
 @pytest.mark.asyncio
 async def test_a_cycle_that_changed_nothing_still_reports() -> None:
-    """A quiet cycle still publishes once, because the callback is a liveness
-    signal and not only a change notification.
+    """A cycle that read the same values as the last one still publishes once.
 
     A consumer may mark the lock unavailable from its own advertisement
-    tracking, with this callback as its only path back, so a cycle that read
-    the same values as the last one must still report.
+    tracking and mark it available again only from this callback, so the
+    callback has to report that the lock is still answering and not only
+    that it changed.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:30",
@@ -2589,8 +2584,8 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
         tx_power=0,
     )
 
-    # Everything the cycle could read is already held at the value it will
-    # read back, so nothing in the cycle changes any member.
+    # Everything the cycle could read is already held at the value the lock
+    # will answer with, so no read in the cycle changes any field.
     push_lock._lock_state = LockState(
         lock=LockStatus.LOCKED,
         door=DoorStatus.CLOSED,
@@ -2621,7 +2616,7 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
     push_lock._running = False
     push_lock._cancel_disconnect_timer()
 
-    # The lock status was re-read and matched, so no member changed.
+    # The lock status was re-read and matched, so no field changed.
     mock_lock.lock_status.assert_awaited_once()
     assert push_lock.lock_status is LockStatus.LOCKED
     # The cycle still reported exactly once.
@@ -2650,10 +2645,10 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
 ) -> None:
     """A read that answers is a successful round trip, at each site that issues one.
 
-    The seen set is filled bar one member, so the cycle issues exactly that
-    read and no other. An answer publishes AuthState(successful=True) and
-    clears the consecutive-failure count that arms the reauth latch, whichever
-    read it was.
+    _seen_this_session is filled except for one type, so the cycle issues
+    exactly the read that fetches it and no other. An answer applies
+    AuthState(successful=True) and clears the consecutive-failure count that
+    arms the reauth latch, whichever read it was.
     """
     push_lock = PushLock(
         address=address,

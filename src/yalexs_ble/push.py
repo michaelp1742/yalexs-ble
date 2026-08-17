@@ -864,12 +864,6 @@ class PushLock:
             elif isinstance(state, LockStatus):
                 if lock_state.lock != state:
                     if state in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
-                        # Calibration and polarity discovery both end at the
-                        # lock by hand, so nothing here can clear either one
-                        # and the reported status stands until someone acts on
-                        # it. Recorded where the status changes rather than on
-                        # every frame that repeats it, so a lock left in one of
-                        # them says so once.
                         _LOGGER.warning(
                             "%s: Lock reports %s, a setup condition that ends "
                             "at the lock by hand",
@@ -882,25 +876,14 @@ class PushLock:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
                 if state.voltage <= 3.0:
-                    # A refused reading is not a reading, so it must not count
-                    # as having seen the battery this session: the seen mark
-                    # suppresses the next poll, and the reading it would
-                    # suppress it for was never published.
+                    # BatteryState in _seen_this_session would stop
+                    # _poll_battery asking again after a reading that was
+                    # thrown away, so remove it and start the cooldown
+                    # instead.
                     self._seen_this_session.discard(BatteryState)
-                    # The mark was the only thing holding the next poll off,
-                    # so the refusal arms the cooldown a failed read arms.
-                    # Held here, where the refusal happens, rather than
-                    # inferred back at the poll from a missing mark: a lock
-                    # reporting the same voltage would otherwise be asked,
-                    # and warned about, every cycle.
                     self._earliest_battery_attempt_time = (
                         time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
                     )
-                    # A checksum-clean frame reporting 3.0 V or less is
-                    # 0.75 V per cell, against a table that already treats
-                    # 1.24 V per cell as empty. That is unexpected lock
-                    # behavior, so it is surfaced rather than silently
-                    # dropped, and the hold it arms is named with it.
                     _LOGGER.warning(
                         "%s: Battery voltage is impossible: %s; "
                         "not asking again for %d seconds",
@@ -945,12 +928,9 @@ class PushLock:
     def _record_auth_success(self) -> None:
         """Record a successful round trip with the lock.
 
-        Resets the consecutive-failure count that arms the auth latch, and
-        publishes the auth state itself. This is the only producer of
-        AuthState(successful=True); the latch in the retry decorator is the
-        only producer of the failure, so both publish through the same path.
-        _update_any_state drops a repeat, so a keep-alive cycle that changes
-        nothing publishes nothing.
+        Nothing else produces AuthState(successful=True); the latch in the
+        retry decorator is the only producer of the failure, so both reach the
+        consumer through _update_any_state, which drops a repeat.
         """
         _AUTH_FAILURE_HISTORY.auth_success(self.address)
         self._update_any_state([AuthState(successful=True)])
@@ -969,17 +949,13 @@ class PushLock:
         _LOGGER.debug("%s: Finished validate", self.name)
 
     async def _poll_battery(self, lock: Lock) -> bool:
-        """Poll battery if needed: periodic refresh, timeout cooldown, errors.
+        """Poll battery if needed: periodic refresh, cooldown, errors.
 
         Battery state requires a poll of the lock to update. In always_connected mode
         _seen_this_session never clears, so once the refresh deadline passes
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
 
-        The read is issued for its effect on the receive path, which applies
-        the value before the await here resolves, so the fetched value is
-        discarded.
-
-        Returns whether a request was made.
+        Returns True if the lock was asked, whether or not it answered.
         """
         assert self._lock_info is not None  # nosec
         if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
@@ -991,11 +967,11 @@ class PushLock:
             return False
 
         now = time.monotonic()
-        # Skip while in cooldown after a prior battery timeout.
+        # Skip while in cooldown, after a read the lock did not answer or a
+        # reading that was thrown away.
         if now < self._earliest_battery_attempt_time:
             _LOGGER.debug(
-                "%s: Skipping battery request due to recent timeout "
-                "(cooldown until %.1fs)",
+                "%s: Skipping battery request; not asking again for %d seconds",
                 self.name,
                 self._earliest_battery_attempt_time - now,
             )
@@ -1014,16 +990,6 @@ class PushLock:
         try:
             await lock.battery()
             self._record_auth_success()
-            # Schedule the next refresh. Whether the reading was accepted is
-            # not decided here: the state path refuses an impossible one where
-            # the frame lands and arms the cooldown itself, and the cooldown
-            # gate above is what the next cycle meets. Nothing clears that
-            # cooldown on the way out either, because reaching this line means
-            # the gate found it lapsed, so it is already in the past.
-            #
-            # The deadline set below is read only while the seen mark is
-            # present, and a refusal discards the mark, so setting it after a
-            # refused reading costs nothing.
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
         except TimeoutError as err:
             _LOGGER.info(
@@ -1171,11 +1137,10 @@ class PushLock:
     async def _update(self) -> None:
         """Update the lock state.
 
-        Each read publishes through the receive path as its answer lands, so
-        the cycle assembles no state of its own and has nothing to hand back.
-        Anything it returned would be a second reading of what the callback has
-        already delivered, taken at a different moment; a caller reads the state
-        from the callback or from the properties.
+        Returns nothing. Every value this cycle asks for is applied as the
+        lock's answering frame arrives, so a returned state would be a second
+        reading, taken later than the one the callback already delivered. A
+        caller takes the state from the callback or from the properties.
         """
         has_lock_info = self._lock_info is not None
 
@@ -1186,11 +1151,8 @@ class PushLock:
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
 
-        # Each read below is issued for its effect on the receive path:
-        # session._notify hands every frame to the state path before it
-        # resolves the waiter the read is blocked on, so the answer has
-        # already been applied by the time the await returns.
-        # The fetched values therefore carry nothing new and are discarded.
+        # The reads below are issued here, and _update_any_state processes each
+        # answer, so the returned values are not used.
         made_request = False
 
         # Asking for battery first seems to reduce the chance of the lock
@@ -1228,16 +1190,7 @@ class PushLock:
         _LOGGER.debug("%s: Finished update", self.name)
 
         current = self._get_current_state()
-        # One publish per cycle, of the live state. Every reading this cycle
-        # took was applied as its frame landed, so this hands back exactly what
-        # is already held and cannot change any member.
-        #
-        # It exists because a consumer may read the callback as a liveness
-        # signal rather than only as a change notification. The Home Assistant
-        # entities do: they mark themselves unavailable from their own
-        # advertisement tracking and have no path back other than this
-        # callback, so a cycle that read the same values as the last one still
-        # has to report.
+        # Notify consumers that the update is complete, even if nothing changed.
         self._callback_state(current)
 
         if not has_lock_info:

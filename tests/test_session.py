@@ -85,14 +85,14 @@ async def test_execute_without_matcher_takes_first_valid_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_answering_frame_reaches_the_state_path_before_the_wait() -> None:
+async def test_the_answering_frame_reaches_the_callback_before_the_wait() -> None:
     """The frame answering a command is applied before the wait it resolves.
 
     A caller that reads the lock discards what the read returns and relies on
     the frame having been applied here, so the answering frame has to reach
-    the state path, and has to reach it while the wait is still armed. Drop
-    the hand-off for that frame and the state path never sees it; move it
-    below the resolution and the caller can resume ahead of it.
+    _state_callback, and has to reach it while the wait is still armed. Skip
+    the call for that frame and the callback never sees it; move it below the
+    resolution and the caller can resume ahead of it.
     """
     received: list[bytes] = []
     armed_at_hand_off: list[bool] = []
