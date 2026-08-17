@@ -16,6 +16,12 @@ YALE_MFR_ID = 465
 HAP_FIRST_BYTE = 0x06
 HAP_ENCRYPTED_FIRST_BYTE = 0x11
 
+# Every frame on the link, sent or received, is 18 bytes: a 16-byte encrypted
+# block plus two trailing plain bytes, and the checksums run over all 18. The
+# command builders, the checksum helpers, and the notify admission gate all
+# share this length.
+RESPONSE_FRAME_LEN = 0x12
+
 
 MANUFACTURER_NAME_CHARACTERISTIC = "00002a29-0000-1000-8000-00805f9b34fb"
 MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
