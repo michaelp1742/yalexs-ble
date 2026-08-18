@@ -174,6 +174,10 @@ NO_BATTERY_SUPPORT_MODELS = {
 
 AUTO_LOCK_DEFAULT_DURATION = 90
 
+# Statuses reported during calibration (0x01) and polarity discovery (0x06),
+# setup conditions that end at the lock by hand.
+SETUP_CONDITION_STATUSES = {LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06}
+
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
     """Define a wrapper to only allow a single operation at a time."""
@@ -887,7 +891,7 @@ class PushLock:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
                 if lock_state.lock != state:
-                    if state in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
+                    if state in SETUP_CONDITION_STATUSES:
                         _LOGGER.warning(
                             "%s: Lock reports %s, a setup condition that ends "
                             "at the lock by hand",
