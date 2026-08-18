@@ -14,20 +14,27 @@ from yalexs_ble.const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    BatteryState,
     Commands,
+    DoorActivity,
+    DoorStatus,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
     LockStateValue,
     LockStatus,
     SettingType,
+    StatusType,
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
     Lock,
+    _poll_response_matcher,
     _settings_response_matcher,
     convert_voltage_to_percentage,
 )
+from yalexs_ble.session import Session
+from yalexs_ble.util import _simple_checksum
 
 
 def test_aa_battery_voltage_to_percentage_is_monotonic() -> None:
@@ -787,3 +794,184 @@ async def test_lock_info_reads_model_first() -> None:
     await lock.lock_info()
 
     assert call_order[0] == MODEL_NUMBER_CHARACTERISTIC
+
+
+# --------------------------------------------------------------------------- #
+# Typed poll waits
+# --------------------------------------------------------------------------- #
+# byte[1] carries the polled opcode and byte[4] the status type; byte[3] is the
+# checksum and each frame sums to zero.
+BATTERY_FRAME = bytes.fromhex("bb0200a50f00000079140000000000000200")
+LOCK_FRAME = bytes.fromhex("bb02003c0200000003000000000000000200")
+DOOR_FRAME = bytes.fromhex("bb0200122e00000001000000000000000200")
+
+
+def _with_checksum(hex_str: str) -> bytes:
+    """Build an 18-byte frame with a valid simple checksum in byte[3].
+
+    byte[3] is the checksum field and ``_validate_response`` requires the
+    frame to sum to zero.
+    """
+    frame = bytearray.fromhex(hex_str)
+    frame[0x03] = 0
+    frame[0x03] = _simple_checksum(frame)
+    return bytes(frame)
+
+
+# A LOCK_ACTIVITY reply carries one activity record: byte[2] is the record
+# index and byte[4] the record type. 0x80 ends the log and decodes to nothing;
+# 0x20 is a door state change, carrying a door status at byte[9], so it decodes
+# to a value no status frame can be mistaken for.
+ACTIVITY_FRAME = _with_checksum("bb2d00008000000000000000000000000000")
+DOOR_ACTIVITY_FRAME = _with_checksum("bb2d00002000000000010000000000000000")
+
+
+def _connected_lock(
+    state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
+) -> tuple[Lock, Session]:
+    """A Lock wired to a real Session with pass-through crypto.
+
+    The matcher is applied inside Session.execute, so pinning the wiring
+    between a poll and its matcher needs a real session rather than a mock.
+    """
+    lock = _make_lock(state_callback)
+    client = MagicMock(is_connected=True)
+    session = Session(
+        client, "mylock", asyncio.Lock(), set(), lock._internal_state_callback
+    )
+    session.decrypt = bytes  # type: ignore[method-assign, assignment]
+    session.cipher_encrypt = MagicMock(update=bytes)
+    lock.client = client
+    lock.session = session
+    lock.secure_session = MagicMock()
+    return lock, session
+
+
+def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
+    """0xBB plus the polled opcode plus the byte[4] status type."""
+    matches = _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value)
+    assert matches(BATTERY_FRAME)
+    # Right opcode, wrong subtype.
+    assert not matches(DOOR_FRAME)
+    assert not matches(LOCK_FRAME)
+    # Right opcode and subtype, but an acknowledgment rather than a response.
+    assert not matches(_with_checksum("aa02000f0f00000000000000000000000000"))
+    # Wrong opcode.
+    assert not matches(ACTIVITY_FRAME)
+
+
+def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
+    """lock_activity's answer carries a record type at byte[4], not a status type.
+
+    So its matcher keys on the opcode alone and must accept any byte[4].
+    """
+    matches = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
+    assert matches(ACTIVITY_FRAME)
+    assert matches(_with_checksum("bb2d00002000000000000000000000000000"))
+    # Still opcode-gated.
+    assert not matches(BATTERY_FRAME)
+    # An acknowledgment carries the request's own byte[4], which is zero for
+    # this command and so reads as a lock operation record. Only the 0xBB check
+    # keeps it out of the parser.
+    assert not matches(_with_checksum("aa2d00000000000000000000000000000000"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("poll", "stray", "stray_state", "answer", "expected"),
+    [
+        (
+            "battery",
+            DOOR_FRAME,
+            DoorStatus.CLOSED,
+            BATTERY_FRAME,
+            BatteryState(5.241, 28),
+        ),
+        (
+            "lock_status",
+            BATTERY_FRAME,
+            BatteryState(5.241, 28),
+            LOCK_FRAME,
+            LockStatus.UNLOCKED,
+        ),
+        # The door answer is CLOSED, not OPENED: DoorStatus.OPENED and
+        # LockStatus.UNLOCKED are both 0x03, so the lock stray mis-parses to
+        # exactly OPENED and an OPENED expectation would pass either way.
+        ("door_status", LOCK_FRAME, LockStatus.UNLOCKED, DOOR_FRAME, DoorStatus.CLOSED),
+    ],
+)
+async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
+    poll: str,
+    stray: bytes,
+    stray_state: LockStateValue,
+    answer: bytes,
+    expected: object,
+) -> None:
+    """A stray push arriving mid-poll does not resolve the wait.
+
+    Every one of these strays is a valid frame that the untyped wait accepted
+    as the poll's answer, so the poll's own parser read the wrong bytes: the
+    door frame answering a battery poll is the recurring near-zero voltage
+    seen in the field. The stray still reaches the state callback, which is
+    where it belonged all along. Each answer decodes to a value its own stray
+    cannot produce, so the returned value discriminates on its own.
+    """
+    emitted: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda states: emitted.append(list(states)))
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(stray))
+        # The stray must not have answered the poll.
+        assert session._notify_future is not None
+        session._notify(0, bytearray(answer))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    assert await getattr(lock, poll)() == expected
+    # The stray was decoded as what it is, on the path it belonged on.
+    assert [stray_state] in emitted
+
+
+@pytest.mark.asyncio
+async def test_a_lock_activity_poll_is_not_answered_by_a_status_frame() -> None:
+    """lock_activity matches on the opcode alone, so a status frame is not it."""
+    lock, session = _connected_lock()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(LOCK_FRAME))
+        assert session._notify_future is not None
+        session._notify(0, bytearray(DOOR_ACTIVITY_FRAME))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    # The answer is a DOOR activity, which the status stray cannot decode to,
+    # so the returned object says which frame resolved the wait.
+    activity = await lock.lock_activity()
+    assert isinstance(activity, DoorActivity)
+    assert activity.status is DoorStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_the_auto_lock_read_completes_on_its_acknowledgment() -> None:
+    """The auto lock read must stay untyped: its 0xAA acknowledgment ends it.
+
+    It is the one poll deliberately left out of the typed set, so that a lock
+    with no auto lock support answers the command and the read moves on rather
+    than holding the wait open for the full response timeout. A matcher here
+    would wait for a 0xBB such a lock never sends.
+    """
+    lock, session = _connected_lock()
+    ack = _with_checksum("aa0400002800000000000000000000000000")
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        # The read arms no matcher, which is the exemption itself.
+        assert session._notify_matcher is None
+        session._notify(0, bytearray(ack))
+        # Checked here rather than after the call returns: _locked_write
+        # disarms the wait in a finally, so by then it is clear whatever ended
+        # it, and only the acknowledgment can have ended it at this point.
+        assert session._notify_future is None
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    await lock.auto_lock_status()

@@ -130,6 +130,45 @@ def _settings_response_matcher(
     return matches
 
 
+def _poll_response_matcher(
+    opcode: int, subtype: int | None = None
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB frame answering one status poll.
+
+    An answer carries the polled opcode in byte[1] and declares its own status
+    type in byte[4], which the poll compares against the one it asked for.
+
+    The plain wait accepts the first valid frame, so an unsolicited push
+    arriving mid-wait was taken as the poll answer and read at the offsets the
+    poll expected: a door-status push answering a battery poll had its door
+    byte read as a voltage, which is the recurring near-zero battery reading
+    seen in the field. Typing every status-poll wait keeps a foreign frame on
+    the state callback path where it belongs, and the response timeout is the
+    backstop for a poll the lock never answers. LOCK_ACTIVITY declares a record
+    type in byte[4] rather than a status type, so it matches on the opcode
+    alone; an acknowledgment carries back the request's own byte[4], which is
+    zero for that command and reads as a lock operation record, so requiring
+    the 0xBB frame keeps an acknowledgment out of that parser too.
+    auto_lock_status is a poll too, but it completes on its acknowledgment by
+    design (see its docstring), so it is not typed here.
+    """
+
+    def matches(data: bytes) -> bool:
+        return (
+            # The session gates every payload to a full frame ahead of decrypt,
+            # so this length check is unreachable through it. It is the
+            # matcher's own floor, for a caller with no session behind it, and
+            # it covers the highest byte the match reads, the subtype at 0x04.
+            # _settings_response_matcher above carries a floor of its own.
+            len(data) > 0x04
+            and data[0x00] == 0xBB
+            and data[0x01] == opcode
+            and (subtype is None or data[0x04] == subtype)
+        )
+
+    return matches
+
+
 class Lock:
     def __init__(
         self,
@@ -497,12 +536,22 @@ class Lock:
             await self.force_unlock()
 
     async def _execute_command(
-        self, opcode: int, cmd_byte: int, command_name: str
+        self,
+        opcode: int,
+        cmd_byte: int,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
     ) -> bytes:
+        # The matcher is passed in rather than built here from opcode and
+        # cmd_byte, because auto_lock_status uses this method too and has to
+        # stay untyped: it completes on its acknowledgment so that a lock with
+        # no auto lock support does not hold the wait open for the full
+        # response timeout. Building a matcher here would type that read as
+        # well.
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
         _LOGGER.debug("%s: send: [%s] [%s]", self.name, command.hex(), hex(cmd_byte))
-        response = await self.session.execute(command, command_name)
+        response = await self.session.execute(command, command_name, response_matcher)
         _LOGGER.debug(
             "%s: response: [%s] [%s]", self.name, response.hex(), hex(cmd_byte)
         )
@@ -565,7 +614,12 @@ class Lock:
         _LOGGER.debug("%s: Executing lock_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.LOCK_ONLY, "lock_status"
+            Commands.GETSTATUS,
+            StatusType.LOCK_ONLY,
+            "lock_status",
+            _poll_response_matcher(
+                Commands.GETSTATUS.value, StatusType.LOCK_ONLY.value
+            ),
         )
         _LOGGER.debug("%s: Finished executing lock_status", self.name)
         return self._parse_lock_status(response[0x08])
@@ -575,7 +629,12 @@ class Lock:
         _LOGGER.debug("%s: Executing door_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.DOOR_ONLY, "door_status"
+            Commands.GETSTATUS,
+            StatusType.DOOR_ONLY,
+            "door_status",
+            _poll_response_matcher(
+                Commands.GETSTATUS.value, StatusType.DOOR_ONLY.value
+            ),
         )
         _LOGGER.debug("%s: Finished executing door_status", self.name)
         return self._parse_door_status(response[0x08])
@@ -595,7 +654,10 @@ class Lock:
     async def battery(self) -> BatteryState:
         _LOGGER.debug("%s: Executing battery", self.name)
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.BATTERY, "battery"
+            Commands.GETSTATUS,
+            StatusType.BATTERY,
+            "battery",
+            _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value),
         )
         _LOGGER.debug("%s: Finished executing battery", self.name)
         return self._parse_battery_state(response)
@@ -718,7 +780,9 @@ class Lock:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
         assert self.session is not None  # nosec
         response = await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value), "lock_activity"
+            self.session.build_command(Commands.LOCK_ACTIVITY.value),
+            "lock_activity",
+            _poll_response_matcher(Commands.LOCK_ACTIVITY.value),
         )
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
