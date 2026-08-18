@@ -308,11 +308,9 @@ class Lock:
                 return ()  # Ignore lock activity as these are historical events
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
-                    lock_status = state[0x08]
-                    return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
+                    return [self._parse_lock_status(state[0x08])]
                 if state[4] == StatusType.DOOR_ONLY.value:
-                    door_status = state[0x08]
-                    return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
+                    return [self._parse_door_status(state[0x08])]
                 if state[4] == StatusType.DOOR_AND_LOCK.value:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:
@@ -622,7 +620,10 @@ class Lock:
             ),
         )
         _LOGGER.debug("%s: Finished executing lock_status", self.name)
-        return self._parse_lock_status(response[0x08])
+        # The answering frame was already decoded and logged on the notify
+        # path, so the bare lookup here keeps the unrecognized-code
+        # diagnostic to one line per frame.
+        return VALUE_TO_LOCK_STATUS.get(response[0x08], LockStatus.UNKNOWN)
 
     @raise_if_not_connected
     async def door_status(self) -> DoorStatus:
@@ -637,7 +638,10 @@ class Lock:
             ),
         )
         _LOGGER.debug("%s: Finished executing door_status", self.name)
-        return self._parse_door_status(response[0x08])
+        # The answering frame was already decoded and logged on the notify
+        # path, so the bare lookup here keeps the unrecognized-code
+        # diagnostic to one line per frame.
+        return VALUE_TO_DOOR_STATUS.get(response[0x08], DoorStatus.UNKNOWN)
 
     def _parse_battery_state(self, response: bytes) -> BatteryState:
         """Parse the battery state from the response."""

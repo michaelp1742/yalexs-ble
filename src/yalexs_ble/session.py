@@ -236,6 +236,13 @@ class Session:
         except ResponseError as ex:
             self._reject_frame(ex, decrypted_data)
             return
+        # Every frame that validates reaches _state_callback, the one answering
+        # a read included, and it reaches it before the waiter below is resolved.
+        # Callers that discard what a read returns rely on that order, so moving
+        # this call after an await, or skipping it for the frame that answers a
+        # read, resumes a caller before its answer is applied. SecureSession
+        # inherits this method and is built without a state callback, which is
+        # why the call is guarded.
         if self._state_callback:
             self._state_callback(decrypted_data)
         if self._notify_future is None:

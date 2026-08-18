@@ -32,6 +32,7 @@ from yalexs_ble.push import (
     AUTO_LOCK_READ_RESPONSE_TIMEOUT,
     AUTO_LOCK_WRITE_ATTEMPTS,
     BATTERY_REFRESH_INTERVAL,
+    BATTERY_TIMEOUT_COOLDOWN,
     DEFAULT_ATTEMPTS,
     HAP_FIRST_BYTE,
     NEVER_TIME,
@@ -55,6 +56,21 @@ TEST_LOCK_INFO = LockInfo(
     serial="12345",
     firmware="2.0.0",
 )
+
+
+def publishing_read(push_lock: PushLock, *states: Any) -> AsyncMock:
+    """Mock a Lock read that answers the way a real one does.
+
+    Session._notify hands every frame to _state_callback before it resolves
+    the waiter the read is blocked on, so a real read's answer is applied. A
+    mock that only sets a return value reproduces the call but not the answer,
+    so reads are stubbed with this.
+    """
+
+    async def _read(*args: Any, **kwargs: Any) -> None:
+        push_lock._state_callback(list(states))
+
+    return AsyncMock(side_effect=_read)
 
 
 @pytest.mark.asyncio
@@ -200,7 +216,7 @@ async def test_update_continues_after_battery_timeout():
     Requirements:
     - battery() timeout does not fail entire update
     - lock_status/door_status/auto_lock_status still get called
-    - final state has valid lock/door values (not UNKNOWN)
+    - the display has valid lock/door values (not UNKNOWN)
     - no forced disconnect due to battery timeout
     """
 
@@ -220,9 +236,9 @@ async def test_update_continues_after_battery_timeout():
     mock_lock.battery = AsyncMock(side_effect=TimeoutError("Battery timeout"))
 
     # But other calls succeed
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock()
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
@@ -240,7 +256,7 @@ async def test_update_continues_after_battery_timeout():
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
         # Should NOT raise exception
-        final_state = await push_lock._update()
+        await push_lock._update()
 
         # Battery call was attempted
         mock_lock.battery.assert_called_once()
@@ -250,16 +266,16 @@ async def test_update_continues_after_battery_timeout():
         mock_lock.auto_lock_status.assert_called_once()
         mock_lock.lock_status.assert_called_once()
 
-        # Final state has valid lock/door (from the successful calls)
-        assert final_state.lock == LockStatus.LOCKED
-        assert final_state.door == DoorStatus.CLOSED
+        # The display has valid lock/door (from the successful calls)
+        assert push_lock.lock_status == LockStatus.LOCKED
+        assert push_lock.door_status == DoorStatus.CLOSED
 
         # Battery should be None since it timed out
-        assert final_state.battery is None
+        assert push_lock.battery is None
 
 
 @pytest.mark.asyncio
-async def test_poll_battery_cooldown_skip():
+async def test_poll_battery_cooldown_skip(caplog: pytest.LogCaptureFixture) -> None:
     """Test that _poll_battery skips when on cooldown."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -276,28 +292,23 @@ async def test_poll_battery_cooldown_skip():
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
 
-    initial_state = LockState(
-        lock=LockStatus.LOCKED,
-        door=DoorStatus.CLOSED,
-        battery=None,
-        auth=None,
-        auto_lock=None,
-        auto_lock_prev=None,
-    )
-
     # Call _poll_battery
-    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        made_request = await push_lock._poll_battery(mock_lock)
 
     # Should skip the request
     assert made_request is False
     mock_lock.battery.assert_not_called()
-    # State should be unchanged
-    assert result_state == initial_state
+    # The message names only the cooldown; the gate cannot know what armed it.
+    # Asserted up to the fixed prefix, since the remaining seconds vary.
+    assert "Skipping battery request; not asking again for" in caplog.text
+    # Nothing was published
+    assert push_lock.battery is None
 
 
 @pytest.mark.asyncio
 async def test_poll_battery_success():
-    """Test that _poll_battery successfully fetches battery and resets cooldown."""
+    """Test that _poll_battery fetches battery and arms no cooldown."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
         key="0800200c9a66",
@@ -307,39 +318,29 @@ async def test_poll_battery_success():
     push_lock._name = "Test Lock"
     push_lock._lock_info = TEST_LOCK_INFO
 
-    # Set cooldown to simulate previous timeout
-    push_lock._earliest_battery_attempt_time = time.monotonic() + 100.0
+    # A cooldown from an earlier failure, already lapsed, so the gate lets
+    # this poll through.
+    lapsed_cooldown = time.monotonic() - 1.0
+    push_lock._earliest_battery_attempt_time = lapsed_cooldown
 
     mock_lock = MagicMock()
     battery_state = BatteryState(voltage=6.0, percentage=80)
-    mock_lock.battery = AsyncMock(return_value=battery_state)
+    mock_lock.battery = publishing_read(push_lock, battery_state)
 
-    initial_state = LockState(
-        lock=LockStatus.LOCKED,
-        door=DoorStatus.CLOSED,
-        battery=None,
-        auth=None,
-        auto_lock=None,
-        auto_lock_prev=None,
-    )
-
-    # Call _poll_battery (cooldown should be ignored since it's in the future)
-    # Wait a moment to ensure cooldown expires
-    push_lock._earliest_battery_attempt_time = NEVER_TIME
-
-    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+    made_request = await push_lock._poll_battery(mock_lock)
 
     # Should make the request
     assert made_request is True
     mock_lock.battery.assert_called_once()
 
-    # State should have battery data
-    assert result_state.battery == battery_state
-    assert result_state.auth is not None
-    assert result_state.auth.successful is True
+    # The lock's answering frame put the reading on display.
+    assert push_lock.battery == battery_state
+    assert push_lock.auth is not None
+    assert push_lock.auth.successful is True
 
-    # Cooldown should be reset to NEVER_TIME
-    assert push_lock._earliest_battery_attempt_time == NEVER_TIME
+    # A reading the lock answered with leaves the lapsed deadline untouched,
+    # so nothing here can wipe a cooldown armed while the read was in flight.
+    assert push_lock._earliest_battery_attempt_time == lapsed_cooldown
 
 
 @pytest.mark.asyncio
@@ -357,24 +358,15 @@ async def test_poll_battery_bleak_error():
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock(side_effect=BleakError("Connection failed"))
 
-    initial_state = LockState(
-        lock=LockStatus.LOCKED,
-        door=DoorStatus.CLOSED,
-        battery=None,
-        auth=None,
-        auto_lock=None,
-        auto_lock_prev=None,
-    )
-
     # Call _poll_battery
-    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+    made_request = await push_lock._poll_battery(mock_lock)
 
     # Should make the request
     assert made_request is True
     mock_lock.battery.assert_called_once()
 
-    # State should be unchanged (error was logged but not raised)
-    assert result_state == initial_state
+    # Nothing was published (error was logged but not raised)
+    assert push_lock.battery is None
 
     # Cooldown should NOT be set (only TimeoutError sets cooldown)
     assert push_lock._earliest_battery_attempt_time == NEVER_TIME
@@ -397,40 +389,28 @@ async def test_poll_battery_bleak_dbus_error():
         side_effect=BleakDBusError("DBus error", "error body")
     )
 
-    initial_state = LockState(
-        lock=LockStatus.LOCKED,
-        door=DoorStatus.CLOSED,
-        battery=None,
-        auth=None,
-        auto_lock=None,
-        auto_lock_prev=None,
-    )
-
     # Call _poll_battery
-    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+    made_request = await push_lock._poll_battery(mock_lock)
 
     # Should make the request
     assert made_request is True
     mock_lock.battery.assert_called_once()
 
-    # State should be unchanged (error was logged but not raised)
-    assert result_state == initial_state
+    # Nothing was published (error was logged but not raised)
+    assert push_lock.battery is None
 
     # Cooldown should NOT be set (only TimeoutError sets cooldown)
     assert push_lock._earliest_battery_attempt_time == NEVER_TIME
 
 
 @pytest.mark.asyncio
-async def test_update_preserves_notify_state_from_cache() -> None:
-    """
-    Test that _update() does not overwrite lock/door state with UNKNOWN
-    when notify callbacks have updated the cached state.
+async def test_update_keeps_a_value_delivered_mid_cycle_over_unknown() -> None:
+    """A notify arriving mid-cycle survives when the cycle started at UNKNOWN.
 
-    Regression test for race condition where:
-    1. Update starts with UNKNOWN state
-    2. Notify callback updates cached state to LOCKED/CLOSED during update
-    3. Update skips polling lock_status (already seen this session)
-    4. Final state should preserve LOCKED/CLOSED from cache, not revert to UNKNOWN
+    The cycle starts at UNKNOWN and reads no lock status of its own, since
+    one is already seen this session. A notify delivers LOCKED and CLOSED
+    while the cycle is awaiting a read, and the delivered values are still
+    on display when the cycle ends.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -496,26 +476,93 @@ async def test_update_preserves_notify_state_from_cache() -> None:
         push_lock._update_any_state([LockStatus.LOCKED, DoorStatus.CLOSED])
         allow_auto_lock_to_continue.set()
 
-        final_state = await update_task
+        await update_task
 
-        # The critical assertion: lock/door must be preserved from cache
-        assert final_state.lock == LockStatus.LOCKED, (
-            f"Lock status should be LOCKED from cache, got {final_state.lock}"
+        # The values the lock sent mid-cycle are still on display.
+        assert push_lock.lock_status == LockStatus.LOCKED, (
+            f"Lock status should still be LOCKED, got {push_lock.lock_status}"
         )
-        assert final_state.door == DoorStatus.CLOSED, (
-            f"Door status should be CLOSED from cache, got {final_state.door}"
+        assert push_lock.door_status == DoorStatus.CLOSED, (
+            f"Door status should still be CLOSED, got {push_lock.door_status}"
         )
 
 
 @pytest.mark.asyncio
+async def test_update_does_not_revert_a_mid_cycle_change() -> None:
+    """A notify arriving mid-cycle survives when the cycle started at a real value.
+
+    The cycle begins with the lock LOCKED and the door CLOSED, so it holds a
+    reading for both. While it is awaiting one of its reads, a key turned by
+    hand delivers UNLOCKED and OPENED, and a battery frame delivers a voltage.
+    Nothing in the cycle read a lock status, a door status, or a battery, so it
+    has nothing newer to say about any of them, and the delivered values must
+    be what is on display when it ends.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:ff", always_connected=False)
+
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    mock_lock = MagicMock()
+    push_lock._lock_info = MagicMock(model="ASL-03", door_sense=True)
+    push_lock._running = True
+
+    # Everything but the auto lock setting is already seen, so the cycle reads
+    # no lock or door status of its own.
+    push_lock._seen_this_session.add(LockStatus)
+    push_lock._seen_this_session.add(DoorStatus)
+    push_lock._seen_this_session.add(BatteryState)
+
+    push_lock._advertisement_data = _advertisement({})
+
+    mid_cycle_battery = BatteryState(voltage=6.0, percentage=80)
+
+    # Gate the auto lock read so the change can be delivered mid-cycle.
+    auto_lock_in_progress = asyncio.Event()
+    allow_auto_lock_to_continue = asyncio.Event()
+
+    async def auto_lock_status() -> None:
+        auto_lock_in_progress.set()
+        await allow_auto_lock_to_continue.wait()
+
+    mock_lock.auto_lock_status = AsyncMock(side_effect=auto_lock_status)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        update_task = asyncio.create_task(push_lock._update())
+        # As _deferred_update would, so the resync the change arms defers to
+        # this cycle instead of starting a second one mid-test.
+        push_lock._update_task = update_task
+
+        await auto_lock_in_progress.wait()
+        push_lock._update_any_state([LockStatus.UNLOCKED, DoorStatus.OPENED])
+        push_lock._update_any_state([mid_cycle_battery])
+        allow_auto_lock_to_continue.set()
+
+        await update_task
+        push_lock._cancel_future_update()
+
+    assert push_lock.lock_status == LockStatus.UNLOCKED
+    assert push_lock.door_status == DoorStatus.OPENED
+    assert push_lock.battery == mid_cycle_battery
+
+
+@pytest.mark.asyncio
 async def test_update_auto_lock_from_notify_path_survives_poll_result() -> None:
-    """_update() carries the notify-published auto-lock into its final state.
+    """A mid-cycle auto-lock publish is what _update ends holding.
 
     The auto-lock read's return value is the READSETTING acknowledgment
     constant (OFF) and is discarded; the stored setting arrives as the 0xBB
-    settings response on the notify path during the cycle. The end-of-update
-    restore must apply the notify-published value, not revert to the cycle's
-    starting snapshot or the poll constant.
+    settings response on the notify path during the cycle. The value on
+    display when the cycle ends must be the published one, not the cycle's
+    starting value or the poll constant.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -575,11 +622,10 @@ async def test_update_auto_lock_from_notify_path_survives_poll_result() -> None:
         push_lock._update_any_state([AutoLockState(AutoLockMode.TIMER, 1800)])
         allow_auto_lock_to_continue.set()
 
-        final_state = await update_task
+        await update_task
 
-        assert final_state.auto_lock == AutoLockState(AutoLockMode.TIMER, 1800), (
-            f"Auto-lock should be the notify-published value, "
-            f"got {final_state.auto_lock}"
+        assert push_lock.auto_lock == AutoLockState(AutoLockMode.TIMER, 1800), (
+            f"Auto-lock should be the notify-published value, got {push_lock.auto_lock}"
         )
 
 
@@ -597,10 +643,12 @@ async def test_update_continues_when_lock_info_probe_fails() -> None:
 
     mock_lock = MagicMock()
     mock_lock.lock_info = AsyncMock(side_effect=TimeoutError("probe timed out"))
-    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=6.0, percentage=80)
+    )
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock()
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
@@ -613,17 +661,17 @@ async def test_update_continues_when_lock_info_probe_fails() -> None:
     )
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        final_state = await push_lock._update()
+        await push_lock._update()
 
     # lock_info was attempted
     mock_lock.lock_info.assert_called_once()
 
     # Update still completed with real data
-    assert final_state.lock == LockStatus.LOCKED
+    assert push_lock.lock_status == LockStatus.LOCKED
 
     # door_status not called because model="" makes door_sense=False
     mock_lock.door_status.assert_not_called()
-    assert final_state.door == DoorStatus.UNKNOWN
+    assert push_lock.door_status == DoorStatus.UNKNOWN
 
     # Defaults were used for lock_info, serial falls back to MAC address
     assert push_lock._lock_info is not None
@@ -648,10 +696,12 @@ async def test_update_continues_when_lock_info_probe_bleak_error() -> None:
     mock_lock.lock_info = AsyncMock(
         side_effect=BleakError("connection dropped during probe")
     )
-    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=6.0, percentage=80)
+    )
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock()
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     push_lock._advertisement_data = AdvertisementData(
         local_name="Test Lock",
@@ -664,9 +714,9 @@ async def test_update_continues_when_lock_info_probe_bleak_error() -> None:
     )
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        final_state = await push_lock._update()
+        await push_lock._update()
 
-    assert final_state.lock == LockStatus.LOCKED
+    assert push_lock.lock_status == LockStatus.LOCKED
     assert push_lock._lock_info is not None
     assert push_lock._lock_info.manufacturer == "Unknown"
     assert push_lock._lock_info.serial == "aa:bb:cc:dd:ee:ff"
@@ -690,9 +740,11 @@ async def test_update_sets_slow_connection_params_when_always_connected():
 
     mock_lock = MagicMock()
     mock_lock.client = mock_client
-    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=5.5, percentage=95)
+    )
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
     mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -748,9 +800,11 @@ async def test_update_does_not_set_connection_params_when_not_always_connected()
 
     mock_lock = MagicMock()
     mock_lock.client = mock_client
-    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=5.5, percentage=95)
+    )
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
     mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -789,9 +843,11 @@ async def test_update_handles_connection_params_failure():
 
     mock_lock = MagicMock()
     mock_lock.client = mock_client
-    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=5.5, percentage=95)
+    )
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
     mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -807,9 +863,9 @@ async def test_update_handles_connection_params_failure():
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
         # Should NOT raise even though set_connection_params failed
-        final_state = await push_lock._update()
+        await push_lock._update()
 
-    assert final_state.lock == LockStatus.LOCKED
+    assert push_lock.lock_status == LockStatus.LOCKED
     mock_client.set_connection_params.assert_called_once()
 
 
@@ -828,9 +884,9 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
 
     battery_state = BatteryState(voltage=4.0, percentage=90)
     mock_lock = MagicMock()
-    mock_lock.battery = AsyncMock(return_value=battery_state)
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.battery = publishing_read(push_lock, battery_state)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
@@ -855,11 +911,11 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
     before_update = time.monotonic()
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        final_state = await push_lock._update()
+        await push_lock._update()
 
     # Battery should have been re-polled
     mock_lock.battery.assert_called_once()
-    assert final_state.battery == battery_state
+    assert push_lock.battery == battery_state
     # Deadline should have been pushed out a full interval from the poll
     assert (
         push_lock._next_battery_refresh_time >= before_update + BATTERY_REFRESH_INTERVAL
@@ -880,8 +936,8 @@ async def test_battery_refresh_not_due_skips_repoll():
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
@@ -926,8 +982,8 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
@@ -977,15 +1033,6 @@ async def test_battery_refresh_due_but_on_cooldown_does_not_evict():
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
 
-    initial_state = LockState(
-        lock=LockStatus.LOCKED,
-        door=DoorStatus.CLOSED,
-        battery=None,
-        auth=None,
-        auto_lock=None,
-        auto_lock_prev=None,
-    )
-
     # Battery already polled this session and the refresh is due...
     push_lock._seen_this_session.add(BatteryState)
     refresh_deadline = time.monotonic() - 1.0
@@ -993,14 +1040,14 @@ async def test_battery_refresh_due_but_on_cooldown_does_not_evict():
     # ...but a prior timeout left the battery cooldown active.
     push_lock._earliest_battery_attempt_time = time.monotonic() + 100.0
 
-    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+    made_request = await push_lock._poll_battery(mock_lock)
 
     # Cooldown gate wins: no poll, no eviction, deadline untouched.
     assert made_request is False
     mock_lock.battery.assert_not_called()
     assert BatteryState in push_lock._seen_this_session
     assert push_lock._next_battery_refresh_time == refresh_deadline
-    assert result_state == initial_state
+    assert push_lock.battery is None
 
 
 @pytest.mark.asyncio
@@ -1712,10 +1759,12 @@ async def test_auto_lock_read_timeout_does_not_propagate_out_of_update() -> None
 
     mock_lock = MagicMock()
     mock_lock.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
-    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
-    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=6.0, percentage=80)
+    )
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
     mock_lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
-    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
@@ -1730,11 +1779,11 @@ async def test_auto_lock_read_timeout_does_not_propagate_out_of_update() -> None
     )
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        state = await push_lock._update()
+        await push_lock._update()
 
     # The update returned instead of raising: no forced disconnect, and the
     # timeout was counted as a failure rather than propagated.
-    assert state.lock == LockStatus.LOCKED
+    assert push_lock.lock_status == LockStatus.LOCKED
     assert push_lock._auto_lock_read_ack_failures == 1
     mock_lock.auto_lock_status.assert_awaited_once()
     push_lock._cancel_disconnect_timer()
@@ -1799,7 +1848,7 @@ async def test_set_auto_lock_write_resets_read_backoff() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _auto_lock_push_lock(address: str, *, always_connected: bool) -> PushLock:
+def _named_push_lock(address: str, *, always_connected: bool) -> PushLock:
     """A named PushLock with the canonical test key and slot."""
     push_lock = PushLock(
         address=address,
@@ -1811,7 +1860,9 @@ def _auto_lock_push_lock(address: str, *, always_connected: bool) -> PushLock:
     return push_lock
 
 
-def _auto_lock_update_lock(auto_lock_status: AsyncMock) -> MagicMock:
+def _auto_lock_update_lock(
+    push_lock: PushLock, auto_lock_status: AsyncMock
+) -> MagicMock:
     """A mock Lock answering every read so _update reaches the auto lock read.
 
     The auto lock read itself is wired per the outcome under test.
@@ -1819,9 +1870,9 @@ def _auto_lock_update_lock(auto_lock_status: AsyncMock) -> MagicMock:
     lock = MagicMock()
     lock.connect = AsyncMock()
     lock.is_connected = True
-    lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
-    lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    lock.battery = publishing_read(push_lock, BatteryState(voltage=6.0, percentage=80))
+    lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
     lock.auto_lock_status = auto_lock_status
     return lock
 
@@ -1839,9 +1890,7 @@ async def test_auto_lock_read_response_timeout_arms_backoff(
     log reports the ack and response counts separately.
     """
     caplog.set_level(logging.INFO)
-    push_lock = _auto_lock_push_lock(
-        "aa:bb:cc:dd:ee:20", always_connected=always_connected
-    )
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:20", always_connected=always_connected)
     mock_lock = MagicMock()
     mock_lock.auto_lock_status = AsyncMock(return_value=None)  # ack ok, no 0xBB
 
@@ -1885,7 +1934,7 @@ async def test_auto_lock_read_value_in_flight_holds_without_strike() -> None:
     Before the deadline the 0xBB may still be in flight, so the read neither
     books a response timeout nor issues another read.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:21", always_connected=True)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:21", always_connected=True)
     mock_lock = MagicMock()
     mock_lock.auto_lock_status = AsyncMock(return_value=None)
 
@@ -1909,7 +1958,7 @@ async def test_auto_lock_read_value_landing_during_ack_does_not_arm_pending() ->
     deadline for a value already in hand -- otherwise the next cycle would book
     one spurious response timeout.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:2a", always_connected=True)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:2a", always_connected=True)
 
     def _ack_and_value(*_args: object) -> None:
         # The 0xBB is dispatched on the notify path before the await resumes.
@@ -1936,7 +1985,7 @@ async def test_auto_lock_read_pending_survives_reconnect() -> None:
     The hold must outlive the connection, so the pending flag, its deadline, and
     the response count all persist across the reconnect that clears the seen set.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:23", always_connected=True)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:23", always_connected=True)
     deadline = time.monotonic() + AUTO_LOCK_READ_RESPONSE_TIMEOUT
     push_lock._awaiting_auto_lock_response = True
     push_lock._auto_lock_response_deadline = deadline
@@ -1963,11 +2012,9 @@ async def test_auto_lock_read_pending_survives_reconnect() -> None:
 async def test_auto_lock_read_success_ack_then_value(always_connected: bool) -> None:
     """Case 4: a full working lock. The ack arms the pending-response deadline;
     the 0xBB value landing afterwards clears it and arms the refresh timer."""
-    push_lock = _auto_lock_push_lock(
-        "aa:bb:cc:dd:ee:24", always_connected=always_connected
-    )
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:24", always_connected=always_connected)
     push_lock._lock_info = TEST_LOCK_INFO
-    mock_lock = _auto_lock_update_lock(AsyncMock(return_value=None))
+    mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
 
     before = time.monotonic()
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
@@ -2003,7 +2050,7 @@ async def test_update_any_state_auth_change_is_applied() -> None:
     auto lock success block; the two share the "if lock_state.x != state" shape,
     so an inserted auto lock block anchors against the auth branch in the diff.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
     assert push_lock._get_current_state().auth is None
 
     push_lock._update_any_state([AuthState(successful=True)])
@@ -2023,7 +2070,7 @@ async def test_auto_lock_read_response_backoff_survives_connect_on_demand(
     backoff still latches instead of the read repeating on every connection.
     """
     caplog.set_level(logging.INFO)
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:25", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:25", always_connected=False)
 
     async def _advert_connect() -> Lock:
         # A fresh advert-driven connection: was disconnected, now reconnects,
@@ -2067,7 +2114,7 @@ async def test_auto_lock_read_ack_backoff_survives_connect_on_demand() -> None:
     """Case 2 under connect-on-demand: a lock silent to the read accumulates ack
     timeouts across reconnects and backs off, rather than being re-asked on
     every connection."""
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:26", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:26", always_connected=False)
 
     async def _advert_connect() -> Lock:
         push_lock._client = None
@@ -2103,10 +2150,10 @@ async def test_auto_lock_read_connects_after_advertisement() -> None:
     The lock is disconnected; an advertisement arrives and schedules the update;
     the deferred update connects on demand and issues the auto lock read.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:27", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:27", always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
-    mock_lock = _auto_lock_update_lock(AsyncMock(return_value=None))
+    mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
     ad = AdvertisementData(
         local_name="Test Lock",
@@ -2146,11 +2193,9 @@ async def test_dead_lock_read_not_reached_earlier_read_propagates(
     layer handles the dead lock), so the auto lock read is never reached and its
     counters stay clean.
     """
-    push_lock = _auto_lock_push_lock(
-        "aa:bb:cc:dd:ee:28", always_connected=always_connected
-    )
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:28", always_connected=always_connected)
     push_lock._lock_info = TEST_LOCK_INFO
-    mock_lock = _auto_lock_update_lock(AsyncMock(return_value=None))
+    mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
     mock_lock.door_status = AsyncMock(side_effect=TimeoutError)
 
     with (
@@ -2203,6 +2248,181 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up(
     assert mock_lock.set_auto_lock.await_count == AUTO_LOCK_WRITE_ATTEMPTS
 
 
+@pytest.mark.asyncio
+async def test_poll_battery_skips_models_without_battery_support() -> None:
+    """A model on the no-battery-support list is never asked for a reading."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:19", always_connected=False)
+    push_lock._lock_info = LockInfo(
+        manufacturer="Yale",
+        model="SL-103",
+        serial="12345",
+        firmware="2.0.0",
+    )
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+
+    assert await push_lock._poll_battery(mock_lock) is False
+    mock_lock.battery.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voltage", [2.5, 3.0])
+async def test_impossible_battery_voltage_is_refused_and_surfaced(
+    caplog: pytest.LogCaptureFixture, voltage: float
+) -> None:
+    """A reading at or below 3.0 V is refused, reported, and starts the cooldown.
+
+    The 3.0 V threshold is upstream's; the warning and the cooldown armed
+    at the refusal are what this change adds.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:15", always_connected=False)
+
+    earliest = time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        push_lock._update_any_state([BatteryState(voltage=voltage, percentage=0)])
+
+    assert push_lock.battery is None
+    assert "Battery voltage is impossible" in caplog.text
+    # The warning says how long the lock will not be asked again.
+    assert f"not asking again for {BATTERY_TIMEOUT_COOLDOWN} seconds" in caplog.text
+    # Warning, not error: the lock behaved unexpectedly, the host did not fail.
+    assert caplog.records[0].levelno == logging.WARNING
+    # A refused reading must not suppress the next poll.
+    assert BatteryState not in push_lock._seen_this_session
+    # The cooldown is armed here, where the reading is thrown away.
+    assert push_lock._earliest_battery_attempt_time >= earliest
+
+
+@pytest.mark.asyncio
+async def test_a_refused_battery_reading_starts_the_cooldown() -> None:
+    """A poll whose reading is refused comes back with the cooldown running.
+
+    The companion to the test above, taken through _poll_battery: the lock's
+    answering frame is refused while the read is still awaiting it, so the
+    cooldown is already armed when the poll returns.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:34", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+
+    mock_lock = MagicMock()
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=2.5, percentage=0)
+    )
+
+    earliest = time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
+    assert await push_lock._poll_battery(mock_lock) is True
+
+    assert push_lock.battery is None
+    assert push_lock._earliest_battery_attempt_time >= earliest
+    # The cooldown, not BatteryState in _seen_this_session, stops the next ask.
+    assert await push_lock._poll_battery(mock_lock) is False
+    mock_lock.battery.assert_called_once()
+
+
+def _real_decoder_pair(address: str) -> tuple[PushLock, Lock]:
+    """A PushLock fed by a real Lock decoder rather than a stub."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    lock = Lock(
+        lambda: BLEDevice(address, "lock"),
+        "0800200c9a66",
+        1,
+        "Test Lock",
+        push_lock._state_callback,
+    )
+    return push_lock, lock
+
+
+@pytest.mark.asyncio
+async def test_a_battery_frame_reaches_the_display_through_the_real_decoder() -> None:
+    """Pin the only route from a battery frame to the display.
+
+    With the fetch return discarded, Lock._parse_state's BATTERY branch is the
+    one route between a battery frame from the lock and the published state, so
+    this drives a real captured frame through the real decoder into
+    _update_any_state rather than stubbing either side.
+    """
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:17")
+
+    lock._internal_state_callback(bytes.fromhex("bb0200a50f00000079140000000000000200"))
+
+    battery = push_lock.battery
+    assert battery is not None
+    assert battery.voltage == 5.241
+    assert battery.percentage == 28
+
+
+@pytest.mark.asyncio
+async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> None:
+    """Pin the only route from a door status frame to the display.
+
+    door_status() asks for DOOR_ONLY, and with the fetch return discarded that
+    branch of Lock._parse_state is the one route between the lock's answering
+    frame and the published state, so this drives a real captured frame
+    through the real decoder into _update_any_state rather than stubbing
+    either side.
+    """
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:18")
+
+    lock._internal_state_callback(bytes.fromhex("bb0200122e00000003000000000000000000"))
+
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported", [LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06])
+async def test_update_does_not_reconnect_on_a_setup_condition(
+    caplog: pytest.LogCaptureFixture,
+    reported: LockStatus,
+) -> None:
+    """A polled 0x01 or 0x06 reaches the display, warns, and forces no reconnect.
+
+    The reconnect that used to answer these two is gone, so the warning is the
+    only thing that records the condition. Without it a lock left in
+    calibration or polarity discovery is diagnosable from nothing.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:16", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+
+    mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
+    mock_lock.lock_status = publishing_read(push_lock, reported)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(
+            push_lock, "_execute_forced_disconnect", new_callable=AsyncMock
+        ) as forced_disconnect,
+    ):
+        await push_lock._update()
+        push_lock._cancel_future_update()
+
+    forced_disconnect.assert_not_awaited()
+    assert push_lock.lock_status is reported
+    assert "a setup condition that ends at the lock by hand" in caplog.text
+    assert str(reported) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_setup_condition_is_recorded_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A repeated 0x01 is recorded once, not once per frame that carries it.
+
+    The warning sits inside the lock_state.lock != state guard, so a frame
+    that repeats the held status records nothing, however many arrive.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:35", always_connected=False)
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        push_lock._update_any_state([LockStatus.UNKNOWN_01])
+        push_lock._update_any_state([LockStatus.UNKNOWN_01])
+
+    assert push_lock.lock_status is LockStatus.UNKNOWN_01
+    assert len(caplog.records) == 1
+
+
 def _advertisement(manufacturer_data: dict[int, bytes]) -> AdvertisementData:
     """An advertisement carrying the given manufacturer payloads."""
     return AdvertisementData(
@@ -2239,7 +2459,7 @@ async def test_a_short_advertisement_payload_is_skipped_not_parsed(
     parse used to index and unpack it unconditionally, so a truncated payload
     raised out of the callback the consumer dispatches from.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:28", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:28", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
 
     push_lock.update_advertisement(ble_device, _advertisement(manufacturer_data))
@@ -2259,7 +2479,7 @@ def _hap_payload(state_num: int) -> bytes:
 @pytest.mark.asyncio
 async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> None:
     """The guard admits a payload long enough for the fields it reads."""
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
 
     push_lock.update_advertisement(
@@ -2283,3 +2503,122 @@ async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> No
     )
     assert push_lock._last_hk_state == 0x1235
     assert push_lock._cancel_deferred_update is None
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_changed_nothing_still_reports() -> None:
+    """A cycle that read the same values as the last one still publishes once.
+
+    A consumer may mark the lock unavailable from its own advertisement
+    tracking and mark it available again only from this callback, so the
+    callback has to report that the lock is still answering and not only
+    that it changed.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:30", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+
+    # Everything the cycle could read is already held at the value the lock
+    # will answer with, so no read in the cycle changes any field.
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=AuthState(successful=True),
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+    push_lock._seen_this_session.add(DoorStatus)
+    push_lock._seen_this_session.add(BatteryState)
+    push_lock._seen_this_session.add(AutoLockState)
+
+    published: list[LockState] = []
+    push_lock.register_callback(lambda state, info, conn: published.append(state))
+
+    mock_lock = MagicMock()
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+    mock_lock.battery = AsyncMock()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+        push_lock._cancel_future_update()
+
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+    # The lock status was re-read and matched, so no field changed.
+    mock_lock.lock_status.assert_awaited_once()
+    assert push_lock.lock_status is LockStatus.LOCKED
+    # The cycle still reported exactly once.
+    assert len(published) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("address", "unseen", "read_name", "answer"),
+    [
+        ("aa:bb:cc:dd:ee:31", DoorStatus, "door_status", DoorStatus.OPENED),
+        (
+            "aa:bb:cc:dd:ee:32",
+            AutoLockState,
+            "auto_lock_status",
+            AutoLockState(mode=AutoLockMode.TIMER, duration=30),
+        ),
+        ("aa:bb:cc:dd:ee:33", LockStatus, "lock_status", LockStatus.LOCKED),
+    ],
+)
+async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
+    address: str,
+    unseen: type,
+    read_name: str,
+    answer: Any,
+) -> None:
+    """A read that answers is a successful round trip, at each site that issues one.
+
+    _seen_this_session is filled except for one type, so the cycle issues
+    exactly the read that fetches it and no other. An answer applies
+    AuthState(successful=True) and clears the consecutive-failure count that
+    arms the reauth latch, whichever read it was.
+    """
+    push_lock = _named_push_lock(address, always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+
+    # At the reauth latch, so a reset is observable.
+    for _ in range(AUTH_FAILURE_TO_START_REAUTH):
+        _AUTH_FAILURE_HISTORY.auth_failed(address)
+    assert _AUTH_FAILURE_HISTORY.should_raise(address) is True
+
+    reads = {"door_status", "auto_lock_status", "lock_status"}
+    for seen in {LockStatus, DoorStatus, BatteryState, AutoLockState} - {unseen}:
+        push_lock._seen_this_session.add(seen)
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+    for name in reads:
+        setattr(mock_lock, name, AsyncMock())
+    setattr(mock_lock, read_name, publishing_read(push_lock, answer))
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+        push_lock._cancel_future_update()
+
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+    # Exactly the one read, so the assertions below name one site.
+    getattr(mock_lock, read_name).assert_awaited_once()
+    for name in reads - {read_name}:
+        getattr(mock_lock, name).assert_not_awaited()
+    mock_lock.battery.assert_not_awaited()
+
+    assert push_lock.auth == AuthState(successful=True)
+    assert _AUTH_FAILURE_HISTORY.should_raise(address) is False
