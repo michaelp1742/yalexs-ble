@@ -1685,3 +1685,48 @@ async def test_replay_incident2_settled_bb02_never_completes_force_unlock() -> N
     assert progress.acknowledged is True
     # Both settled pushes stayed on the state-callback path, never claimed.
     assert seen.count(settled_unlocked) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_wait_that_already_ended_is_reported_as_not_waiting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The notify line and the drop line both read the wait, not the slot.
+
+    Between a future resolving and the waiter resuming to clear it, the slot
+    still holds an object while no wait is live. A frame arriving in that
+    window answers nothing, and these two lines are the only record of it.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    future: asyncio.Future[bytes] = session.loop.create_future()
+    session._notify_future = future
+    future.cancel()
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        session._notify(0, bytearray(READ_ANSWER))
+
+    assert "waiting=False" in caplog.text
+    assert "dropping the answer to a wait that already ended" in caplog.text
+    assert READ_ANSWER.hex() in caplog.text
+    # The frame still reached the state callback; only its role as an answer
+    # was dropped.
+    assert received == [READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_a_live_wait_is_reported_as_waiting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same line reads True while the wait is genuinely outstanding."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    future: asyncio.Future[bytes] = session.loop.create_future()
+    session._notify_future = future
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        session._notify(0, bytearray(READ_ANSWER))
+
+    assert "waiting=True" in caplog.text
+    assert "dropping the answer to a wait that already ended" not in caplog.text
+    assert future.result() == READ_ANSWER
