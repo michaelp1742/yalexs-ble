@@ -2302,7 +2302,7 @@ async def test_a_refused_battery_reading_starts_the_cooldown() -> None:
     answering frame is refused while the read is still awaiting it, so the
     cooldown is already armed when the poll returns.
     """
-    push_lock = _named_push_lock("aa:bb:cc:dd:ee:20", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:34", always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
 
     mock_lock = MagicMock()
@@ -2413,7 +2413,7 @@ async def test_a_repeated_setup_condition_is_recorded_once(
     The warning sits inside the lock_state.lock != state guard, so a frame
     that repeats the held status records nothing, however many arrive.
     """
-    push_lock = _named_push_lock("aa:bb:cc:dd:ee:17", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:35", always_connected=False)
 
     with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
         push_lock._update_any_state([LockStatus.UNKNOWN_01])
