@@ -498,13 +498,7 @@ async def test_update_does_not_revert_a_mid_cycle_change() -> None:
     has nothing newer to say about any of them, and the delivered values must
     be what is on display when it ends.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:ff",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:ff", always_connected=False)
 
     push_lock._lock_state = LockState(
         lock=LockStatus.LOCKED,
@@ -525,15 +519,7 @@ async def test_update_does_not_revert_a_mid_cycle_change() -> None:
     push_lock._seen_this_session.add(DoorStatus)
     push_lock._seen_this_session.add(BatteryState)
 
-    push_lock._advertisement_data = AdvertisementData(
-        local_name="Test Lock",
-        service_data={},
-        service_uuids=[],
-        rssi=-50,
-        manufacturer_data={},
-        platform_data=(),
-        tx_power=0,
-    )
+    push_lock._advertisement_data = _advertisement({})
 
     mid_cycle_battery = BatteryState(voltage=6.0, percentage=80)
 
@@ -1845,7 +1831,7 @@ async def test_set_auto_lock_write_resets_read_backoff() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _auto_lock_push_lock(address: str, *, always_connected: bool) -> PushLock:
+def _named_push_lock(address: str, *, always_connected: bool) -> PushLock:
     """A named PushLock with the canonical test key and slot."""
     push_lock = PushLock(
         address=address,
@@ -1887,9 +1873,7 @@ async def test_auto_lock_read_response_timeout_arms_backoff(
     log reports the ack and response counts separately.
     """
     caplog.set_level(logging.INFO)
-    push_lock = _auto_lock_push_lock(
-        "aa:bb:cc:dd:ee:20", always_connected=always_connected
-    )
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:20", always_connected=always_connected)
     mock_lock = MagicMock()
     mock_lock.auto_lock_status = AsyncMock(return_value=None)  # ack ok, no 0xBB
 
@@ -1933,7 +1917,7 @@ async def test_auto_lock_read_value_in_flight_holds_without_strike() -> None:
     Before the deadline the 0xBB may still be in flight, so the read neither
     books a response timeout nor issues another read.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:21", always_connected=True)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:21", always_connected=True)
     mock_lock = MagicMock()
     mock_lock.auto_lock_status = AsyncMock(return_value=None)
 
@@ -1957,7 +1941,7 @@ async def test_auto_lock_read_value_landing_during_ack_does_not_arm_pending() ->
     deadline for a value already in hand -- otherwise the next cycle would book
     one spurious response timeout.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:2a", always_connected=True)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:2a", always_connected=True)
 
     def _ack_and_value(*_args: object) -> None:
         # The 0xBB is dispatched on the notify path before the await resumes.
@@ -1984,7 +1968,7 @@ async def test_auto_lock_read_pending_survives_reconnect() -> None:
     The hold must outlive the connection, so the pending flag, its deadline, and
     the response count all persist across the reconnect that clears the seen set.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:23", always_connected=True)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:23", always_connected=True)
     deadline = time.monotonic() + AUTO_LOCK_READ_RESPONSE_TIMEOUT
     push_lock._awaiting_auto_lock_response = True
     push_lock._auto_lock_response_deadline = deadline
@@ -2011,9 +1995,7 @@ async def test_auto_lock_read_pending_survives_reconnect() -> None:
 async def test_auto_lock_read_success_ack_then_value(always_connected: bool) -> None:
     """Case 4: a full working lock. The ack arms the pending-response deadline;
     the 0xBB value landing afterwards clears it and arms the refresh timer."""
-    push_lock = _auto_lock_push_lock(
-        "aa:bb:cc:dd:ee:24", always_connected=always_connected
-    )
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:24", always_connected=always_connected)
     push_lock._lock_info = TEST_LOCK_INFO
     mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
 
@@ -2051,7 +2033,7 @@ async def test_update_any_state_auth_change_is_applied() -> None:
     auto lock success block; the two share the "if lock_state.x != state" shape,
     so an inserted auto lock block anchors against the auth branch in the diff.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
     assert push_lock._get_current_state().auth is None
 
     push_lock._update_any_state([AuthState(successful=True)])
@@ -2071,7 +2053,7 @@ async def test_auto_lock_read_response_backoff_survives_connect_on_demand(
     backoff still latches instead of the read repeating on every connection.
     """
     caplog.set_level(logging.INFO)
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:25", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:25", always_connected=False)
 
     async def _advert_connect() -> Lock:
         # A fresh advert-driven connection: was disconnected, now reconnects,
@@ -2115,7 +2097,7 @@ async def test_auto_lock_read_ack_backoff_survives_connect_on_demand() -> None:
     """Case 2 under connect-on-demand: a lock silent to the read accumulates ack
     timeouts across reconnects and backs off, rather than being re-asked on
     every connection."""
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:26", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:26", always_connected=False)
 
     async def _advert_connect() -> Lock:
         push_lock._client = None
@@ -2151,7 +2133,7 @@ async def test_auto_lock_read_connects_after_advertisement() -> None:
     The lock is disconnected; an advertisement arrives and schedules the update;
     the deferred update connects on demand and issues the auto lock read.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:27", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:27", always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
     mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
@@ -2194,9 +2176,7 @@ async def test_dead_lock_read_not_reached_earlier_read_propagates(
     layer handles the dead lock), so the auto lock read is never reached and its
     counters stay clean.
     """
-    push_lock = _auto_lock_push_lock(
-        "aa:bb:cc:dd:ee:28", always_connected=always_connected
-    )
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:28", always_connected=always_connected)
     push_lock._lock_info = TEST_LOCK_INFO
     mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
     mock_lock.door_status = AsyncMock(side_effect=TimeoutError)
@@ -2254,13 +2234,7 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up(
 @pytest.mark.asyncio
 async def test_poll_battery_skips_models_without_battery_support() -> None:
     """A model on the no-battery-support list is never asked for a reading."""
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:19",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:19", always_connected=False)
     push_lock._lock_info = LockInfo(
         manufacturer="Yale",
         model="SL-103",
@@ -2285,13 +2259,7 @@ async def test_impossible_battery_voltage_is_refused_and_surfaced(
     The 3.0 V threshold is upstream's; the warning and the cooldown armed
     at the refusal are what this change adds.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:15",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:15", always_connected=False)
 
     earliest = time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
     with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
@@ -2317,13 +2285,7 @@ async def test_a_refused_battery_reading_starts_the_cooldown() -> None:
     answering frame is refused while the read is still awaiting it, so the
     cooldown is already armed when the poll returns.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:20",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:20", always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
 
     mock_lock = MagicMock()
@@ -2341,6 +2303,19 @@ async def test_a_refused_battery_reading_starts_the_cooldown() -> None:
     mock_lock.battery.assert_called_once()
 
 
+def _real_decoder_pair(address: str) -> tuple[PushLock, Lock]:
+    """A PushLock fed by a real Lock decoder rather than a stub."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    lock = Lock(
+        lambda: BLEDevice(address, "lock"),
+        "0800200c9a66",
+        1,
+        "Test Lock",
+        push_lock._state_callback,
+    )
+    return push_lock, lock
+
+
 @pytest.mark.asyncio
 async def test_a_battery_frame_reaches_the_display_through_the_real_decoder() -> None:
     """Pin the only route from a battery frame to the display.
@@ -2350,20 +2325,7 @@ async def test_a_battery_frame_reaches_the_display_through_the_real_decoder() ->
     this drives a real captured frame through the real decoder into
     _update_any_state rather than stubbing either side.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:17",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:17", "lock"),
-        "0800200c9a66",
-        1,
-        "Test Lock",
-        push_lock._state_callback,
-    )
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:17")
 
     lock._internal_state_callback(bytes.fromhex("bb0200a50f00000079140000000000000200"))
 
@@ -2383,20 +2345,7 @@ async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> No
     through the real decoder into _update_any_state rather than stubbing
     either side.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:18",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:18", "lock"),
-        "0800200c9a66",
-        1,
-        "Test Lock",
-        push_lock._state_callback,
-    )
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:18")
 
     lock._internal_state_callback(bytes.fromhex("bb0200122e00000003000000000000000000"))
 
@@ -2415,23 +2364,12 @@ async def test_update_does_not_reconnect_on_a_setup_condition(
     only thing that records the condition. Without it a lock left in
     calibration or polarity discovery is diagnosable from nothing.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:16",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:16", always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
 
-    mock_lock = MagicMock()
+    mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
     mock_lock.lock_status = publishing_read(push_lock, reported)
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(return_value=None)
-    mock_lock.battery = publishing_read(
-        push_lock, BatteryState(voltage=6.0, percentage=80)
-    )
 
     with (
         caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
@@ -2458,13 +2396,7 @@ async def test_a_repeated_setup_condition_is_recorded_once(
     The warning sits inside the lock_state.lock != state guard, so a frame
     that repeats the held status records nothing, however many arrive.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:17",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:17", always_connected=False)
 
     with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
         push_lock._update_any_state([LockStatus.UNKNOWN_01])
@@ -2510,7 +2442,7 @@ async def test_a_short_advertisement_payload_is_skipped_not_parsed(
     parse used to index and unpack it unconditionally, so a truncated payload
     raised out of the callback the consumer dispatches from.
     """
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:28", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:28", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
 
     push_lock.update_advertisement(ble_device, _advertisement(manufacturer_data))
@@ -2530,7 +2462,7 @@ def _hap_payload(state_num: int) -> bytes:
 @pytest.mark.asyncio
 async def test_a_full_homekit_advertisement_still_reads_its_state_number() -> None:
     """The guard admits a payload long enough for the fields it reads."""
-    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
     ble_device = BLEDevice(push_lock.address, "Test Lock", None)
 
     push_lock.update_advertisement(
@@ -2565,24 +2497,10 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
     callback has to report that the lock is still answering and not only
     that it changed.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:30",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=True,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:30", always_connected=True)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
-    push_lock._advertisement_data = AdvertisementData(
-        local_name="Test Lock",
-        service_data={},
-        service_uuids=[],
-        rssi=-50,
-        manufacturer_data={},
-        platform_data=(),
-        tx_power=0,
-    )
+    push_lock._advertisement_data = _advertisement({})
 
     # Everything the cycle could read is already held at the value the lock
     # will answer with, so no read in the cycle changes any field.
@@ -2650,24 +2568,10 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
     AuthState(successful=True) and clears the consecutive-failure count that
     arms the reauth latch, whichever read it was.
     """
-    push_lock = PushLock(
-        address=address,
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock(address, always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
-    push_lock._advertisement_data = AdvertisementData(
-        local_name="Test Lock",
-        service_data={},
-        service_uuids=[],
-        rssi=-50,
-        manufacturer_data={},
-        platform_data=(),
-        tx_power=0,
-    )
+    push_lock._advertisement_data = _advertisement({})
 
     # At the reauth latch, so a reset is observable.
     for _ in range(AUTH_FAILURE_TO_START_REAUTH):

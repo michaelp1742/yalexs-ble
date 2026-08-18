@@ -308,11 +308,9 @@ class Lock:
                 return ()  # Ignore lock activity as these are historical events
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
-                    lock_status = state[0x08]
-                    return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
+                    return [self._parse_lock_status(state[0x08])]
                 if state[4] == StatusType.DOOR_ONLY.value:
-                    door_status = state[0x08]
-                    return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
+                    return [self._parse_door_status(state[0x08])]
                 if state[4] == StatusType.DOOR_AND_LOCK.value:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:

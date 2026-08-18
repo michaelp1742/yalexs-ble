@@ -96,15 +96,13 @@ async def test_the_answering_frame_reaches_the_callback_before_the_wait() -> Non
     """
     received: list[bytes] = []
     armed_at_hand_off: list[bool] = []
+    session = _make_session(received)
 
     def state_callback(data: bytes) -> None:
         received.append(data)
         armed_at_hand_off.append(session._notify_future is not None)
 
-    client = MagicMock(is_connected=True)
-    session = Session(client, "testlock", asyncio.Lock(), set(), state_callback)
-    session.decrypt = bytes  # type: ignore[method-assign, assignment]
-    session.cipher_encrypt = MagicMock(update=bytes)
+    session._state_callback = state_callback
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         session._notify(0, bytearray(READ_ACK))

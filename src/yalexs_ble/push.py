@@ -856,8 +856,22 @@ class PushLock:
         original_lock_status = lock_state.lock
         changes: dict[str, Any] = {}
         for state in states:
-            state_type = type(state)
-            self._seen_this_session.add(state_type)
+            if isinstance(state, BatteryState) and state.voltage <= 3.0:
+                # A refused reading must not stand as seen, so _poll_battery
+                # can ask again; the cooldown paces that next ask.
+                self._seen_this_session.discard(BatteryState)
+                self._earliest_battery_attempt_time = (
+                    time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
+                )
+                _LOGGER.warning(
+                    "%s: Battery voltage is impossible: %s; "
+                    "not asking again for %d seconds",
+                    self.name,
+                    state.voltage,
+                    BATTERY_TIMEOUT_COOLDOWN,
+                )
+                continue
+            self._seen_this_session.add(type(state))
             if isinstance(state, AuthState):
                 if lock_state.auth != state:
                     changes["auth"] = state
@@ -875,23 +889,6 @@ class PushLock:
                 if lock_state.door != state:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
-                if state.voltage <= 3.0:
-                    # BatteryState in _seen_this_session would stop
-                    # _poll_battery asking again after a reading that was
-                    # thrown away, so remove it and start the cooldown
-                    # instead.
-                    self._seen_this_session.discard(BatteryState)
-                    self._earliest_battery_attempt_time = (
-                        time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
-                    )
-                    _LOGGER.warning(
-                        "%s: Battery voltage is impossible: %s; "
-                        "not asking again for %d seconds",
-                        self.name,
-                        state.voltage,
-                        BATTERY_TIMEOUT_COOLDOWN,
-                    )
-                    continue
                 if lock_state.battery != state:
                     changes["battery"] = state
             elif isinstance(state, AutoLockState):
@@ -1153,12 +1150,9 @@ class PushLock:
 
         # The reads below are issued here, and _update_any_state processes each
         # answer, so the returned values are not used.
-        made_request = False
-
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        if await self._poll_battery(lock):
-            made_request = True
+        made_request = await self._poll_battery(lock)
 
         if (
             DoorStatus not in self._seen_this_session

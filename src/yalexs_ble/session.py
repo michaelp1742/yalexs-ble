@@ -238,12 +238,11 @@ class Session:
             return
         # Every frame that validates reaches _state_callback, the one answering
         # a read included, and it reaches it before the waiter below is resolved.
-        # PushLock's update cycle discards what its reads return and relies on
-        # that order, so moving this call after an await, or skipping it for
-        # the frame that answers a read, stops polled values from reaching
-        # the display with nothing logged. SecureSession inherits this method
-        # and is built without a state callback, which is why the call is
-        # guarded.
+        # Callers that discard what a read returns rely on that order, so moving
+        # this call after an await, or skipping it for the frame that answers a
+        # read, resumes a caller before its answer is applied. SecureSession
+        # inherits this method and is built without a state callback, which is
+        # why the call is guarded.
         if self._state_callback:
             self._state_callback(decrypted_data)
         if self._notify_future is None:
