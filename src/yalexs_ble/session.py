@@ -312,7 +312,10 @@ class Session:
             "%s: Receiving response via notify: %s (waiting=%s)",
             self.name,
             data.hex(),
-            bool(self._notify_future),
+            # A future left armed but already done is not a live wait: the
+            # slot is cleared by the waiter when it resumes, not at the
+            # moment the future resolves, so the two differ in that window.
+            self._notify_future is not None and not self._notify_future.done(),
         )
         if not data:
             # An empty notification is a transport artifact, not a frame off
@@ -409,6 +412,16 @@ class Session:
             progress.result = decrypted_data
         if (future := self._disarm_wait()) is not None and not future.done():
             future.set_result(decrypted_data)
+        else:
+            # The wait ended before this frame arrived, so nothing consumes it
+            # as an answer. The waiter reports its own timeout and that report
+            # is all a reader of the log would otherwise see, so the frame that
+            # would have answered it is named here.
+            _LOGGER.debug(
+                "%s: dropping the answer to a wait that already ended: %s",
+                self.name,
+                decrypted_data.hex(),
+            )
 
     def _encrypt_command(self, command: bytearray, command_name: str) -> None:
         # NOTE: The last two bytes are not encrypted
