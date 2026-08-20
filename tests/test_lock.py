@@ -489,6 +489,8 @@ def test_jammed_maps_to_the_settled_static_position_value() -> None:
 
 def _make_lock(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
+    *,
+    op_response_callback: Callable[[], None] | None = None,
 ) -> Lock:
     return Lock(
         lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
@@ -496,6 +498,7 @@ def _make_lock(
         1,
         "mylock",
         state_callback,
+        op_response_callback=op_response_callback,
     )
 
 
@@ -1159,6 +1162,8 @@ async def _spin_until(predicate: Callable[[], bool]) -> None:
 
 def _make_connected_lock_with_session(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
+    *,
+    op_response_callback: Callable[[], None] | None = None,
 ) -> Lock:
     """Build a connected Lock backed by a real Session over a mock BLE client.
 
@@ -1168,7 +1173,10 @@ def _make_connected_lock_with_session(
     place, so an operation driven through here completes only if its matchers
     read their expected bytes out of that buffer before the encryption.
     """
-    lock = _make_lock(state_callback)
+    lock = _make_lock(
+        state_callback,
+        op_response_callback=op_response_callback,
+    )
     client = MagicMock()
     client.is_connected = True
     client.write_gatt_char = AsyncMock()
@@ -1968,3 +1976,78 @@ async def test_the_awaited_opcode_is_armed_at_the_command_write() -> None:
     assert at_write == [None]
     assert at_hook == [Commands.LOCK.value]
     assert lock._awaited_operation_opcode is None
+
+
+def test_op_response_callback_fires_and_an_ack_carries_nothing() -> None:
+    """op_response_callback fires per op-response; an operation ack does not.
+
+    The op-response hook fires for both a success and a failure result,
+    independent of whatever state the parse emits. An operation ack is
+    recognized and emits no state, and reaches no hook.
+    """
+    op_calls: list[int] = []
+    lock = _make_lock(op_response_callback=lambda: op_calls.append(1))
+
+    lock_ack = lock._parse_state(bytes.fromhex("aa0b00490000000000000000000000000200"))
+    unlock_ack = lock._parse_state(
+        bytes.fromhex("aa0a004a0000000000000000000000000200")
+    )
+
+    assert lock_ack is not None
+    assert unlock_ack is not None
+    assert list(lock_ack) == []
+    assert list(unlock_ack) == []
+    assert op_calls == []  # acks are not op-responses
+
+    # A success op-response (byte[15]=0x00) and a failure one (byte[15]=0x1F)
+    # both stamp op_response_callback, regardless of the emitted state. A
+    # success only ever answers a command of ours, so the opcode is armed for
+    # it; a failure also arrives for an operation started at the lock or in
+    # the app, which is the unarmed frame here.
+    lock._awaited_operation_opcode = Commands.UNLOCK.value
+    success = lock._parse_state(bytes.fromhex("bb0a003b0000000000000000000000000000"))
+    lock._awaited_operation_opcode = None
+    failure = lock._parse_state(bytes.fromhex("bb0a001c00000000000000000000001f0000"))
+
+    assert op_calls == [1, 1]
+    assert success is not None
+    assert failure is not None
+    assert list(success) == []
+    assert list(failure) == [LockStatus.JAMMED]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_stream_hook_does_not_abort_the_operation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hook that raises is contained and the operation still completes.
+
+    The hook runs while the frame is being parsed, and the session parses a
+    frame before it resolves the wait that frame answers, so an exception
+    escaping it would cost an operation that succeeded its op-response: the
+    wait would run out its budget and report the result as never delivered.
+    """
+    calls: list[str] = []
+
+    def _boom() -> None:
+        calls.append("op_response_callback")
+        raise RuntimeError("hook bug")
+
+    lock = _make_connected_lock_with_session(op_response_callback=_boom)
+    session = lock.session
+    assert session is not None
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(0, bytearray(bytes.fromhex(_LOCK_ACK_HEX)))
+        await asyncio.sleep(0)
+        session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
+
+    feeder = asyncio.create_task(feed())
+    with caplog.at_level("ERROR", logger="yalexs_ble.lock"):
+        await lock.force_lock()
+    await feeder
+
+    assert calls == ["op_response_callback"]
+    assert "op_response_callback raised, continuing to parse the frame" in caplog.text
+    assert "hook bug" in caplog.text

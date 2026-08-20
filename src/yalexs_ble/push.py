@@ -82,7 +82,16 @@ FIRST_CONNECTION_DISCONNECT_TIME = 2.1
 
 # After a lock operation we need to wait for the lock to
 # update its state or it will return a stale state.
+# Raised from 3 s to 4.0 s to 6.1 s across #111, #112 and #113, the last
+# noting that further testing showed the previous value still too low.
+# The reported symptom is home-assistant/core#90271, where a lock answered
+# the poll after an operation with the position it had left.
 LOCK_STALE_STATE_DEBOUNCE_DELAY = 6.1
+
+# How long to hold polls off the lock after an op-response for an operation
+# we did not issue. An operation of ours stamps the longer hold at its exit,
+# from a later moment, and the floor only moves forward.
+POST_OP_RESPONSE_DEBOUNCE_DELAY = 4.1
 
 # How long to wait before processing an advertisement change
 ADV_UPDATE_COALESCE_SECONDS = 0.05
@@ -149,6 +158,17 @@ POSITION_READINGS = frozenset(
         LockStatus.JAMMED,
         LockStatus.UNKNOWN_01,
         LockStatus.UNKNOWN_06,
+    }
+)
+
+# The statuses in play while the motor is running, SECURING included:
+# the lock never reports it, but securemode() stamps it at write-success.
+TRANSITIONAL_READINGS = frozenset(
+    {
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+        LockStatus.SECURING,
     }
 )
 
@@ -604,6 +624,7 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            op_response_callback=self._op_response_callback,
         )
 
     def _disconnected_callback(self) -> None:
@@ -886,6 +907,10 @@ class PushLock:
         finally:
             self._operation_window_open = True
 
+    def _op_response_callback(self) -> None:
+        """Hold update cycles off the lock when an op-response arrives."""
+        self._hold_update(POST_OP_RESPONSE_DEBOUNCE_DELAY)
+
     def _close_operation_window(self) -> None:
         """Close the operation window and drop everything it recorded.
 
@@ -920,7 +945,7 @@ class PushLock:
         # outlive a stop. Stamped before the stop check, so a watcher
         # started again on this instance inherits them.
         self._force_lock_status_poll = True
-        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
         if not self._running:
             # Stopped mid-operation: the window is closed, but the actions
             # below would arm timers on a lock nothing is watching.
@@ -1006,8 +1031,17 @@ class PushLock:
         here. None refuses the value outright: the caller applies nothing
         from it, so a refused status cannot reach _project_lock_status
         either and the secure lock keeps its display. The status on display
-        is what the hold below is holding, so it is read here too.
+        is what the hold below is holding, so it is read here too. A value
+        saying the mechanism is moving holds the next poll off before any of
+        that, since the motion is a fact about the lock and not a display
+        decision.
         """
+        if incoming in TRANSITIONAL_READINGS:
+            # The mechanism is moving, and it is moving whatever the display
+            # decisions below make of the value, so the next poll is held off
+            # ahead of them: a lock polled while the motor runs answers with
+            # the position it is leaving.
+            self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
         if self._operation_window_open:
             # No received lock status is accepted between write-success and
             # op-response; the operation applies its own outcome. Door and
@@ -1860,6 +1894,17 @@ class PushLock:
             ) from ex
         finally:
             self._first_update_future = None
+
+    def _hold_update(self, seconds: float) -> None:
+        """Hold scheduled update cycles off the lock for seconds from now.
+
+        _earliest_update_time only ever moves later: an op-response asking
+        for its shorter hold must not pull a poll back inside the window the
+        write-success stamp before it claimed.
+        """
+        self._earliest_update_time = max(
+            self._earliest_update_time, time.monotonic() + seconds
+        )
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""

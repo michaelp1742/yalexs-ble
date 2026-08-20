@@ -239,6 +239,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        op_response_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -251,6 +252,10 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # Called when a LOCK/UNLOCK op-response is parsed, whoever issued
+        # the command. Externally started operations mostly produce none;
+        # a failure report is the exception.
+        self._op_response_callback = op_response_callback
         # byte[15] of the most recent op-response: 0x00 success, non-zero =
         # OperationError enum value (MECH_* = jam). None until the first op.
         # Retained so a follow-up can expose the failure reason as a
@@ -346,6 +351,22 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
+    def _run_stream_hook(self, hook: Callable[[], None] | None, hook_name: str) -> None:
+        """Run a notify-stream hook, containing anything it raises.
+
+        An escaping exception would cost the frame its state update and
+        abandon a staged wait mid-operation. A raising hook is a bug in
+        the caller, which is why it is surfaced at ERROR.
+        """
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            _LOGGER.exception(
+                "%s: %s raised, continuing to parse the frame", self.name, hook_name
+            )
+
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
         if state[0] == 0xBB:
             # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
@@ -355,6 +376,9 @@ class Lock:
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
                 and len(state) > 0x0F
             ):
+                self._run_stream_hook(
+                    self._op_response_callback, "op_response_callback"
+                )
                 result = state[0x0F]
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
@@ -401,7 +425,8 @@ class Lock:
         elif state[0] == 0xAA:
             if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
                 # Operation acknowledgment: byte[1] matches the command and
-                # the frame carries no result and no state.
+                # the frame carries no result and no state, so recognize it
+                # and move on rather than logging an unknown frame.
                 return ()
             if state[1] in (
                 Commands.READSETTING.value,
