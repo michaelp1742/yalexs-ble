@@ -117,6 +117,13 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long a jam or setup condition stays on display, the hold armed once,
+# when one arrives over a display showing none of them. Polls after a jam
+# may return a plain position and nothing announces the condition's end, so
+# without the hold a user may never see it. 30 s is a reasonable minimum
+# time for a user interface to hold the status on display.
+JAMMED_HOLD_TIME = 30.0
+
 # How long to wait and check again while an operation is in flight: an
 # update cycle created then would run the instant the operation ends, while
 # the lock still reports a stale state.
@@ -365,10 +372,12 @@ class PushLock:
     """A lock with push updates."""
 
     # mypy takes the type of an attribute from its assignment, and
-    # _init_operation_state assigns these fields nothing but None, so without
-    # these declarations the inferred type would be None.
+    # _init_operation_state and _init_jam_state assign these fields nothing
+    # but None, so without these declarations the inferred type would be
+    # None.
     _pending_op_state: LockStatus | None
     _operation_outcome: LockStatus | None
+    _seen_intervention_status: LockStatus | None
 
     def __init__(
         self,
@@ -423,22 +432,16 @@ class PushLock:
         self._first_update_future: asyncio.Future[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._init_operation_state()
-        # A status needing someone at the lock that the window filter dropped,
-        # kept until the operation can apply it. The status itself, not a flag,
-        # so the operation applies the one the lock reported rather than a
-        # stand-in for it. Survives a reconnect, since a mechanism needing
-        # attention outlives the link that reported it.
-        self._seen_intervention_status: LockStatus | None = None
-        # A scheduled status poll owes one lock_status() read that
-        # _seen_this_session may not suppress: the reading it holds can be the very
-        # one the poll exists to replace. Not reset on reconnect, since it is
-        # an obligation, not session state.
+        # When set, one lock_status() call is owed that _seen_this_session
+        # may not suppress, since that set may hold the very reading the
+        # poll must replace. It survives reconnect: an obligation, not
+        # session state.
         self._force_lock_status_poll = False
-        # Earliest moment an update cycle may read the lock. Every scheduled cycle is
-        # held to it, so a read cannot be taken while the reported state is
-        # still settling, whichever path scheduled the cycle and however short
-        # the debounce made it. Not reset on reconnect: a mechanism still
-        # moving does not care which link watches it.
+        self._init_jam_state()
+        # The earliest moment an update cycle may poll the lock; every
+        # scheduled cycle is held to it, however it was scheduled. It
+        # survives reconnect: the mechanism does not care which link
+        # watches it.
         self._earliest_update_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
@@ -852,19 +855,23 @@ class PushLock:
             self._finalize_operation()
 
     def _operation_write_success(self) -> None:
-        """The command write reached the lock: the single state-action moment.
+        """Stamp the operation's transitional state and open the operation window.
 
-        Order matters: stamp the operation's transitional while the window is
-        still closed, so the stamp passes the filter. The window then opens in
-        a finally, because the session contains an exception from this hook
-        and runs the staged wait to its end: a stamp that raised must not
-        leave the whole operation running with the window closed.
-
-        Clearing _seen_intervention_status is a backstop, so no record
-        reaches a new command's write-success. A record that did reach here
-        would be superseded anyway: the command a caller issued after it is the
-        intervention the status calls for, and its outcome is the newer truth.
+        Runs when the command write reaches the lock. Order matters:
+        release the display hold first (a new operation supersedes it),
+        then stamp the transitional while the window is still closed, so
+        the stamp passes the window filter in _admit_lock_status. The
+        window then opens in a finally, because the session contains an
+        exception from this hook and runs the staged wait to its end: a
+        stamp that raised must not leave the whole operation running with
+        the window closed. Clearing _seen_intervention_status is a backstop.
         """
+        if time.monotonic() < self._jammed_hold_deadline:
+            _LOGGER.debug(
+                "%s: New operation write succeeded; releasing the display hold",
+                self.name,
+            )
+        self._release_jam_hold()
         self._seen_intervention_status = None
         try:
             if self._pending_op_state is not None:
@@ -910,33 +917,91 @@ class PushLock:
         self._force_lock_status_poll = True
         self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
         if not self._running:
-            # The watcher was stopped while this operation was in flight. The
-            # window is closed above so the object is left consistent, but
-            # scheduling a cycle now would arm a timer holding the lock past the
-            # stop, with nothing left to run it and no consumer listening.
+            # Stopped mid-operation: the window is closed, but the actions
+            # below would arm timers on a lock nothing is watching.
             return
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
-        # A settled pair waits the keep-alive; an unsettled one polls at
-        # the stale-state debounce, the earliest a poll answers with the
-        # motor stopped. The two motion values are the only transitional
-        # readings the projection publishes on the secure channel.
-        if self.lock_status in POSITION_READINGS and self.secure_status not in (
-            LockStatus.LOCKING,
-            LockStatus.UNLOCKING,
-        ):
-            delay = KEEP_ALIVE_TIME
-        else:
-            delay = LOCK_STALE_STATE_DEBOUNCE_DELAY
-        self._schedule_future_update_with_debounce(delay)
+        # A live hold schedules nothing here; its timer polls the lock at
+        # the deadline.
+        if time.monotonic() >= self._jammed_hold_deadline:
+            # A settled pair waits the keep-alive; an unsettled one polls at
+            # the stale-state debounce, the earliest a poll answers with the
+            # motor stopped. The two motion values are the only transitional
+            # readings the projection publishes on the secure channel.
+            if self.lock_status in POSITION_READINGS and self.secure_status not in (
+                LockStatus.LOCKING,
+                LockStatus.UNLOCKING,
+            ):
+                delay = KEEP_ALIVE_TIME
+            else:
+                delay = LOCK_STALE_STATE_DEBOUNCE_DELAY
+            self._schedule_future_update_with_debounce(delay)
 
-    def _admit_lock_status(self, incoming: LockStatus) -> LockStatus | None:
+    def _init_jam_state(self) -> None:
+        """Initialize the fields behind the display hold.
+
+        The hold deadline and its timer survive reconnects (the mechanism
+        outlives the link that reported it) but not a stop (see _cancel).
+        _seen_intervention_status holds the status the operation window
+        filtered out, until the operation applies it at its exit.
+        """
+        self._jammed_hold_deadline = NEVER_TIME
+        self._jam_hold_timer: asyncio.TimerHandle | None = None
+        self._seen_intervention_status = None
+
+    def _arm_jam_hold(self, now: float) -> None:
+        """Set the hold deadline and arm the timer that ends the hold.
+
+        The deadline and the timer are written as a pair, so a live
+        deadline always has a timer coming to end it.
+        """
+        self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
+        self._schedule_jam_hold_timer(JAMMED_HOLD_TIME)
+
+    def _schedule_jam_hold_timer(self, delay: float) -> None:
+        """Arm the hold-ending timer, replacing any armed one."""
+        self._cancel_jam_hold_timer()
+        self._jam_hold_timer = self.loop.call_later(delay, self._jam_hold_ended)
+
+    def _cancel_jam_hold_timer(self) -> None:
+        """Cancel the hold-ending timer if one is armed."""
+        if self._jam_hold_timer:
+            self._jam_hold_timer.cancel()
+            self._jam_hold_timer = None
+
+    def _release_jam_hold(self) -> None:
+        """Clear the hold deadline and cancel its timer."""
+        self._jammed_hold_deadline = NEVER_TIME
+        self._cancel_jam_hold_timer()
+
+    def _jam_hold_ended(self) -> None:
+        """The display hold has ended: the held status is now a guess, so
+        poll the lock.
+        """
+        # The handle that ran this callback is spent.
+        self._jam_hold_timer = None
+        if self._operation_lock.locked():
+            # A cycle armed here would sit in the deferred-update slot, and
+            # the debounce would displace the delay the operation's exit
+            # chooses. The timer retries instead.
+            self._schedule_jam_hold_timer(DEADLINE_WAKEUP_RETRY_DELAY)
+            return
+        # Remove LockStatus so the cycle asks the lock instead of trusting
+        # the held value.
+        self._seen_this_session.discard(LockStatus)
+        self._schedule_future_update_with_debounce(0)
+
+    def _admit_lock_status(
+        self, incoming: LockStatus, current: LockStatus
+    ) -> LockStatus | None:
         """Decide the displayed lock status for an incoming value.
 
         Every incoming lock status, polled or pushed, must pass through
         here. None refuses the value outright: the caller applies nothing
         from it, so a refused status cannot reach _project_lock_status
-        either and the secure lock keeps its display.
+        either and the secure lock keeps its display. The status on display
+        is what the hold below is holding, so it is read here too.
         """
         if self._operation_window_open:
             # No received lock status is accepted between write-success and
@@ -950,6 +1015,35 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Operation in flight, not accepting lock status %s",
                 self.name,
+                incoming,
+            )
+            return None
+        now = time.monotonic()
+        if incoming in MANUAL_INTERVENTION_STATUSES:
+            if current not in MANUAL_INTERVENTION_STATUSES:
+                # The hold is armed once, when the status arrives over a
+                # display showing no status needing attention; a further
+                # report while one is displayed arms no new hold. Re-arming
+                # would make the deadline poll permanent, one fresh
+                # connection per hold on a lock that is not always
+                # connected; past the one hold the status is refreshed the
+                # way any other state is.
+                _LOGGER.debug(
+                    "%s: Holding %s on display for %s seconds",
+                    self.name,
+                    incoming,
+                    JAMMED_HOLD_TIME,
+                )
+                self._arm_jam_hold(now)
+            return incoming
+        if current in MANUAL_INTERVENTION_STATUSES and now < self._jammed_hold_deadline:
+            # Refused on purpose, a requested refresh included: the polls
+            # that follow a jam report a plain position the mechanism is
+            # not in.
+            _LOGGER.debug(
+                "%s: Holding %s, not accepting lock status %s",
+                self.name,
+                current,
                 incoming,
             )
             return None
@@ -1180,11 +1274,9 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                # Route every incoming lock status through the policy before the
-                # equality check, so the admission filter is the single authority
-                # for the displayed value. A repeated identical reading is put
-                # through it too rather than short-circuited.
-                admitted = self._admit_lock_status(state)
+                # Admission runs before the equality check, so a repeated
+                # reading still reaches the discard below.
+                admitted = self._admit_lock_status(state, lock_state.lock)
                 if admitted not in POSITION_READINGS:
                     # A display left on anything but a settled position must
                     # not suppress the follow-up poll, so LockStatus is
@@ -1722,6 +1814,13 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        # Release the hold with its timer: a stopped watcher has no
+        # display, and a leftover deadline would mask the status on a
+        # restarted watcher with no timer to end it. A status frame
+        # arriving between here and the disconnect may arm the hold again,
+        # and the update cycle that timer schedules is dropped by
+        # _execute_deferred_update, which returns while _running is False.
+        self._release_jam_hold()
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
