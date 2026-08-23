@@ -2642,6 +2642,7 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
         auth=AuthState(successful=True),
         auto_lock=None,
         auto_lock_prev=None,
+        secure=LockStatus.UNLOCKED,
     )
     push_lock._seen_this_session.add(DoorStatus)
     push_lock._seen_this_session.add(BatteryState)
@@ -2752,8 +2753,15 @@ def _operational_push_lock(address: str = "aa:bb:cc:dd:ee:50") -> PushLock:
     return push_lock
 
 
-def _known_state(lock: LockStatus, door: DoorStatus = DoorStatus.CLOSED) -> LockState:
-    """A settled cycle state, so an operation starts from a known position."""
+def _known_state(
+    lock: LockStatus,
+    door: DoorStatus = DoorStatus.CLOSED,
+    secure: LockStatus = LockStatus.UNLOCKED,
+) -> LockState:
+    """A settled cycle state, so an operation starts from a known position.
+
+    The secure lock defaults to not secured.
+    """
     return LockState(
         lock=lock,
         door=door,
@@ -2761,6 +2769,7 @@ def _known_state(lock: LockStatus, door: DoorStatus = DoorStatus.CLOSED) -> Lock
         auth=None,
         auto_lock=None,
         auto_lock_prev=None,
+        secure=secure,
     )
 
 
@@ -2792,6 +2801,333 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
     getattr(mock_lock, op_attr).assert_awaited_once()
     assert push_lock.lock_status == complete_state
+
+
+@pytest.mark.asyncio
+async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
+    """Securing an already-locked lock moves the secure lock and not the main.
+
+    The stamped SECURING never publishes; the projection turns it into the
+    pair. The main lock holds at LOCKED and then settles at SECUREMODE, so
+    it cannot run the phantom locked -> locking -> locked cycle a LOCKING
+    stamp caused, while the secure lock runs its own securing transitional.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:60")
+    emissions: list[tuple[LockStatus, LockStatus]] = []
+    push_lock.register_callback(
+        lambda ls, li, ci: emissions.append((ls.lock, ls.secure))
+    )
+
+    # The lock is already locked when securemode is commanded.
+    push_lock._update_any_state([LockStatus.LOCKED])
+    assert emissions == [(LockStatus.LOCKED, LockStatus.UNLOCKED)]
+
+    async def force_securemode(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()
+        # The previous operation's settled push can still land inside this
+        # window; it is refused outright, so neither channel moves off the
+        # stamped pair.
+        push_lock._state_callback([LockStatus.LOCKED])
+
+    mock_lock = MagicMock()
+    mock_lock.force_securemode = force_securemode
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.securemode()
+
+    # The main lock never shows LOCKING, so it cannot flap, and the secure
+    # lock runs unlocked -> locking -> locked.
+    assert emissions == [
+        (LockStatus.LOCKED, LockStatus.UNLOCKED),
+        (LockStatus.LOCKED, LockStatus.LOCKING),
+        (LockStatus.SECUREMODE, LockStatus.LOCKED),
+    ]
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "operation", "op_attr", "expected"),
+    [
+        (
+            (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            "lock",
+            "force_lock",
+            [
+                (LockStatus.LOCKING, LockStatus.UNLOCKED),
+                (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+        (
+            (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            "securemode",
+            "force_securemode",
+            [
+                (LockStatus.LOCKED, LockStatus.LOCKING),
+                (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            ],
+        ),
+        (
+            (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            "securemode",
+            "force_securemode",
+            [
+                (LockStatus.LOCKING, LockStatus.LOCKING),
+                (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            ],
+        ),
+        (
+            (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            "securemode",
+            "force_securemode",
+            [
+                (LockStatus.SECUREMODE, LockStatus.LOCKING),
+                (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            ],
+        ),
+        (
+            (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            "unlock",
+            "force_unlock",
+            [
+                (LockStatus.UNLOCKING, LockStatus.UNLOCKED),
+                (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+        (
+            (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            "unlock",
+            "force_unlock",
+            [
+                (LockStatus.UNLOCKING, LockStatus.UNLOCKING),
+                (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+    ],
+    ids=[
+        "lock_unlocked_to_locked",
+        "securemode_locked_to_secured",
+        "securemode_unlocked_to_secured",
+        "securemode_already_secured_moves_only_secure",
+        "unlock_locked_to_unlocked",
+        "unlock_secured_to_unlocked",
+    ],
+)
+async def test_secure_projection_invariant_table(
+    start: tuple[LockStatus, LockStatus],
+    operation: str,
+    op_attr: str,
+    expected: list[tuple[LockStatus, LockStatus]],
+) -> None:
+    """Every operation publishes its own pair for the two logical locks.
+
+    One reported status feeds both, so this table is the invariant. The main
+    lock keeps its present vocabulary, SECUREMODE as the settled secured
+    position and a transitional only where the position itself has to change, and the
+    secure lock reads secured or not secured with transitionals of its own.
+    Each row drives the real operation and records every published pair.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:61")
+    push_lock._lock_state = _known_state(start[0], secure=start[1])
+    emissions: list[tuple[LockStatus, LockStatus]] = []
+    push_lock.register_callback(
+        lambda ls, li, ci: emissions.append((ls.lock, ls.secure))
+    )
+
+    async def force_operation(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()
+
+    mock_lock = MagicMock()
+    setattr(mock_lock, op_attr, force_operation)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update"),
+    ):
+        await getattr(push_lock, operation)()
+
+    assert emissions == expected
+    # The synthetic SECURING is consumed by the projection: no published
+    # value on either channel ever carries it.
+    assert all(LockStatus.SECURING not in pair for pair in emissions)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_settled_securemode_push_is_not_a_securing_transitional() -> None:
+    """A SECUREMODE push outside an operation is a settled secured position.
+
+    Only securemode() produces SECURING, so a reported SECUREMODE needs no
+    other discriminator: the pair settles at secured at once.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:63")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    push_lock._state_callback([LockStatus.SECUREMODE])
+
+    assert push_lock.lock_status is LockStatus.SECUREMODE
+    assert push_lock.secure_status is LockStatus.LOCKED
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_plain_locking_reads_not_secured() -> None:
+    """A plain lock() out of Secured reads the secure lock as not secured.
+
+    Only a reported SECUREMODE proves the lock is secured, so a plain
+    LOCKING drops the secure lock to unlocked whatever it held; the settled
+    SECUREMODE that follows a securing motion re-secures it.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:69")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+
+    push_lock._pending_op_state = LockStatus.LOCKING
+    push_lock._operation_write_success()
+
+    assert push_lock.lock_status is LockStatus.LOCKING
+    assert push_lock.secure_status is LockStatus.UNLOCKED
+
+
+@pytest.mark.asyncio
+async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
+    """A stamped SECURING must not suppress the follow-up status poll.
+
+    SECURING is the library's own transitional and the motor is running
+    while it stands, so the reading that replaces it can only come from the
+    poll the operation schedules at its exit. Recording LockStatus as seen
+    this session would suppress that poll's read.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6a")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    push_lock._update_any_state([LockStatus.SECURING], arm_resync=False)
+
+    assert push_lock.secure_status is LockStatus.LOCKING
+    assert LockStatus not in push_lock._seen_this_session
+
+
+@pytest.mark.asyncio
+async def test_window_filter_refusal_leaves_the_secure_lock_alone() -> None:
+    """A status refused by the window filter never reaches the projection.
+
+    Part way through an unlock out of Secured the published pair is
+    (UNLOCKING, UNLOCKING). The filter returns None for a refused value, so
+    nothing is projected from it. Projecting it instead would read the
+    settled reading as "the lock is not secured" and drop the secure lock to
+    unlocked while the motor is still running.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+    push_lock._pending_op_state = LockStatus.UNLOCKING
+    push_lock._operation_write_success()
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.UNLOCKING,
+        LockStatus.UNLOCKING,
+    )
+
+    # The previous operation's settled push arriving inside the window is
+    # refused, so the pair stands.
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.UNLOCKING,
+        LockStatus.UNLOCKING,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retried_unlock_keeps_the_secure_transitional() -> None:
+    """A second write-success projects the same UNLOCKING again.
+
+    Every attempt stamps its own transitional at write-success, so one
+    unlock can project UNLOCKING more than once. Taking LOCKED alone as
+    evidence that the lock was secured would make the second stamp answer
+    "not secured" and end the transitional with the motor still running.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:65")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+
+    # Attempt 1 writes, then fails retryably: the window closes and the
+    # transitional stays on display with nothing stamped over it.
+    push_lock._pending_op_state = LockStatus.UNLOCKING
+    push_lock._operation_write_success()
+    push_lock._close_operation_window()
+    assert push_lock.secure_status is LockStatus.UNLOCKING
+
+    # Attempt 2 writes and stamps the same pending state.
+    push_lock._pending_op_state = LockStatus.UNLOCKING
+    push_lock._operation_write_success()
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.UNLOCKING,
+        LockStatus.UNLOCKING,
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_securemode_after_write_stamps_unknown() -> None:
+    """A securemode that dies after its write settles the pair at UNKNOWN.
+
+    The write reached the lock and no op-response followed, so nothing said
+    where the mechanism stopped. The transitional the write stamped is not a
+    position, and the operation replaces it with the unknown one, which the
+    projection carries to both channels.
+    """
+    exc = OperationIncompleteError("no op-response")
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:66")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    mock_lock = MagicMock()
+
+    async def force_securemode(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()  # opens window, publishes (LOCKED, LOCKING)
+        raise exc
+
+    mock_lock.force_securemode = force_securemode
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(type(exc)),
+    ):
+        await push_lock.securemode()
+
+    assert push_lock._operation_window_open is False
+    assert push_lock.lock_status is LockStatus.UNKNOWN
+    assert push_lock.secure_status is LockStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secure", "expected_delay"),
+    [
+        (LockStatus.LOCKING, LOCK_STALE_STATE_DEBOUNCE_DELAY),
+        (LockStatus.UNLOCKED, KEEP_ALIVE_TIME),
+    ],
+    ids=["secure_transitional_polls_at_the_debounce", "settled_pair_keeps_alive"],
+)
+async def test_operation_exit_delay_follows_the_displayed_pair(
+    secure: LockStatus, expected_delay: float
+) -> None:
+    """The exit poll delay reads the pair, not the main lock alone.
+
+    A cancelled securemode out of locked leaves (LOCKED, LOCKING) on
+    display: the main lock holds a position, but the secure transitional is
+    unresolved and only a read can settle it, so the poll runs at the settle
+    debounce rather than waiting a keep-alive interval.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:67")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED, secure=secure)
+
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock._finalize_operation()
+
+    schedule.assert_called_once_with(expected_delay)
 
 
 @pytest.mark.asyncio

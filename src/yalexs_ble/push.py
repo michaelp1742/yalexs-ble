@@ -316,6 +316,46 @@ def retry_bluetooth_connection_error(
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+def _project_lock_status(
+    reported: LockStatus,
+    main: LockStatus,
+    secure: LockStatus,
+) -> tuple[LockStatus, LockStatus]:
+    """Project the physical lock's status onto the logical main and secure
+    lock statuses.
+
+    The physical lock maintains a single status, but to include the
+    transitional states for both logical locks we need an additional lock
+    status channel for the secure lock. To maintain backward compatibility
+    the main lock keeps SECUREMODE as its settled secured position. The
+    internal state SECURING is the equivalent of the main lock's LOCKING
+    state. The model has no Secured to Locked transition.
+    """
+    if reported is LockStatus.SECURING:
+        # SECURING: if the main lock is already locked it stays locked.
+        # Any other state shows LOCKING on both channels.
+        if main in (LockStatus.LOCKED, LockStatus.SECUREMODE):
+            return main, LockStatus.LOCKING
+        return LockStatus.LOCKING, LockStatus.LOCKING
+    if reported is LockStatus.SECUREMODE:
+        return LockStatus.SECUREMODE, LockStatus.LOCKED
+    if reported is LockStatus.LOCKING:
+        # A plain lock(): the main lock is moving, the secure lock is not.
+        return reported, LockStatus.UNLOCKED
+    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING):
+        # The secure lock is moving only if it was secured, or was already
+        # unlocking.
+        if secure in (LockStatus.LOCKED, LockStatus.UNLOCKING):
+            return reported, LockStatus.UNLOCKING
+        return reported, LockStatus.UNLOCKED
+    if reported in (LockStatus.LOCKED, LockStatus.UNLOCKED, LockStatus.UNLATCHED):
+        # The lock may be locked, but it is not Secured.
+        return reported, LockStatus.UNLOCKED
+    # JAMMED, UNKNOWN, and the setup conditions are faults of the whole lock,
+    # so both channels carry them.
+    return reported, reported
+
+
 class PushLock:
     """A lock with push updates."""
 
@@ -453,6 +493,11 @@ class PushLock:
     def lock_status(self) -> LockStatus:
         """Return the current lock status."""
         return self._lock_state.lock if self._lock_state else LockStatus.UNKNOWN
+
+    @property
+    def secure_status(self) -> LockStatus:
+        """Return the current status of the secure lock."""
+        return self._lock_state.secure if self._lock_state else LockStatus.UNKNOWN
 
     @property
     def battery(self) -> BatteryState | None:
@@ -733,7 +778,7 @@ class PushLock:
     async def securemode(self) -> None:
         """Set the lock into securemode."""
         await self._run_lock_operation(
-            "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
+            "force_securemode", LockStatus.SECURING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
@@ -839,22 +884,26 @@ class PushLock:
             self._update_any_state([outcome], arm_resync=False)
         self._force_lock_status_poll = True
         self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
-        # A settled status waits the keep-alive; an unsettled one polls at
+        # A settled pair waits the keep-alive; an unsettled one polls at
         # the stale-state debounce, the earliest a poll answers with the
-        # motor stopped.
-        if self.lock_status in POSITION_READINGS:
+        # motor stopped. The two motion values are the only transitional
+        # readings the projection publishes on the secure channel.
+        if self.lock_status in POSITION_READINGS and self.secure_status not in (
+            LockStatus.LOCKING,
+            LockStatus.UNLOCKING,
+        ):
             delay = KEEP_ALIVE_TIME
         else:
             delay = LOCK_STALE_STATE_DEBOUNCE_DELAY
         self._schedule_future_update_with_debounce(delay)
 
-    def _admit_lock_status(
-        self, incoming: LockStatus, current: LockStatus
-    ) -> LockStatus:
+    def _admit_lock_status(self, incoming: LockStatus) -> LockStatus | None:
         """Decide the displayed lock status for an incoming value.
 
         Every incoming lock status, polled or pushed, must pass through
-        here.
+        here. None refuses the value outright: the caller applies nothing
+        from it, so a refused status cannot reach _project_lock_status
+        either and the secure lock keeps its display.
         """
         if self._operation_window_open:
             # No received lock status is accepted between write-success and
@@ -870,7 +919,7 @@ class PushLock:
                 self.name,
                 incoming,
             )
-            return current
+            return None
         return incoming
 
     # The decorator retries only AuthError and RETRYABLE_EXCEPTIONS; the
@@ -1047,6 +1096,7 @@ class PushLock:
             self.auth,
             self.auto_lock,
             self.auto_lock_prev,
+            self.secure_status,
         )
 
     def _update_any_state(
@@ -1092,23 +1142,33 @@ class PushLock:
                 # equality check, so the admission filter is the single authority
                 # for the displayed value. A repeated identical reading is put
                 # through it too rather than short-circuited.
-                admitted = self._admit_lock_status(state, lock_state.lock)
+                admitted = self._admit_lock_status(state)
                 if admitted not in POSITION_READINGS:
                     # A display left on anything but a settled position must
                     # not suppress the follow-up poll, so LockStatus is
-                    # removed from _seen_this_session. A refused reading
-                    # leaves the operation's transitional standing, so it
-                    # reaches here too.
+                    # removed from _seen_this_session.
                     self._seen_this_session.discard(type(state))
-                if lock_state.lock != admitted:
-                    if admitted in SETUP_CONDITION_STATUSES:
+                if admitted is None:
+                    continue
+                # The projection runs on every admitted status, not only on
+                # one that moves the main lock: a securemode command given
+                # to an already-locked lock leaves lock at LOCKED, so gating
+                # the secure value on a changed lock would publish no
+                # securing transitional at all.
+                main, secure = _project_lock_status(
+                    admitted, lock_state.lock, lock_state.secure
+                )
+                if lock_state.lock != main:
+                    if main in SETUP_CONDITION_STATUSES:
                         _LOGGER.warning(
                             "%s: Lock reports %s, a setup condition that ends "
                             "at the lock by hand",
                             self.name,
-                            admitted,
+                            main,
                         )
-                    changes["lock"] = admitted
+                    changes["lock"] = main
+                if lock_state.secure != secure:
+                    changes["secure"] = secure
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
