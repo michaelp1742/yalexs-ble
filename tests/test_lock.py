@@ -217,6 +217,62 @@ def test_parse_getstatus_staticposition() -> None:
     assert list(result) == [LockStatus.JAMMED]
 
 
+@pytest.mark.parametrize(
+    ("frame_hex", "expected"),
+    [
+        # Synthetic frames built to the GETSTATUS layout; not captured
+        # device frames.
+        ("bb0200380200000009000000000000000000", LockStatus.UNLATCHING),
+        ("bb020037020000000a000000000000000000", LockStatus.UNLATCHED),
+    ],
+    ids=["unlatching", "unlatched"],
+)
+def test_parse_getstatus_unlatch_states(frame_hex: str, expected: LockStatus) -> None:
+    """A GETSTATUS position of 0x09 or 0x0A decodes to the unlatch states.
+
+    Both decoded as UNKNOWN while the two members were commented out of
+    LockStatus, since VALUE_TO_LOCK_STATUS is derived from that enum.
+    """
+    lock = _make_lock()
+
+    result = lock._parse_state(bytes.fromhex(frame_hex))
+
+    assert result is not None
+    assert list(result) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "diagnostic_logged"),
+    [
+        (0x09, LockStatus.UNLATCHING, False),
+        (0x0A, LockStatus.UNLATCHED, False),
+        (0x08, LockStatus.UNKNOWN, True),
+    ],
+    ids=["unlatching", "unlatched", "still_unmapped"],
+)
+def test_parse_lock_status_decodes_the_unlatch_states(
+    value: int,
+    expected: LockStatus,
+    diagnostic_logged: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shared decode takes the two values, and stops logging them.
+
+    _parse_lock_status has four call sites: the GETSTATUS LOCK_ONLY branch,
+    the DOOR_AND_LOCK branch, the activity LOCK record's status byte, and the
+    low nibble of the activity PIN record's status byte, so the change lands at
+    all four. Both values logged an "Unrecognized lock_status_str code" line at
+    every one of them while the members were commented out of LockStatus, and
+    0x08, still unmapped, still logs it, which is where the change stops.
+    """
+    lock = _make_lock()
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        assert lock._parse_lock_status(value) is expected
+
+    assert ("Unrecognized lock_status_str" in caplog.text) is diagnostic_logged
+
+
 def test_parse_success_op_response_with_0200_trailer_is_no_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1054,27 +1110,39 @@ def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -
     return _with_checksum(frame.hex())
 
 
-async def _drive_operation(lock: Lock, op_attr: str, opcode: int, ack: bytes) -> None:
+async def _drive_operation(
+    lock: Lock, op_attr: str, opcode: int, ack: bytes
+) -> list[str]:
     """Run a force_* method, feeding its ack then op-response through notify.
 
-    The acknowledgement has to be matched before the op-response is fed. A
+    The acknowledgment has to be matched before the op-response is fed. A
     command carrying the wrong operation byte, or a matcher that never
     matches, would otherwise still complete on the op-response alone and the
     operation would look correct.
+
+    The operation is given a write-success callback of this helper's own, and
+    the returned list records that callback and the two fed frames in the
+    order they landed.
     """
     session = lock.session
     assert session is not None
+    events: list[str] = []
 
     async def feed() -> None:
         await _spin_until(lambda: session._ack_future is not None)
+        events.append("ack")
         session._notify(0, bytearray(ack))
-        assert session._ack_future is None, "the acknowledgement was not matched"
+        assert session._ack_future is None, "the acknowledgment was not matched"
         await asyncio.sleep(0)
+        events.append("op_response")
         session._notify(0, bytearray(_op_response_frame(opcode)))
 
     feeder = asyncio.create_task(feed())
-    await getattr(lock, op_attr)()
+    await getattr(lock, op_attr)(
+        write_success_callback=lambda: events.append("write_success")
+    )
     await feeder
+    return events
 
 
 def test_parse_operation_ack_reports_no_state(
@@ -1122,16 +1190,21 @@ def test_parse_operation_ack_reports_no_state(
 async def test_force_operations_complete_on_ack_then_op_response(
     op_attr: str, opcode: int, ack_hex: str
 ) -> None:
-    """Each force_* completes only on its own ack, then its 0xBB op-response.
+    """Each force_* completes only on its own ack, then its 0xBB op-response,
+    and hands the caller's write-success callback down to the session.
 
     Drives _execute_operation_command end to end through the real staged
-    session wait, on field-captured acknowledgements. Their byte[4] is the
-    operation byte the command must have carried, so the acknowledgement only
-    matches if the right command went out.
+    session wait, on field-captured acknowledgments. Their byte[4] is the
+    operation byte the command must have carried, so the acknowledgment only
+    matches if the right command went out. The callback is the caller's
+    signal that the command reached the lock, so it has to run once per
+    operation and before any answering frame arrives.
     """
     lock = _make_connected_lock_with_session()
 
-    await _drive_operation(lock, op_attr, opcode, bytes.fromhex(ack_hex))
+    events = await _drive_operation(lock, op_attr, opcode, bytes.fromhex(ack_hex))
+
+    assert events == ["write_success", "ack", "op_response"]
 
 
 @pytest.mark.asyncio

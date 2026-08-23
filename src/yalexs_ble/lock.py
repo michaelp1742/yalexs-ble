@@ -502,6 +502,7 @@ class Lock:
         command: bytearray,
         command_name: str,
         response_timeout: float,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> None:
         """Run a mechanical operation, returning when the lock reports it done.
 
@@ -519,10 +520,13 @@ class Lock:
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=response_timeout,
             progress=OperationProgress(),
+            write_success_callback=write_success_callback,
         )
 
     @raise_if_not_connected
-    async def force_securemode(self) -> None:
+    async def force_securemode(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
@@ -532,11 +536,14 @@ class Lock:
             ),
             "force_securemode",
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
+    async def force_lock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
@@ -544,11 +551,14 @@ class Lock:
             self.session.build_command(Commands.LOCK),
             "force_lock",
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
+    async def force_unlock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
@@ -556,6 +566,7 @@ class Lock:
             self.session.build_command(Commands.UNLOCK),
             "force_unlock",
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
 
