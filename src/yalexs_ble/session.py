@@ -79,6 +79,25 @@ class OperationIncompleteError(YaleXSBLEError):
     """
 
 
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed.
+
+    The op-response arrived with a non-zero result: the exchange completed,
+    the operation did not. Deliberately not a retryable type: re-driving a
+    failed mechanism is not a recovery.
+    """
+
+    def __init__(self, message: str, result: int) -> None:
+        super().__init__(message)
+        self.result = result
+
+    def __reduce__(self) -> tuple[type[OperationFailedError], tuple[str, int]]:
+        # BaseException copies and pickles by calling the class with
+        # self.args, which holds the message alone and would leave __init__
+        # an argument short.
+        return (self.__class__, (str(self), self.result))
+
+
 class UnlatchError(YaleXSBLEError):
     """An unlatch failed after its command write was attempted.
 

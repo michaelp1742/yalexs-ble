@@ -45,6 +45,7 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     UnlatchError,
@@ -780,19 +781,28 @@ class PushLock:
             return self._client
 
     async def securemode(self) -> None:
-        """Set the lock into securemode."""
+        """Set the lock into securemode.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
         await self._run_lock_operation(
             "force_securemode", LockStatus.SECURING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
-        """Lock the lock."""
+        """Lock the lock.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
         await self._run_lock_operation(
             "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
         )
 
     async def unlock(self) -> None:
-        """Unlock the lock."""
+        """Unlock the lock.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
         await self._run_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
@@ -802,6 +812,8 @@ class PushLock:
 
         The op-response arrives after the latch has returned, so the
         completed state is UNLOCKED, not UNLATCHED.
+
+        Raises OperationFailedError on a reported operation failure.
         """
         await self._run_lock_operation(
             "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
@@ -967,6 +979,19 @@ class PushLock:
             await getattr(lock, op_attr)(
                 write_success_callback=self._operation_write_success
             )
+        except OperationFailedError:
+            # The parser's JAMMED landed inside our own window and stands
+            # recorded there for _finalize_operation; the outcome is its
+            # backstop, and the raise tells the caller.
+            self._operation_outcome = LockStatus.JAMMED
+            _LOGGER.debug(
+                "%s: %s reported failure; recording JAMMED", self.name, op_attr
+            )
+            # The exchange completed, so the link is proven alive: move the
+            # timers as a successful operation does. The arms below cannot
+            # prove the exchange completed, so they do not.
+            self._complete_operation(time.monotonic())
+            raise
         except (OperationIncompleteError, UnlatchError):
             # Listed so both types reach the caller as themselves: the arm
             # below would convert them while a status stands recorded.

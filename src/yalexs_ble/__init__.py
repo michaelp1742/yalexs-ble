@@ -15,6 +15,7 @@ from .push import PushLock
 from .session import (
     AuthError,
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
     UnlatchError,
     YaleXSBLEError,
@@ -41,6 +42,7 @@ __all__ = [
     "LockInfo",
     "LockState",
     "LockStatus",
+    "OperationFailedError",
     "OperationIncompleteError",
     "PushLock",
     "UnlatchError",

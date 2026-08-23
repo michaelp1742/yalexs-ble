@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 from collections.abc import Callable, Iterable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import yalexs_ble
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
@@ -34,6 +36,7 @@ from yalexs_ble.lock import (
     UNLATCH_OPERATION_BYTE,
     Lock,
     _ack_matcher,
+    _describe_operation_error,
     _operation_response_matcher,
     _poll_response_matcher,
     _settings_response_matcher,
@@ -43,6 +46,7 @@ from yalexs_ble.session import (
     OPERATION_RESPONSE_TIMEOUT,
     UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
     Session,
@@ -335,15 +339,73 @@ def test_parse_lock_activity_is_no_update(
     assert "Unknown state" not in caplog.text
 
 
+def test_mechanical_operation_errors_is_the_whole_mech_range() -> None:
+    """The hand-written set holds exactly the MECH_* codes, and nothing else.
+
+    A member dropped from it stops being a known mechanical failure: its log
+    line is promoted to warning and reads as a result the decode has no story
+    for. Derived here from the enum names so a drop fails rather than passes
+    quietly.
+    """
+    assert {
+        error for error in OperationError if error.name.startswith("MECH_")
+    } == MECHANICAL_OPERATION_ERRORS
+
+
+@pytest.mark.parametrize(
+    ("awaited_opcode", "result_byte", "expected_level"),
+    [
+        *(
+            (Commands.LOCK.value, error.value, "DEBUG")
+            for error in sorted(MECHANICAL_OPERATION_ERRORS)
+        ),
+        (Commands.LOCK.value, 0x32, "WARNING"),
+        (Commands.UNLOCK.value, 0x1F, "WARNING"),
+        (None, 0x1F, "WARNING"),
+    ],
+)
+def test_parse_op_response_failure_log_level(
+    awaited_opcode: int | None,
+    result_byte: int,
+    expected_level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The mechanical result of an operation we issued logs at DEBUG, because
+    OperationFailedError carries the same cause to the caller. A result of ours
+    outside the mechanical class (0x32 VBAT_LOW here), and a mechanical result
+    with no operation of ours awaiting that opcode (which came from the lock,
+    the app or auto-lock and has no other record), both log at WARNING. All of
+    them display JAMMED, since every failure class needs manual intervention at
+    the lock.
+    """
+    lock = _make_lock()
+    lock._awaited_operation_opcode = awaited_opcode
+
+    frame = bytearray.fromhex("bb0b001b00000000000000000000001f0000")
+    frame[0x0F] = result_byte
+    with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
+        result = lock._parse_state(bytes(frame))
+
+    assert result is not None
+    assert list(result) == [LockStatus.JAMMED]
+    records = [
+        record
+        for record in caplog.records
+        if "Operation failed with result" in record.message
+    ]
+    assert [record.levelname for record in records] == [expected_level]
+
+
 def test_parse_non_mech_error_is_jammed_and_logs_decoded_name(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A non-MECH failure result still parses as JAMMED and logs its name."""
     lock = _make_lock()
+    lock._awaited_operation_opcode = Commands.LOCK.value
 
     # byte[15] = 0x32 VBAT_LOW (synthetic; no real capture for a non-MECH error).
-    # Captured at WARNING: an operation failure must be visible at default
-    # log levels, not only in a debug session.
+    # The opcode is armed, so the WARNING pins the result sitting outside the
+    # mechanical family even for our own operation.
     frame = bytes.fromhex("bb0b00000000000000000000000000320000")
     with caplog.at_level("WARNING", logger="yalexs_ble.lock"):
         result = lock._parse_state(frame)
@@ -368,6 +430,12 @@ def test_parse_unknown_error_code_is_jammed_and_logs_unknown(
     assert list(result) == [LockStatus.JAMMED]
     assert "0x77" in caplog.text
     assert "unknown" in caplog.text
+
+
+def test_describe_operation_error_names_the_success_result() -> None:
+    """0x00 decodes to COMM_SUCCESS; only an unmapped result reads as unknown."""
+    assert _describe_operation_error(OperationError.COMM_SUCCESS) == "COMM_SUCCESS"
+    assert _describe_operation_error(0x77) == "unknown"
 
 
 def test_last_op_error_is_retained() -> None:
@@ -1240,15 +1308,20 @@ async def test_force_operations_complete_on_ack_then_op_response(
     session wait. The lock, unlock and securemode acknowledgments are field
     captures; the unlatch one has no capture and is built to the same layout.
     byte[4] is the operation byte the command must have carried, so the
-    acknowledgment only matches if the right command went out. The callback
-    is the caller's signal that the command reached the lock, so it has to
-    run once per operation and before any answering frame arrives.
+    acknowledgment only matches if the right command went out.
+    byte[15]=COMM_SUCCESS in the op-response makes the method return rather
+    than raise OperationFailedError. The callback is the caller's signal that
+    the command reached the lock, so it has to run once per operation and
+    before any answering frame arrives.
     """
     lock = _make_connected_lock_with_session()
 
     events = await _drive_operation(lock, op_attr, opcode, ack)
 
     assert events == ["write_success", "ack", "op_response"]
+    # The operation ran to its op-response and reported success, so nothing was
+    # left awaited on this instance.
+    assert lock._awaited_operation_opcode is None
 
 
 @pytest.mark.asyncio
@@ -1339,8 +1412,9 @@ async def test_convenience_wrappers_run_the_operation_outside_the_target_state(
 ) -> None:
     """A wrapper finding the lock outside its target state runs the operation.
 
-    The wrappers are the exported convenience surface, and delegation is
-    their whole contract.
+    The wrappers return None either way; a reported failure surfaces as the
+    OperationFailedError the force_* call raises, so the delegation is the
+    whole contract.
     """
     lock = _make_lock()
 
@@ -1411,7 +1485,8 @@ async def test_public_unlatch_wrapper_runs_force_unlatch() -> None:
 
     # force_unlock builds a plain Unlock through build_command, so a wrapper
     # wired to it would never reach this call at all. The wrapper returns
-    # nothing, as its three siblings do.
+    # nothing, as its three siblings do; a reported failure would surface as
+    # OperationFailedError.
     built.assert_called_once_with(Commands.UNLOCK, UNLATCH_OPERATION_BYTE)
 
 
@@ -1726,13 +1801,22 @@ async def test_force_unlatch_converts_every_post_write_failure(
 
 
 @pytest.mark.asyncio
-async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
-    """OperationIncompleteError is already non-retryable, so it propagates as
-    itself even after the write and is not re-wrapped as UnlatchError. The
-    identity assertion is what pins the passthrough clause: wrapping the type
-    would break it.
+@pytest.mark.parametrize(
+    "error",
+    [
+        OperationIncompleteError("acked but no op-response"),
+        OperationFailedError("op failed", 0x1F),
+    ],
+    ids=["incomplete", "failed"],
+)
+async def test_force_unlatch_operation_result_errors_are_not_converted(
+    error: Exception,
+) -> None:
+    """Both operation-result types are already non-retryable, so each
+    propagates as itself even after the write; neither is re-wrapped as
+    UnlatchError. The identity assertion is what pins the two-member
+    passthrough tuple: wrapping either type would break it.
     """
-    error = OperationIncompleteError("acked but no op-response")
     lock = _make_lock()
     lock.session = MagicMock()
     lock.secure_session = MagicMock()
@@ -1756,12 +1840,123 @@ async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
     assert excinfo.value is error
 
 
-def test_unlatch_error_is_reachable_from_the_package_root() -> None:
-    """The type a caller has to catch is importable where callers import from.
+def test_operation_failed_error_survives_being_copied() -> None:
+    """The one exception here carrying data must rebuild from its own args.
 
-    Every test here takes it from yalexs_ble.session, so nothing else in the
-    suite would notice if the package-root export were dropped, and a consumer
-    catching it by the documented path would stop compiling.
+    BaseException reconstructs from self.args, which holds the message alone,
+    so a copy of this type would call __init__ an argument short and raise a
+    TypeError that hides the failure it was reporting. Copy and pickle both
+    rebuild through __reduce__, so copying exercises the path either takes.
+    Its two siblings take no extra argument and cannot show the defect.
     """
-    assert yalexs_ble.UnlatchError is UnlatchError
-    assert "UnlatchError" in yalexs_ble.__all__
+    error = OperationFailedError("force_lock reported failure 0x1F", 0x1F)
+
+    for rebuilt in (copy.copy(error), copy.deepcopy(error)):
+        assert isinstance(rebuilt, OperationFailedError)
+        assert rebuilt.result == 0x1F
+        assert str(rebuilt) == str(error)
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [UnlatchError, OperationFailedError],
+    ids=["unlatch", "operation_failed"],
+)
+def test_operation_errors_are_reachable_from_the_package_root(
+    error_type: type[Exception],
+) -> None:
+    """Each type a caller has to catch is importable where callers import from.
+
+    Every test here takes them from yalexs_ble.session, so nothing else in the
+    suite would notice if a package-root export were dropped, and a consumer
+    catching one by the documented path would stop compiling.
+    """
+    assert getattr(yalexs_ble, error_type.__name__) is error_type
+    assert error_type.__name__ in yalexs_ble.__all__
+
+
+@pytest.mark.asyncio
+async def test_force_lock_failure_op_response_raises_operation_failed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure op-response (byte[15] != 0) raises OperationFailedError.
+
+    The exchange completed and the lock named the cause, so the exception
+    carries the result byte and is not converted or retried. The frame is
+    built here, with byte[15] = 0x1F MECH_POSITION, the result a jammed lock
+    reports. The failure record logs at DEBUG, which joins the awaited-opcode
+    arming to its consumer: the parser saw the opcode armed when the frame
+    landed, and an unarmed field routes the same record to WARNING.
+    """
+    lock = _make_connected_lock_with_session()
+    session = lock.session
+    assert session is not None
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(0, bytearray(bytes.fromhex(_LOCK_ACK_HEX)))
+        await asyncio.sleep(0)
+        session._notify(
+            0,
+            bytearray(_op_response_frame(Commands.LOCK, OperationError.MECH_POSITION)),
+        )
+
+    feeder = asyncio.create_task(feed())
+    with (
+        caplog.at_level("DEBUG", logger="yalexs_ble.lock"),
+        pytest.raises(OperationFailedError) as excinfo,
+    ):
+        await lock.force_lock()
+    await feeder
+    assert excinfo.value.result == OperationError.MECH_POSITION
+    records = [
+        record
+        for record in caplog.records
+        if "Operation failed with result" in record.message
+    ]
+    assert [record.levelname for record in records] == ["DEBUG"]
+    # Cleared on the way out of the failure too: left set, every later external
+    # op-response on that opcode would read as one of ours and log at debug for
+    # the instance's life.
+    assert lock._awaited_operation_opcode is None
+
+
+@pytest.mark.asyncio
+async def test_the_awaited_opcode_is_armed_at_the_command_write() -> None:
+    """Nothing is awaited until the command has actually been written.
+
+    The cooldown wait, the session lock and the write itself sit between the
+    call and the command leaving the radio. A frame landing in that stretch
+    cannot be told from an external one, so the field stays unarmed until
+    the write-success hook runs.
+    """
+    lock = _make_connected_lock_with_session()
+    session = lock.session
+    assert session is not None
+    at_write: list[int | None] = []
+    at_hook: list[int | None] = []
+
+    async def _write(*args: object, **kwargs: object) -> None:
+        at_write.append(lock._awaited_operation_opcode)
+
+    def _on_write_success() -> None:
+        at_hook.append(lock._awaited_operation_opcode)
+
+    assert lock.client is not None
+    lock.client.write_gatt_char = AsyncMock(side_effect=_write)
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(0, bytearray(bytes.fromhex(_LOCK_ACK_HEX)))
+        await asyncio.sleep(0)
+        session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
+
+    feeder = asyncio.create_task(feed())
+    await lock.force_lock(write_success_callback=_on_write_success)
+    await feeder
+
+    # Nothing awaited while the command was being written, and armed by the
+    # time the caller's own write-success hook ran.
+    assert at_write == [None]
+    assert at_hook == [Commands.LOCK.value]
+    assert lock._awaited_operation_opcode is None

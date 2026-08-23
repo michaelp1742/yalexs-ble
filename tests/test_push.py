@@ -17,6 +17,7 @@ from yalexs_ble.const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    ConnectionInfo,
     DoorStatus,
     LockInfo,
     LockState,
@@ -52,7 +53,9 @@ from yalexs_ble.push import (
 )
 from yalexs_ble.session import (
     DisconnectedError,
+    OperationFailedError,
     OperationIncompleteError,
+    OperationProgress,
     ResponseError,
     UnlatchError,
 )
@@ -2786,7 +2789,7 @@ def _known_state(
 async def test_execute_lock_operation_success_stamps_complete_state(
     method: str, op_attr: str, complete_state: LockStatus
 ) -> None:
-    """A completed force_* advances the state to the completed status.
+    """A force_* that returns advances the state to the completed status.
 
     Drives each public operation to completion: the transitional is stamped,
     the operation returns, and the completed status is applied.
@@ -2802,6 +2805,70 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
     getattr(mock_lock, op_attr).assert_awaited_once()
     assert push_lock.lock_status == complete_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "op_attr", "transitional"),
+    [
+        ("lock", "force_lock", LockStatus.LOCKING),
+        ("unlock", "force_unlock", LockStatus.UNLOCKING),
+        # securemode from an unknown start position publishes LOCKING: the
+        # projection's transitional for a lock that may have to lock first.
+        ("securemode", "force_securemode", LockStatus.LOCKING),
+    ],
+)
+async def test_failure_op_response_applies_jammed_after_window(
+    method: str, op_attr: str, transitional: LockStatus
+) -> None:
+    """The parser emits JAMMED for our own failure op-response mid-window (the
+    state callback runs before session resolves the future), so the window
+    refuses it for display and records it; _finalize_operation applies the
+    recorded JAMMED after closing the window, and the failure propagates.
+
+    The double stands in for the parser, feeding the parsed JAMMED and
+    raising with result 0x1F MECH_POSITION;
+    test_force_lock_failure_op_response_raises_operation_failed drives the
+    parser end to end.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:2b")
+    events: list[LockStatus] = []
+
+    def cb(
+        lock_state: LockState,
+        lock_info: LockInfo,
+        connection_info: ConnectionInfo,
+    ) -> None:
+        events.append(lock_state.lock)
+
+    push_lock.register_callback(cb)
+
+    mock_lock = MagicMock()
+
+    async def operation(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()  # opens the window, stamps the transitional
+        # Parser emission of the failure op-response lands inside our window.
+        push_lock._state_callback([LockStatus.JAMMED])
+        # op-response byte[15] != 0
+        raise OperationFailedError(f"{op_attr} reported failure", 0x1F)
+
+    setattr(mock_lock, op_attr, operation)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
+    ):
+        await getattr(push_lock, method)()
+
+    # The transitional at write-success; the mid-window JAMMED produced no
+    # event; JAMMED applied once, only after the window closed.
+    assert events == [transitional, LockStatus.JAMMED]
+    assert push_lock.lock_status == LockStatus.JAMMED
+    # The exchange completed, so the failure path runs _complete_operation:
+    # the disconnect timer moves despite the jam.
+    assert push_lock._last_operation_complete_time != NEVER_TIME
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
 
 
 @pytest.mark.asyncio
@@ -2953,6 +3020,40 @@ async def test_secure_projection_invariant_table(
     # The synthetic SECURING is consumed by the projection: no published
     # value on either channel ever carries it.
     assert all(LockStatus.SECURING not in pair for pair in emissions)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_secure_projection_shares_a_jam() -> None:
+    """A failed operation puts both locks in JAMMED.
+
+    One mechanism reported one fault, so the pair carries it together: the
+    operation applies JAMMED once its window is closed and the projection
+    sends it to both channels.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:62")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+
+    async def force_unlock(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()
+        # The parser emits JAMMED for the failure op-response, inside the
+        # window, before the session resolves the waiter.
+        push_lock._state_callback([LockStatus.JAMMED])
+        raise OperationFailedError("force_unlock reported failure", 0x1F)
+
+    mock_lock = MagicMock()
+    mock_lock.force_unlock = force_unlock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
+    ):
+        await push_lock.unlock()
+
+    assert push_lock.lock_status is LockStatus.JAMMED
+    assert push_lock.secure_status is LockStatus.JAMMED
     push_lock._cancel_disconnect_timer()
 
 
@@ -4264,7 +4365,7 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         command: bytearray,
         command_name: str,
         response_timeout: float = 0.0,
-        progress: object | None = None,
+        progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         wait_for_ack: bool = True,
     ) -> None:
@@ -4583,7 +4684,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     assert push_lock._cancel_deferred_update is not None
 
     mock_lock = MagicMock()
-    mock_lock.force_lock = AsyncMock(return_value=True)
+    mock_lock.force_lock = AsyncMock()
     pending_at_connect: list[bool] = []
 
     async def connected() -> MagicMock:
@@ -4606,6 +4707,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     ("error", "jam", "delay"),
     [
         (None, False, KEEP_ALIVE_TIME),
+        (OperationFailedError("reported failure", 0x1F), False, KEEP_ALIVE_TIME),
         (
             OperationIncompleteError("no op-response"),
             False,
@@ -4617,19 +4719,20 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
             KEEP_ALIVE_TIME,
         ),
     ],
-    ids=["success", "no-result", "jam-ends-the-ladder"],
+    ids=["success", "reported-failure", "no-result", "jam-ends-the-ladder"],
 )
 async def test_every_operation_exit_schedules_the_status_poll(
     error: Exception | None, jam: bool, delay: float
 ) -> None:
     """Every way an operation can end schedules the follow-up status poll.
 
-    Success, a result that never came, and a jam that ends the attempt ladder
-    all leave through the same settle, so all three schedule a poll. The delay
-    follows the status each one leaves on display: a position is polled at the
-    keep-alive interval, the cadence an always-connected lock polls at anyway,
-    and the UNKNOWN of a result that never came is polled at the settle
-    debounce, because only a read can replace it.
+    Success, a reported failure, a result that never came, and a jam that ends
+    the attempt ladder all leave through _finalize_operation, so all four
+    schedule the poll. The delay follows the status each one leaves on display:
+    a position is polled at the keep-alive interval, the cadence an
+    always-connected lock polls at anyway, and the UNKNOWN of a result that
+    never came is polled at the post-operation debounce delay, because only a
+    read can replace it.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:44")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
@@ -4638,6 +4741,10 @@ async def test_every_operation_exit_schedules_the_status_poll(
         write_success_callback()  # opens the window, stamps LOCKING
         if jam:
             push_lock._update_any_state([LockStatus.JAMMED])
+        if isinstance(error, OperationFailedError):
+            # The parser emits JAMMED for the failure op-response, inside the
+            # window, before the session resolves the waiter.
+            push_lock._state_callback([LockStatus.JAMMED])
         if error is not None:
             raise error
 
