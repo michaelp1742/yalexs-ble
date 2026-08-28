@@ -495,6 +495,13 @@ class Session:
                 # residual is accepted: requiring the acknowledgment first
                 # would instead drop a genuine op-response whose
                 # acknowledgment was lost.
+                if not progress.acknowledged:
+                    _LOGGER.info(
+                        "%s: %s completed on its op-response; no "
+                        "acknowledgment was received",
+                        self.name,
+                        command_name,
+                    )
                 return result_future.result()
             if ack_future not in done:
                 raise TimeoutError(

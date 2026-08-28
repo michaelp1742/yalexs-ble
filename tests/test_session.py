@@ -963,14 +963,17 @@ async def test_execute_operation_op_response_before_ack() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_stale_same_opcode_op_response_completes_a_fresh_wait() -> None:
+async def test_a_stale_same_opcode_op_response_completes_a_fresh_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A previous same-opcode command's late op-response is taken as the answer.
 
     An op-response is matched on the opcode alone, so a fresh wait cannot
     tell its own answer from the previous same-opcode command's late one:
     fed during stage 1, the stale frame completes the wait through the
     supersede branch. progress.acknowledged staying False is the tell that
-    the result may not be this command's.
+    the result may not be this command's, and the completion is logged at
+    info so the case is visible in a field log.
     """
     session, client = _make_operation_session()
     progress = OperationProgress()
@@ -984,18 +987,20 @@ async def test_a_stale_same_opcode_op_response_completes_a_fresh_wait() -> None:
         session._notify(0, bytearray(stale_op_response))
 
     feeder = asyncio.create_task(feed())
-    result = await session.execute_operation(
-        command,
-        "force_securemode",
-        ack_matcher=_ack_matcher(0x0B, 0x04),
-        response_matcher=_operation_response_matcher(0x0B),
-        response_timeout=5.0,
-        progress=progress,
-    )
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        result = await session.execute_operation(
+            command,
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=progress,
+        )
     await feeder
 
     assert result == bytes(stale_op_response)
     assert progress.acknowledged is False
+    assert "completed on its op-response; no acknowledgment was received" in caplog.text
 
 
 @pytest.mark.asyncio
