@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import monotonic
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -244,7 +244,7 @@ class Session:
             future.set_exception(ex)
 
     def _notify(self, char: int, data: bytearray) -> None:
-        self._last_callback_time = time.monotonic()
+        self._last_callback_time = monotonic()
         _LOGGER.debug(
             "%s: Receiving response via notify: %s (waiting=%s)",
             self.name,
@@ -439,7 +439,7 @@ class Session:
             raise BleakError("disconnected")
         self._encrypt_command(command, command_name)
 
-        attempt_start = time.monotonic()
+        attempt_start = monotonic()
         ack_future: asyncio.Future[bytes] = self.loop.create_future()
         result_future: asyncio.Future[bytes] = self.loop.create_future()
         # Armed before the write: re-arming between stages would race an
@@ -478,7 +478,7 @@ class Session:
                         command_name,
                     )
             _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
-            ack_remaining = ACK_TIMEOUT - (time.monotonic() - attempt_start)
+            ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
             done, _ = await asyncio.wait(
                 (ack_future, result_future),
                 timeout=max(ack_remaining, 0),
@@ -502,7 +502,7 @@ class Session:
                     f"{ACK_TIMEOUT}s of the command being issued"
                 )
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
-            result_remaining = response_timeout - (time.monotonic() - attempt_start)
+            result_remaining = response_timeout - (monotonic() - attempt_start)
             try:
                 async with util.asyncio_timeout(max(result_remaining, 0)):
                     result = await result_future
@@ -576,7 +576,7 @@ class Session:
     async def _wait_for_cooldown(self) -> None:
         while (
             self._enable_cooldown
-            and (cooldown_remain := time.monotonic() - self._last_callback_time)
+            and (cooldown_remain := monotonic() - self._last_callback_time)
             < COOLDOWN_TIME
         ):
             _LOGGER.debug(
