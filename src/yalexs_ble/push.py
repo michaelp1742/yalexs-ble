@@ -36,6 +36,7 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
+    OperationError,
 )
 from .lock import Lock
 from .session import (
@@ -747,8 +748,20 @@ class PushLock:
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        # A failure op-response was already parsed into JAMMED and published
+        # before this write, so the commanded state must not replace it. The
+        # guard is only needed while this part of #369 stands alone: the
+        # parts that follow rework this path to raise on a reported failure,
+        # and they remove it.
+        if lock._last_op_error in (None, OperationError.COMM_SUCCESS):
+            self._update_any_state([complete_state])
+            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        else:
+            _LOGGER.debug(
+                "%s: the lock reported %s failed; the reported state stays on display",
+                self.name,
+                op_attr,
+            )
         now = time.monotonic()
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)

@@ -20,6 +20,7 @@ from yalexs_ble.const import (
     LockInfo,
     LockState,
     LockStatus,
+    OperationError,
 )
 from yalexs_ble.lock import Lock
 from yalexs_ble.push import (
@@ -2760,6 +2761,9 @@ async def test_execute_lock_operation_success_stamps_complete_state() -> None:
     push_lock = _operational_push_lock()
     mock_lock = MagicMock()
     mock_lock.force_lock = AsyncMock()
+    # The result byte a successful op-response leaves behind; the stamp
+    # reads it before applying the completed state.
+    mock_lock._last_op_error = OperationError.COMM_SUCCESS
 
     with patch.object(
         push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
@@ -2768,6 +2772,33 @@ async def test_execute_lock_operation_success_stamps_complete_state() -> None:
 
     mock_lock.force_lock.assert_awaited_once()
     assert push_lock.lock_status == LockStatus.LOCKED
+
+
+@pytest.mark.asyncio
+async def test_a_reported_operation_failure_leaves_jammed_on_display() -> None:
+    """A failure op-response's JAMMED is not overwritten by the commanded state.
+
+    The parser publishes JAMMED from the op-response before force_* returns,
+    so the completed-state stamp applies only when the lock reported success.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
+    mock_lock = MagicMock()
+
+    async def _force_lock_jams() -> None:
+        # What a failure op-response does inside the notify callback: the
+        # parser records the result byte and publishes JAMMED, then the wait
+        # resolves and force_lock returns normally.
+        mock_lock._last_op_error = OperationError.MECH_POSITION
+        push_lock._state_callback([LockStatus.JAMMED])
+
+    mock_lock.force_lock = AsyncMock(side_effect=_force_lock_jams)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    assert push_lock.lock_status == LockStatus.JAMMED
 
 
 @pytest.mark.asyncio
