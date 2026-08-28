@@ -963,6 +963,42 @@ async def test_execute_operation_op_response_before_ack() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_stale_same_opcode_op_response_completes_a_fresh_wait() -> None:
+    """A previous same-opcode command's late op-response is taken as the answer.
+
+    An op-response is matched on the opcode alone, so a fresh wait cannot
+    tell its own answer from the previous same-opcode command's late one:
+    fed during stage 1, the stale frame completes the wait through the
+    supersede branch. progress.acknowledged staying False is the tell that
+    the result may not be this command's.
+    """
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.LOCK, 0x04)
+    # The same bytes a previous lock-opcode command's op-response carries.
+    stale_op_response = _with_checksum(_OP_RESPONSE_OK)
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        # Arrives before this command's acknowledgment.
+        session._notify(0, bytearray(stale_op_response))
+
+    feeder = asyncio.create_task(feed())
+    result = await session.execute_operation(
+        command,
+        "force_securemode",
+        ack_matcher=_ack_matcher(0x0B, 0x04),
+        response_matcher=_operation_response_matcher(0x0B),
+        response_timeout=5.0,
+        progress=progress,
+    )
+    await feeder
+
+    assert result == bytes(stale_op_response)
+    assert progress.acknowledged is False
+
+
+@pytest.mark.asyncio
 async def test_execute_operation_ack_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
