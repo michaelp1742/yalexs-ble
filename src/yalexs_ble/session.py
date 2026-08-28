@@ -489,7 +489,12 @@ class Session:
                 # either beat the acknowledgment entirely, or both resolved in
                 # the same event-loop turn. Either way the op-response is the
                 # answer, and whether an acknowledgment also arrived was
-                # already recorded where it was received.
+                # already recorded where it was received. The matcher keys on
+                # the opcode alone, so the frame taken here can also be a
+                # previous same-opcode command's late op-response. That
+                # residual is accepted: requiring the acknowledgment first
+                # would instead drop a genuine op-response whose
+                # acknowledgment was lost.
                 return result_future.result()
             if ack_future not in done:
                 raise TimeoutError(
