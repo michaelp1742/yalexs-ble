@@ -1442,6 +1442,9 @@ async def test_op_response_and_stage_two_timeout_in_one_turn_returns_the_result(
         # Key the schedule to the armed stage-2 budget, so the ordering
         # holds however long the run spent getting here.
         armed = op_wait_timeouts[1]
+        # armed == 0 would put the notify and the timeout on one deadline,
+        # decided by scheduling order; a stalled run must fail as stalled.
+        assert armed > 0, "the fixture stalled past the stage-2 budget"
         loop = asyncio.get_running_loop()
         loop.call_later(armed / 4, session._notify, 0, bytearray(op_response))
         # Block the loop past both deadlines: when it wakes, the notify handle
@@ -1502,6 +1505,9 @@ async def test_an_op_response_behind_the_stage_two_timeout_returns_the_result(
         # Key the schedule to the armed stage-2 budget, so the ordering
         # holds however long the run spent getting here.
         armed = op_wait_timeouts[1]
+        # armed == 0 would put the notify and the timeout on one deadline,
+        # decided by scheduling order; a stalled run must fail as stalled.
+        assert armed > 0, "the fixture stalled past the stage-2 budget"
         loop = asyncio.get_running_loop()
         loop.call_later(armed + 0.05, session._notify, 0, bytearray(op_response))
         # Block the loop past both deadlines: when it wakes, the stage-2
