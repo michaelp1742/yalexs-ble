@@ -1106,7 +1106,7 @@ async def test_stage_deadlines_run_from_the_command_issue(
     op_response = _with_checksum(_OP_RESPONSE_OK)
 
     clock = {"now": 1000.0}
-    monkeypatch.setattr("yalexs_ble.session.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: clock["now"])
 
     async def write_taking_half_a_second(*args: object, **kwargs: object) -> None:
         clock["now"] += 0.5
@@ -1213,7 +1213,7 @@ async def test_cooldown_paces_a_command_behind_the_last_frame(
     session, _ = _make_operation_session()
     session.enable_cooldown()
     clock = {"now": 1000.0}
-    monkeypatch.setattr("yalexs_ble.session.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: clock["now"])
     session._last_callback_time = clock["now"] - 0.2
     slept: list[float] = []
 
@@ -1240,7 +1240,7 @@ async def test_execute_operation_pays_the_cooldown_before_its_write(
     session, client = _make_operation_session()
     session.enable_cooldown()
     clock = {"now": 1000.0}
-    monkeypatch.setattr("yalexs_ble.session.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: clock["now"])
     session._last_callback_time = clock["now"] - 0.2
     slept: list[float] = []
     real_sleep = asyncio.sleep
@@ -1434,13 +1434,16 @@ async def test_op_response_and_stage_two_timeout_in_one_turn_returns_the_result(
         # Wait for the op-response stage to arm its own timer, so the blocking
         # sleep below expires that timer and not the acknowledgment stage's.
         await _spin_until(lambda: len(op_wait_timeouts) == 2)
+        # Key the schedule to the armed stage-2 budget, so the ordering
+        # holds however long the run spent getting here.
+        armed = op_wait_timeouts[1]
         loop = asyncio.get_running_loop()
-        loop.call_later(0.05, session._notify, 0, bytearray(op_response))
+        loop.call_later(armed / 4, session._notify, 0, bytearray(op_response))
         # Block the loop past both deadlines: when it wakes, the notify handle
         # (the earlier deadline) and the stage-2 timeout handle run in the
         # same iteration, notify first, reproducing the race. The blocking
         # sleep is the point, so the async lint rule is suppressed.
-        time.sleep(0.4)  # noqa: ASYNC251
+        time.sleep(armed + 0.1)  # noqa: ASYNC251
 
     feeder = asyncio.create_task(feed())
     result = await session.execute_operation(
@@ -1491,14 +1494,17 @@ async def test_an_op_response_behind_the_stage_two_timeout_returns_the_result(
         # Wait for the op-response stage to arm its own timer, so the blocking
         # sleep below expires that timer and not the acknowledgment stage's.
         await _spin_until(lambda: len(op_wait_timeouts) == 2)
+        # Key the schedule to the armed stage-2 budget, so the ordering
+        # holds however long the run spent getting here.
+        armed = op_wait_timeouts[1]
         loop = asyncio.get_running_loop()
-        loop.call_later(0.25, session._notify, 0, bytearray(op_response))
+        loop.call_later(armed + 0.05, session._notify, 0, bytearray(op_response))
         # Block the loop past both deadlines: when it wakes, the stage-2
         # timeout handle (the earlier deadline) and the notify handle run in
         # the same iteration, the timeout first, which is the ordering this
         # test pins. The blocking sleep is the point, so the async lint rule
         # is suppressed.
-        time.sleep(0.4)  # noqa: ASYNC251
+        time.sleep(armed + 0.15)  # noqa: ASYNC251
 
     feeder = asyncio.create_task(feed())
     result = await session.execute_operation(
@@ -1744,10 +1750,10 @@ async def test_execute_operation_generic_bleak_error_is_reraised() -> None:
 # =========================================================================== #
 # 1000 ms field replays: the typed staged wait vs the wrong-capture frames
 #
-# Verbatim, ordered field frame sequences from fixtures_1000ms_wrong_captures.md
-# where the OLD untyped wait captured a wrong frame, written ahead of the staged
-# wait that answers them. Each is replayed through session._notify during an
-# execute_operation staged wait. Frame classes:
+# Verbatim, ordered field frame sequences in which the OLD untyped wait
+# captured a wrong frame, written ahead of the staged wait that answers them.
+# Each is replayed through session._notify during an execute_operation staged
+# wait. Frame classes:
 #   * bb0a / bb0b = 0xBB op-response (opcode 0x0a unlock / 0x0b lock+securemode)
 #   * bb02        = 0xBB 0x02 settled GETSTATUS status push
 #   * aa0a / aa0b = 0xAA acknowledgment matching the written opcode
