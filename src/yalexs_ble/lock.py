@@ -181,10 +181,12 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 
     def _matches(data: bytes) -> bool:
         return (
+            # The floor covers the highest byte the match reads, the
+            # operation byte at 0x04.
             len(data) > 0x04
-            and data[0] == 0xAA
-            and data[1] == opcode
-            and data[4] == operation_byte
+            and data[0x00] == 0xAA
+            and data[0x01] == opcode
+            and data[0x04] == operation_byte
         )
 
     return _matches
@@ -196,7 +198,10 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     """
 
     def _matches(data: bytes) -> bool:
-        return len(data) > 0x0F and data[0] == 0xBB and data[1] == opcode
+        # The match reads only the identity bytes, but the wait it completes
+        # reads the result at byte 0x0F, so the floor admits only a frame
+        # that carries it.
+        return len(data) > 0x0F and data[0x00] == 0xBB and data[0x01] == opcode
 
     return _matches
 

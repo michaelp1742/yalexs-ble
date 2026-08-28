@@ -675,10 +675,10 @@ class Session:
         result is unknown and the caller decides.
 
         response_timeout is the budget for the whole exchange, measured from
-        the moment the command is issued, and must exceed ACK_TIMEOUT: the
+        the moment the command is issued. Size it above ACK_TIMEOUT: the
         remainder left once the operation is acknowledged is the op-response
-        wait, so a value at or below ACK_TIMEOUT leaves that wait no time at
-        all. OPERATION_RESPONSE_TIMEOUT is that budget for the operations
+        wait, so a budget at or below ACK_TIMEOUT leaves that wait no time
+        at all. OPERATION_RESPONSE_TIMEOUT is that budget for the operations
         sized here, and an operation with a longer motion passes its own.
         """
         await self._wait_for_cooldown()
