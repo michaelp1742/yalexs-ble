@@ -329,7 +329,10 @@ def _project_lock_status(
     status channel for the secure lock. To maintain backward compatibility
     the main lock keeps SECUREMODE as its settled secured position. The
     internal state SECURING is the equivalent of the main lock's LOCKING
-    state. The model has no Secured to Locked transition.
+    state. The model has no Secured to Locked transition, so a reported
+    LOCKING never animates the secure lock: only a reported SECUREMODE
+    proves the lock is secured, and the settled SECUREMODE that follows a
+    securing motion re-secures the display.
     """
     if reported is LockStatus.SECURING:
         # SECURING: if the main lock is already locked it stays locked.
