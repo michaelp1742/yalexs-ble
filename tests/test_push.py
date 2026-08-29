@@ -2931,6 +2931,29 @@ async def test_write_success_without_pending_state_stamps_nothing():
 
 
 @pytest.mark.asyncio
+async def test_a_raising_stamp_still_opens_the_window():
+    """The window opens even when stamping the transitional raises.
+
+    The session contains an exception from the write-success hook and runs
+    the staged wait to its end, so a raise that left the window closed would
+    run the whole operation with every mid-motion status admitted and no
+    intervention status recorded.
+    """
+    push_lock = _operational_push_lock()
+    push_lock._pending_op_state = LockStatus.LOCKING
+
+    with (
+        patch.object(
+            push_lock, "_update_any_state", side_effect=RuntimeError("stamp failed")
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        push_lock._operation_write_success()
+
+    assert push_lock._operation_window_open is True
+
+
+@pytest.mark.asyncio
 async def test_window_filters_foreign_settle_until_close():
     """While the operation window is open a foreign lock-status settle is
     dropped; once the window closes the same value is admitted."""
