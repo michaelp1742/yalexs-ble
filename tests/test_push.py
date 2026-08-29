@@ -3319,6 +3319,36 @@ async def test_an_operation_settling_after_the_stop_arms_nothing():
 
 
 @pytest.mark.asyncio
+async def test_a_stop_mid_operation_keeps_the_owed_poll_and_the_floor():
+    """The stopped exit still stamps the owed poll and the stale-state floor.
+
+    Both are facts about the mechanism, so a watcher started again on this
+    instance inherits them: its first cycle waits out the motor and asks the
+    lock for the status the stopped operation never displayed.
+    """
+    push_lock = _operational_push_lock()
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+
+    async def _stop_then_fail(write_success_callback):
+        write_success_callback()
+        push_lock._running = False
+        raise OperationIncompleteError("no op-response, and we were stopped")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = AsyncMock(side_effect=_stop_then_fail)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationIncompleteError),
+    ):
+        await push_lock.lock()
+
+    assert push_lock._force_lock_status_poll is True
+    assert push_lock._earliest_update_time > time.monotonic()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_a_jam_recorded_before_the_stop_reaches_no_later_operation():
     """A stopped operation discharges the jam record instead of leaving it set.
 
