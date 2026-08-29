@@ -829,7 +829,10 @@ class PushLock:
         """The command write reached the lock: the single state-action moment.
 
         Order matters: stamp the operation's transitional while the window is
-        still closed, so the stamp passes the filter, then open the window.
+        still closed, so the stamp passes the filter. The window then opens in
+        a finally, because the session contains an exception from this hook
+        and runs the staged wait to its end: a stamp that raised must not
+        leave the whole operation running with the window closed.
 
         Clearing _seen_intervention_status is a backstop, so no record
         reaches a new command's write-success. A record that did reach here
@@ -837,11 +840,13 @@ class PushLock:
         intervention the status calls for, and its outcome is the newer truth.
         """
         self._seen_intervention_status = None
-        if self._pending_op_state is not None:
-            # The None check only narrows the type; every caller is inside
-            # an operation that set it.
-            self._update_any_state([self._pending_op_state], arm_resync=False)
-        self._operation_window_open = True
+        try:
+            if self._pending_op_state is not None:
+                # The None check only narrows the type; every caller is inside
+                # an operation that set it.
+                self._update_any_state([self._pending_op_state], arm_resync=False)
+        finally:
+            self._operation_window_open = True
 
     def _close_operation_window(self) -> None:
         """Close the operation window and drop everything it recorded.
