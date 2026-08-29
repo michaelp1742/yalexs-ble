@@ -873,12 +873,16 @@ class PushLock:
         if (recorded := self._seen_intervention_status) is not None:
             outcome = recorded
             _LOGGER.debug(
-                "%s: the lock reported %s while the operation was in flight; "
-                "displaying it",
+                "%s: the lock reported %s while the operation was in flight",
                 self.name,
                 recorded,
             )
         self._close_operation_window()
+        # Both describe the mechanism rather than the watcher, so both
+        # outlive a stop. Stamped before the stop check, so a watcher
+        # started again on this instance inherits them.
+        self._force_lock_status_poll = True
+        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
         if not self._running:
             # The watcher was stopped while this operation was in flight. The
             # window is closed above so the object is left consistent, but
@@ -887,8 +891,6 @@ class PushLock:
             return
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
-        self._force_lock_status_poll = True
-        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
         # A settled pair waits the keep-alive; an unsettled one polls at
         # the stale-state debounce, the earliest a poll answers with the
         # motor stopped. The two motion values are the only transitional
