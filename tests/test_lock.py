@@ -273,22 +273,18 @@ def test_parse_lock_status_decodes_the_unlatch_states(
     assert ("Unrecognized lock_status_str" in caplog.text) is diagnostic_logged
 
 
-def test_a_frame_value_matching_securing_is_unrecognized(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A frame carrying SECURING's value never decodes to the member.
+def test_no_status_byte_decodes_to_securing() -> None:
+    """No frame can decode to SECURING.
 
-    SECURING is library-synthesized and excluded from VALUE_TO_LOCK_STATUS,
-    so a frame carrying its byte cannot forge the securing stamp: it takes
-    the unrecognized-code path like any other value the lock does not
-    report.
+    Every decode site reads a single status byte, so a value above 0xFF is
+    out of a byte lookup's reach whatever VALUE_TO_LOCK_STATUS holds.
     """
     lock = _make_lock()
 
-    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
-        assert lock._parse_lock_status(LockStatus.SECURING.value) is LockStatus.UNKNOWN
-
-    assert "Unrecognized lock_status_str" in caplog.text
+    assert all(
+        lock._parse_lock_status(value) is not LockStatus.SECURING
+        for value in range(0x100)
+    )
 
 
 def test_parse_success_op_response_with_0200_trailer_is_no_update(

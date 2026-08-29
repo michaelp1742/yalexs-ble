@@ -123,16 +123,12 @@ class LockStatus(Enum):
     SECUREMODE = 0x0C
     # Library-synthesized securing transitional. securemode() stamps it as
     # the operation's pending state and _project_lock_status consumes it,
-    # so it never reaches a published LockState.
-    SECURING = 0x12
+    # so it never reaches a published LockState. The value is wider than a
+    # byte, so no frame can decode to it either.
+    SECURING = 0x100
 
 
-# SECURING is excluded so it can never be decoded from a frame: a frame
-# carrying its value takes the unrecognized-code path instead of forging
-# the securing stamp.
-VALUE_TO_LOCK_STATUS = {
-    status.value: status for status in LockStatus if status is not LockStatus.SECURING
-}
+VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
 
 # Statuses reported during calibration (0x01) and polarity discovery (0x06),
 # setup conditions that end at the lock by hand.
