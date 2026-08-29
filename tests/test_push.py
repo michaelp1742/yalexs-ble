@@ -3888,8 +3888,8 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
 async def test_a_new_commands_write_success_clears_the_jam_record() -> None:
     """A command that reaches the lock supersedes a jam still on record.
 
-    Every operation exit applies a status it recorded, so no exit leaves
-    _seen_intervention_status set for the next command to find. The record is
+    No exit leaves _seen_intervention_status set for the next command to
+    find: _close_operation_window clears it above the stop check. The record is
     seeded by hand here to pin the backstop: were one ever to reach a
     write-success, the command the caller issued after the jam is the
     intervention that status calls for, and its own result is what the display
