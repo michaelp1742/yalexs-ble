@@ -3014,29 +3014,27 @@ async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
 async def test_window_filter_refusal_leaves_the_secure_lock_alone() -> None:
     """A status refused by the window filter never reaches the projection.
 
-    Part way through an unlock out of Secured the published pair is
-    (UNLOCKING, UNLOCKING). The filter returns None for a refused value, so
-    nothing is projected from it. Projecting it instead would read the
-    settled reading as "the lock is not secured" and drop the secure lock to
-    unlocked while the motor is still running.
+    Part way through a securemode out of locked the published pair is
+    (LOCKED, LOCKING). The filter returns None for a refused value, so
+    nothing is projected from it. Re-projecting the standing display instead
+    would read the settled main lock as "the lock is not secured" and end
+    the secure transitional while the motor is still running.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
-    push_lock._lock_state = _known_state(
-        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
-    )
-    push_lock._pending_op_state = LockStatus.UNLOCKING
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    push_lock._pending_op_state = LockStatus.SECURING
     push_lock._operation_write_success()
     assert (push_lock.lock_status, push_lock.secure_status) == (
-        LockStatus.UNLOCKING,
-        LockStatus.UNLOCKING,
+        LockStatus.LOCKED,
+        LockStatus.LOCKING,
     )
 
     # The previous operation's settled push arriving inside the window is
     # refused, so the pair stands.
-    push_lock._update_any_state([LockStatus.UNLOCKED])
+    push_lock._update_any_state([LockStatus.LOCKED])
     assert (push_lock.lock_status, push_lock.secure_status) == (
-        LockStatus.UNLOCKING,
-        LockStatus.UNLOCKING,
+        LockStatus.LOCKED,
+        LockStatus.LOCKING,
     )
 
 
