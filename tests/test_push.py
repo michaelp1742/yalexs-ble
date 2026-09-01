@@ -4727,11 +4727,11 @@ async def test_exhausted_retries_after_write_success_stamp_unknown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unlatch_stamps_unlatching_then_unlocked():
-    """The new public unlatch() maps to force_unlatch, stamping UNLATCHING at
-    write-success and UNLOCKED on success: the op-response arrives when the
-    latch has returned from its open dwell, so UNLATCHED is never the
-    completed state."""
+async def test_unlatch_stamps_unlatching_then_unlatched():
+    """The public unlatch() maps to force_unlatch, stamping UNLATCHING at
+    write-success and UNLATCHED on success: the op-response answers the
+    latch pull, so the operation's own outcome is the open door lock, and
+    the state the lock settles to arrives as a later status update."""
     push_lock = _operational_push_lock()
     order: list[str | LockStatus] = []
 
@@ -4753,8 +4753,81 @@ async def test_unlatch_stamps_unlatching_then_unlocked():
     ):
         await push_lock.unlatch()
 
-    assert order == ["write_success", LockStatus.UNLATCHING, LockStatus.UNLOCKED]
-    assert push_lock.lock_status == LockStatus.UNLOCKED
+    assert order == ["write_success", LockStatus.UNLATCHING, LockStatus.UNLATCHED]
+    assert push_lock.lock_status == LockStatus.UNLATCHED
+    # UNLATCHED is not a position, so it is not marked seen and the cycles
+    # after the follow-up poll keep asking for the settled reading.
+    assert LockStatus not in push_lock._seen_this_session
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resting_state",
+    [LockStatus.UNLOCKED, LockStatus.LOCKED],
+    ids=["unlocked", "locked"],
+)
+async def test_the_resting_state_replaces_unlatched_when_it_arrives(
+    resting_state: LockStatus,
+) -> None:
+    """A status arriving after the unlatch completes replaces UNLATCHED.
+
+    The lock reports UNLATCHED for the whole dwell and settles where the
+    mechanism takes it: UNLOCKED, or LOCKED once auto-relock has run or on
+    a lock with no separate unlocked rest. The display follows the report
+    either way.
+    """
+    push_lock = _operational_push_lock()
+    mock_lock = MagicMock()
+
+    async def force_unlatch(write_success_callback):
+        write_success_callback()
+
+    mock_lock.force_unlatch = force_unlatch
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.unlatch()
+
+    assert push_lock.lock_status == LockStatus.UNLATCHED
+    push_lock._state_callback([resting_state])
+    assert push_lock.lock_status == resting_state
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_unlatching_a_secured_lock_animates_then_releases_the_secure_lock() -> (
+    None
+):
+    """An unlatch is the Unlock opcode, so it releases a secured lock.
+
+    The secure channel animates UNLOCKING while the latch is driven and
+    reads UNLOCKED once the operation completes: UNLATCHED is the main
+    lock's value alone and never reaches the secure channel.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:51")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+    secure: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: secure.append(ls.secure))
+    mock_lock = MagicMock()
+
+    async def force_unlatch(write_success_callback):
+        write_success_callback()
+
+    mock_lock.force_unlatch = force_unlatch
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.unlatch()
+
+    assert secure == [LockStatus.UNLOCKING, LockStatus.UNLOCKED]
+    assert push_lock.lock_status == LockStatus.UNLATCHED
     push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
 

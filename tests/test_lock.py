@@ -1491,18 +1491,22 @@ async def test_public_unlatch_wrapper_runs_force_unlatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
-    """Unlatch gets the longer op-response budget because it is a longer motion.
+async def test_force_unlatch_passes_its_own_op_response_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlatch passes its own op-response budget and the unlatch encoding.
 
-    force_unlatch passes UNLATCH_OPERATION_RESPONSE_TIMEOUT, and encodes
+    The budget is a separate tuning point so the unlatch can be tuned on
+    its own without moving the other operations, held at the plain value
+    today; the constant is patched to a distinct value here because equal
+    constants cannot show which one is passed. force_unlatch encodes
     unlatch as the Unlock opcode with the unlatch operation byte (there is
     no dedicated unlatch opcode).
 
     The opcode and operation byte are asserted against the wire values, not
     against the constants that produced them: #351 sent operation byte 0x01.
-    The budget is asserted to exceed the plain one, the property the
-    extension exists for.
     """
+    monkeypatch.setattr("yalexs_ble.lock.UNLATCH_OPERATION_RESPONSE_TIMEOUT", 21.5)
     lock = _make_lock()
     session = MagicMock()
 
@@ -1535,8 +1539,7 @@ async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
     lock._execute_operation_command = _capture  # type: ignore[method-assign]
 
     await lock.force_unlatch()
-    assert captured_timeout == UNLATCH_OPERATION_RESPONSE_TIMEOUT
-    assert UNLATCH_OPERATION_RESPONSE_TIMEOUT > OPERATION_RESPONSE_TIMEOUT
+    assert captured_timeout == 21.5
     assert captured_command is not None
     assert captured_command[0x01] == 0x0A  # the Unlock opcode
     assert captured_command[0x04] == 0x0A  # the unlatch operation byte
@@ -1544,13 +1547,13 @@ async def test_force_unlatch_grants_the_extended_op_response_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_every_operation_names_the_budget_its_motion_needs() -> None:
-    """Each operation passes its own response budget; none is defaulted.
+    """Each operation passes a budget explicitly; none inherits one.
 
-    The budget is a property of the motion, so it is set where the operation
-    is issued rather than inherited from a signature: lock, unlock and
-    securemode move the lock, an unlatch also pulls the latch in and holds it
-    out. _execute_operation_command takes it as a required argument, which is
-    what makes an operation added later choose rather than inherit.
+    _execute_operation_command takes the budget as a required argument, so an
+    operation added later has to choose one. The unlatch budget and the plain
+    budget carry the same value today, so which constant force_unlatch reads
+    is pinned by test_force_unlatch_passes_its_own_op_response_budget, which
+    patches it to a distinct value.
     """
     lock = _make_lock()
     lock.session = MagicMock()
@@ -1590,9 +1593,9 @@ async def test_unlatch_is_the_only_operation_that_skips_the_ack_wait() -> None:
 
     The acknowledgment is an early delivery signal and it pays only where the
     caller may re-send. Lock, unlock and securemode may, so a missing
-    acknowledgment should end their attempt early. An unlatch may not once its
-    command is written, and its op-response lands well past the acknowledgment
-    budget, so the stage could only end the operation while the latch was out.
+    acknowledgment should end their attempt early. An unlatch may not once
+    its command is written, so a missing acknowledgment must not end an
+    attempt whose op-response could still arrive.
     """
     lock = _make_lock()
     lock.session = MagicMock()
@@ -1632,7 +1635,7 @@ async def test_an_unlatch_completes_without_an_acknowledgment(
     """An unlatch whose acknowledgment never arrives completes on its op-response.
 
     The lock acknowledges nothing here and its op-response lands past the
-    acknowledgment budget, well inside the unlatch's own. Only the skipped
+    acknowledgment budget, inside the operation budget. Only the skipped
     stage reaching the session makes that exchange a success: with the stage
     in place the attempt ends as a failure while the latch is out, and the
     op-response the lock did send arrives with nothing waiting for it.
