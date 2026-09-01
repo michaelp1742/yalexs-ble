@@ -650,6 +650,10 @@ class Lock:
         There is no unlatch opcode: this is Unlock with operation byte
         0x0A, answered by a normal Unlock op-response.
 
+        The op-response answers the latch pull: the dwell and the latch's
+        return run after it, so returning here does not mean the cycle has
+        finished.
+
         A repeated unlatch opens the door again, so once the write has been
         attempted no failure may re-send the command, and every such
         failure converts to UnlatchError, which is not retryable. The two
@@ -756,8 +760,8 @@ class Lock:
             await self.force_unlock()
 
     async def unlatch(self) -> None:
-        """Unlatch; this always runs the operation, since a momentary
-        action leaves no state a status read could test.
+        """Unlatch; this always runs the operation, since there is no
+        resting state to compare against.
 
         Raises OperationFailedError on a reported failure.
         """
