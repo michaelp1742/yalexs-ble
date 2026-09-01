@@ -593,6 +593,10 @@ class Lock:
         The Unlock opcode with operation byte 0x0A (there is no dedicated
         unlatch opcode); its op-response is a normal Unlock (0xBB 0A) frame.
 
+        The op-response answers the latch pull: the dwell and the latch's
+        return run after it, so returning here does not mean the cycle has
+        finished.
+
         A repeated unlatch fires the latch again, opening the door again, so
         once the command write has been ATTEMPTED no failure may re-send it: a
         write call that errors can still have delivered the request (the PDU
@@ -692,8 +696,8 @@ class Lock:
             await self.force_unlock()
 
     async def unlatch(self) -> None:
-        """Unlatch; this always runs the operation, since a momentary
-        action leaves no state a status read could test.
+        """Unlatch; this always runs the operation, since there is no
+        resting state to compare against.
         """
         await self.force_unlatch()
 

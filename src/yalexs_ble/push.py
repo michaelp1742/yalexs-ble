@@ -800,11 +800,13 @@ class PushLock:
     async def unlatch(self) -> None:
         """Unlatch (momentarily open) the lock.
 
-        The op-response arrives after the latch has returned, so the
-        completed state is UNLOCKED, not UNLATCHED.
+        The op-response answers the latch pull, so the completed state is
+        UNLATCHED: the latch is retracted and the door lock is open. The
+        dwell and the latch's return run after it, and the state the lock
+        settles to arrives as a later status update.
         """
         await self._run_lock_operation(
-            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
         )
 
     def _init_operation_state(self) -> None:
@@ -906,9 +908,9 @@ class PushLock:
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
         # A settled pair waits the keep-alive; an unsettled one polls at
-        # the stale-state debounce, the earliest a poll answers with the
-        # motor stopped. The two motion values are the only transitional
-        # readings the projection publishes on the secure channel.
+        # the stale-state debounce. The two motion values are the only
+        # transitional readings the projection publishes on the secure
+        # channel.
         if self.lock_status in POSITION_READINGS and self.secure_status not in (
             LockStatus.LOCKING,
             LockStatus.UNLOCKING,

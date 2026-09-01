@@ -31,6 +31,7 @@ from yalexs_ble.session import (
     OperationProgress,
     ResponseError,
     Session,
+    UnlatchError,
 )
 
 # Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
@@ -1144,9 +1145,11 @@ def test_operation_response_timeout_outlasts_the_acknowledgment_budget(
     budget at or below ACK_TIMEOUT could reach stage 2 with nothing left and
     fail the operation the moment the acknowledgment lands. The unlatch
     skips the acknowledgment stage, but ACK_TIMEOUT still bounds its GATT
-    write, so the same floor holds. The relationship is the invariant; the
-    plain budget is sized off the observed op-response arrival distribution
-    and moves with it, and the unlatch budget derives from its latch travel.
+    write, so the same floor holds. The floor is asserted once per budget
+    constant rather than once per distinct value: the plain budget is sized
+    off the observed op-response arrival distribution and the unlatch budget
+    is the latch pull's own tuning point, so the two names carry one value
+    today and either may be moved on its own.
     """
     assert budget > ACK_TIMEOUT
 
@@ -1160,6 +1163,18 @@ def test_operation_incomplete_error_passes_the_retry_decorator() -> None:
     that and leaves every other test in this file green.
     """
     assert not issubclass(OperationIncompleteError, RETRYABLE_EXCEPTIONS)
+
+
+def test_unlatch_error_passes_the_retry_decorator() -> None:
+    """A repeated unlatch opens the door again, so the type must not retry.
+
+    force_unlatch converts every post-write failure to this type, and the
+    conversion only stops the re-send while the type stays outside the retry
+    set. The set is assembled from bleak_retry_connector, so reparenting
+    UnlatchError under BleakError or ResponseError would put it back in and
+    leaves every other test in this file green.
+    """
+    assert not issubclass(UnlatchError, RETRYABLE_EXCEPTIONS)
 
 
 @pytest.mark.asyncio

@@ -34,16 +34,15 @@ RESPONSE_TIMEOUT = 10.0
 # disconnect, not an expired stage.
 ACK_TIMEOUT = 8.0
 
-# Budget for a whole operation, command write to op-response. The motor
-# runs from the command write, and the acknowledgment is transport
-# acceptance, so a slow acknowledgment does not cut into motion time. An
-# operation with a longer motion passes its own budget.
+# How long the whole operation, command write to op-response, may take. The
+# motor runs from the command write, and the acknowledgment is transport
+# acceptance, so it is expected before the motor stops.
 OPERATION_RESPONSE_TIMEOUT = 12.0
 
-# The operation budget for an unlatch: an unlatch is an unlock that also
-# fires the latch, so the latch's pull in, hold, and release stack on
-# the mechanical movement the plain budget covers.
-UNLATCH_OPERATION_RESPONSE_TIMEOUT = 20.0
+# How long the unlatch operation may take: an unlatch is an unlock that also
+# unlatches the door. A separate value to allow independent tuning of the
+# unlatch operation.
+UNLATCH_OPERATION_RESPONSE_TIMEOUT = 12.0
 
 
 class YaleXSBLEError(Exception):
@@ -696,28 +695,22 @@ class Session:
     ) -> bytes:
         """Execute a mechanical operation command with the staged wait.
 
-        With the acknowledgment stage in place, failures up to the
-        acknowledgment keep their retryable types, so the caller's retry
-        decorator re-sends early; the acknowledgment has no mechanical
-        delay, so its absence means delivery failed.
-        Later failures raise OperationIncompleteError, which ends the retry
-        attempts with the result unknown.
+        Failures up to the acknowledgment stay retryable, so the caller's
+        retry decorator re-sends early; the acknowledgment has no mechanical
+        delay, so its absence means delivery failed. Later failures raise
+        OperationIncompleteError, which ends the retry attempts with the
+        result unknown.
 
-        response_timeout is the budget for the whole exchange, measured from
-        the moment the command is issued. Size it above ACK_TIMEOUT: the
-        remainder left once the operation is acknowledged is the op-response
-        wait, so a budget at or below ACK_TIMEOUT leaves that wait no time
-        at all. OPERATION_RESPONSE_TIMEOUT is that budget for the operations
-        sized here, and an operation with a longer motion passes its own.
+        response_timeout is the maximum time allowed for the whole operation
+        including the mechanical operation time, measured from the moment the
+        command is issued. Sized above ACK_TIMEOUT.
 
         wait_for_ack=False skips the acknowledgment wait, for a caller
         whose failure handling must never re-send: a lost acknowledgment
         would otherwise end an operation whose result could still arrive.
-        It does not by itself stop a re-send: a post-write disconnect with
-        nothing acknowledged still raises its retryable type, so such a
-        caller converts on progress.write_attempted the way
-        Lock.force_unlatch does. The acknowledgment is still matched and
-        recorded when it lands; only the wait on it is dropped.
+        The acknowledgment is still matched and recorded when it lands;
+        only the wait on it is dropped. It does not by itself stop a re-send:
+        a post-write disconnect with nothing acknowledged is still retryable.
         """
         await self._wait_for_cooldown()
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
