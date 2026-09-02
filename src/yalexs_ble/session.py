@@ -706,7 +706,7 @@ class Session:
                 self.name,
                 command_name,
             )
-            return result
+            return self._completed(result, progress, command_name)
         if progress.acknowledged:
             raise OperationIncompleteError(
                 f"{self.name}: Disconnected while awaiting the op-response "
