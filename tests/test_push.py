@@ -4748,16 +4748,19 @@ async def test_unlatch_stamps_unlatching_then_unlatched():
 
     mock_lock.force_unlatch = force_unlatch
 
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
     ):
         await push_lock.unlatch()
 
     assert order == ["write_success", LockStatus.UNLATCHING, LockStatus.UNLATCHED]
     assert push_lock.lock_status == LockStatus.UNLATCHED
-    # UNLATCHED is not a position, so it is not marked seen and the cycles
-    # after the follow-up poll keep asking for the settled reading.
-    assert LockStatus not in push_lock._seen_this_session
+    # UNLATCHED is a position the lock holds, so it is marked seen as any
+    # other position is, and the follow-up poll the operation owes waits
+    # the keep-alive.
+    assert LockStatus in push_lock._seen_this_session
+    schedule.assert_called_once_with(KEEP_ALIVE_TIME)
     push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
 
@@ -5152,7 +5155,6 @@ async def test_a_failed_status_read_leaves_the_poll_obligation_armed() -> None:
         LockStatus.LOCKING,
         LockStatus.UNLOCKING,
         LockStatus.UNLATCHING,
-        LockStatus.UNLATCHED,
         LockStatus.UNKNOWN,
     ],
 )
@@ -5164,8 +5166,7 @@ async def test_a_value_the_lock_is_not_holding_is_not_a_status_reading(
 
     Recording one in _seen_this_session would suppress the follow-up lock_status()
     poll in _update, and that poll's reading is what replaces it once the
-    mechanism stops. UNLATCHED is here with the transitionals: the latch is
-    open for its dwell and the lock leaves that state on its own.
+    mechanism stops.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:47")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
@@ -5182,6 +5183,7 @@ async def test_a_value_the_lock_is_not_holding_is_not_a_status_reading(
     [
         LockStatus.LOCKED,
         LockStatus.UNLOCKED,
+        LockStatus.UNLATCHED,
         LockStatus.SECUREMODE,
         LockStatus.JAMMED,
         LockStatus.UNKNOWN_01,
@@ -5193,9 +5195,9 @@ async def test_a_position_the_lock_holds_counts_as_a_status_reading(
 ) -> None:
     """The other side of the same set: each of these does suppress the poll.
 
-    The lock stays in each of these until an operation or a person moves it,
-    calibration and polarity discovery included, so the reading stands and
-    asking again this session would tell us nothing new.
+    The lock stays in each of these until an operation, a person, or its own
+    timer moves it, calibration and polarity discovery included, so the
+    reading stands until the lock reports the next one.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:67")
     push_lock._lock_state = _known_state(LockStatus.UNKNOWN)

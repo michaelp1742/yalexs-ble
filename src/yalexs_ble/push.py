@@ -133,8 +133,10 @@ DEADLINE_WAKEUP_RETRY_DELAY = 1.0
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
 # Statuses that report a position the lock is holding; the setup conditions
-# qualify because they end only by hand. Any other status needs the
-# follow-up lock_status() poll to replace it, so it must not enter
+# qualify because they end only by hand, and UNLATCHED qualifies because it
+# is the end state of an unlatch, held until the dwell runs out, as UNLOCKED
+# may be ended by auto-lock. Any other status needs the follow-up
+# lock_status() poll to replace it, so it must not enter
 # _seen_this_session, which would suppress that poll. An unlisted status
 # therefore costs a poll, not a stuck display. _finalize_operation reads the
 # set a second time to pick the delay for that poll.
@@ -142,6 +144,7 @@ POSITION_READINGS = frozenset(
     {
         LockStatus.LOCKED,
         LockStatus.UNLOCKED,
+        LockStatus.UNLATCHED,
         LockStatus.SECUREMODE,
         LockStatus.JAMMED,
         LockStatus.UNKNOWN_01,
