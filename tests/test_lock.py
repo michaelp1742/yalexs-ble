@@ -1471,7 +1471,7 @@ async def test_force_unlatch_passes_its_own_op_response_budget(
 
 
 @pytest.mark.asyncio
-async def test_every_operation_names_the_budget_its_motion_needs() -> None:
+async def test_every_operation_passes_a_budget_explicitly() -> None:
     """Each operation passes a budget explicitly; none inherits one.
 
     _execute_operation_command takes the budget as a required argument, so an

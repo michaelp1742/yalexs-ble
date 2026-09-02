@@ -39,9 +39,10 @@ ACK_TIMEOUT = 8.0
 # acceptance, so it is expected before the motor stops.
 OPERATION_RESPONSE_TIMEOUT = 12.0
 
-# How long the unlatch operation may take: an unlatch is an unlock that also
-# unlatches the door. A separate value to allow independent tuning of the
-# unlatch operation.
+# How long the unlatch operation may take, command write to op-response.
+# Its end state is UNLATCHED, and the dwell after it is not part of the
+# operation. A separate constant to allow independent tuning of the unlatch
+# operation.
 UNLATCH_OPERATION_RESPONSE_TIMEOUT = 12.0
 
 
@@ -696,17 +697,21 @@ class Session:
         """Execute a mechanical operation command with the staged wait.
 
         Failures up to the acknowledgment stay retryable, so the caller's
-        retry decorator re-sends early; the acknowledgment has no mechanical
-        delay, so its absence means delivery failed. Later failures raise
-        OperationIncompleteError, which ends the retry attempts with the
-        result unknown.
+        retry decorator re-sends early. The acknowledgment has no mechanical
+        delay, so its absence means the command was not delivered or the
+        acknowledgment was dropped; an op-response that arrives anyway shows
+        it was dropped. Later failures raise OperationIncompleteError, which
+        ends the retry attempts with the result unknown.
 
-        response_timeout is the maximum time allowed for the whole operation
-        including the mechanical operation time, measured from the moment the
-        command is issued. Sized above ACK_TIMEOUT.
+        response_timeout bounds the whole operation, command write to
+        op-response, measured from the moment the command is issued. On
+        success the lock sends the op-response at the command's end state,
+        and what ends that state later is not part of the operation: the
+        dwell ends UNLATCHED after an unlatch, as auto-lock may end UNLOCKED
+        after an unlock. Sized above ACK_TIMEOUT.
 
         wait_for_ack=False skips the acknowledgment wait, for a caller
-        whose failure handling must never re-send: a lost acknowledgment
+        whose failure handling must never re-send: a dropped acknowledgment
         would otherwise end an operation whose result could still arrive.
         The acknowledgment is still matched and recorded when it lands;
         only the wait on it is dropped. It does not by itself stop a re-send:
