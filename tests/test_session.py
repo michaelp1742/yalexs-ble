@@ -621,6 +621,7 @@ def _make_operation_session(
 # securemode = LOCK opcode (0x0B) with operation byte 0x04.
 _ACK_SECUREMODE = "aa0b00000400000000000000000000000200"
 _OP_RESPONSE_OK = "bb0b00000000000000000000000000000200"
+_OP_RESPONSE_UNLOCK_OK = "bb0a00000000000000000000000000000200"
 _SETTLED_STATUS = "bb0200000200000000000000000000000200"
 _FOREIGN_ACK = "aa0b00000000000000000000000000000200"
 
@@ -1513,6 +1514,47 @@ async def test_op_response_and_disconnect_in_one_turn_returns_the_result() -> No
 
     assert result == bytes(op_response)
     assert progress.result == bytes(op_response)
+
+
+@pytest.mark.asyncio
+async def test_a_result_recovered_at_a_disconnect_still_logs_a_missing_acknowledgment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The disconnect-race return is a completion, so it logs like the others.
+
+    An operation that skips the acknowledgment wait, the unlatch's shape, has
+    its op-response and a link drop land in one turn with nothing
+    acknowledged. The recorded result is returned, and the completion with
+    no acknowledgment is logged, the line every completion path carries.
+    """
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.UNLOCK, 0x0A)
+    op_response = _with_checksum(_OP_RESPONSE_UNLOCK_OK)
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        # Both land in the same turn, with no await between them, the drop
+        # delivered first, and no acknowledgment ever arrives.
+        _fire_disconnect(session)
+        session._notify(0, bytearray(op_response))
+
+    feeder = asyncio.create_task(feed())
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        result = await session.execute_operation(
+            command,
+            "force_unlatch",
+            ack_matcher=_ack_matcher(0x0A, 0x0A),
+            response_matcher=_operation_response_matcher(0x0A),
+            response_timeout=5.0,
+            progress=progress,
+            wait_for_ack=False,
+        )
+    await feeder
+
+    assert result == bytes(op_response)
+    assert progress.acknowledged is False
+    assert "completed on its op-response; no acknowledgment was received" in caplog.text
 
 
 @pytest.mark.asyncio
