@@ -531,16 +531,9 @@ class Session:
                     # op-response. That residual is accepted: requiring the
                     # acknowledgment first would instead drop a genuine
                     # op-response whose acknowledgment was lost.
-                    # The no-acknowledgment INFO belongs to this stage: with
-                    # the stage skipped the acknowledgment is a don't care.
-                    if not progress.acknowledged:
-                        _LOGGER.info(
-                            "%s: %s completed on its op-response; no "
-                            "acknowledgment was received",
-                            self.name,
-                            command_name,
-                        )
-                    return result_future.result()
+                    return self._completed(
+                        result_future.result(), progress, command_name
+                    )
                 if ack_future not in done:
                     raise TimeoutError(
                         f"{self.name}: No acknowledgment to {command_name} "
@@ -552,27 +545,26 @@ class Session:
                 async with util.asyncio_timeout(max(result_remaining, 0)):
                     result = await result_future
             except TimeoutError as err:
-                if (recorded := progress.result) is not None:
-                    # The op-response arrived in the same event-loop turn as
-                    # the timeout; report the recorded result, not the
-                    # timeout.
-                    _LOGGER.debug(
-                        "%s: op-response to %s arrived in the same turn as "
-                        "the stage-2 timeout; returning the recorded result",
-                        self.name,
-                        command_name,
+                if (recorded := progress.result) is None:
+                    never_acknowledged = (
+                        ""
+                        if progress.acknowledged
+                        else "; the command was never acknowledged"
                     )
-                    return recorded
-                never_acknowledged = (
-                    ""
-                    if progress.acknowledged
-                    else "; the command was never acknowledged"
+                    raise OperationIncompleteError(
+                        f"{self.name}: No op-response to {command_name} arrived "
+                        f"within {response_timeout}s of the command being issued"
+                        f"{never_acknowledged}"
+                    ) from err
+                # The op-response arrived in the same event-loop turn as the
+                # timeout; report the recorded result, not the timeout.
+                _LOGGER.debug(
+                    "%s: op-response to %s arrived in the same turn as "
+                    "the stage-2 timeout; returning the recorded result",
+                    self.name,
+                    command_name,
                 )
-                raise OperationIncompleteError(
-                    f"{self.name}: No op-response to {command_name} arrived "
-                    f"within {response_timeout}s of the command being issued"
-                    f"{never_acknowledged}"
-                ) from err
+                result = recorded
         finally:
             # Unconditional: the session lock serializes operations, so the
             # record armed above is still this operation's own.
@@ -583,6 +575,26 @@ class Session:
             if self._notify_future is result_future:
                 self._notify_future = None
                 self._notify_matcher = None
+        return self._completed(result, progress, command_name)
+
+    def _completed(
+        self, result: bytes, progress: OperationProgress, command_name: str
+    ) -> bytes:
+        """Return the op-response, logging a completion the lock never acknowledged.
+
+        The op-response is matched on the opcode alone, so a completion with
+        no acknowledgment recorded means either the acknowledgment was
+        dropped or a previous same-opcode command's late op-response
+        completed this wait. This line is the only trace of either in a
+        field log, so every completion path returns through here, the
+        unlatch's included, which skips the acknowledgment wait.
+        """
+        if not progress.acknowledged:
+            _LOGGER.info(
+                "%s: %s completed on its op-response; no acknowledgment was received",
+                self.name,
+                command_name,
+            )
         return result
 
     async def start_notify(self) -> None:
