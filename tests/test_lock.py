@@ -1630,7 +1630,7 @@ async def test_unlatch_is_the_only_operation_that_skips_the_ack_wait() -> None:
 
 @pytest.mark.asyncio
 async def test_an_unlatch_completes_without_an_acknowledgment(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """An unlatch whose acknowledgment never arrives completes on its op-response.
 
@@ -1638,7 +1638,9 @@ async def test_an_unlatch_completes_without_an_acknowledgment(
     acknowledgment budget, inside the operation budget. Only the skipped
     stage reaching the session makes that exchange a success: with the stage
     in place the attempt ends as a failure while the latch is out, and the
-    op-response the lock did send arrives with nothing waiting for it.
+    op-response the lock did send arrives with nothing waiting for it. The
+    missing acknowledgment is still logged, the same line every operation
+    gets, so the field log keeps its one trace of the case.
     """
     monkeypatch.setattr("yalexs_ble.session.ACK_TIMEOUT", 0.05)
     lock = _make_connected_lock_with_session()
@@ -1651,8 +1653,11 @@ async def test_an_unlatch_completes_without_an_acknowledgment(
         session._notify(0, bytearray(_op_response_frame(Commands.UNLOCK)))
 
     feeder = asyncio.create_task(feed())
-    await lock.force_unlatch()
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        await lock.force_unlatch()
     await feeder
+
+    assert "completed on its op-response; no acknowledgment was received" in caplog.text
 
 
 @pytest.mark.asyncio
