@@ -88,11 +88,6 @@ FIRST_CONNECTION_DISCONNECT_TIME = 2.1
 # the poll after an operation with the position it had left.
 LOCK_STALE_STATE_DEBOUNCE_DELAY = 6.1
 
-# How long to hold polls off the lock after an op-response for an operation
-# we did not issue. An operation of ours stamps the longer hold at its exit,
-# from a later moment, and the floor only moves forward.
-POST_OP_RESPONSE_DEBOUNCE_DELAY = 4.1
-
 # How long to wait before processing an advertisement change
 ADV_UPDATE_COALESCE_SECONDS = 0.05
 
@@ -909,7 +904,7 @@ class PushLock:
 
     def _op_response_callback(self) -> None:
         """Hold update cycles off the lock when an op-response arrives."""
-        self._hold_update(POST_OP_RESPONSE_DEBOUNCE_DELAY)
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
 
     def _close_operation_window(self) -> None:
         """Close the operation window and drop everything it recorded.
@@ -1898,9 +1893,8 @@ class PushLock:
     def _hold_update(self, seconds: float) -> None:
         """Hold scheduled update cycles off the lock for seconds from now.
 
-        _earliest_update_time only ever moves later: an op-response asking
-        for its shorter hold must not pull a poll back inside the window the
-        write-success stamp before it claimed.
+        _earliest_update_time only ever moves later, so a stamp taken now
+        never pulls the floor back inside a hold an earlier stamp claimed.
         """
         self._earliest_update_time = max(
             self._earliest_update_time, time.monotonic() + seconds

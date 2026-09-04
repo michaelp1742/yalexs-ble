@@ -44,7 +44,6 @@ from yalexs_ble.push import (
     LOCK_STALE_STATE_DEBOUNCE_DELAY,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
-    POST_OP_RESPONSE_DEBOUNCE_DELAY,
     RESYNC_DELAY,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
@@ -5934,41 +5933,34 @@ async def test_get_lock_instance_wires_the_op_response_observer():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stamps", "expected_delay"),
-    [
-        # A motion window outlasts an op-response inside it.
-        ((("motion", -4.0), ("op_response", -3.0)), 2.1),
-        # An op-response more than 2 s later carries the floor past it.
-        ((("motion", -5.0), ("op_response", -1.0)), 3.1),
-        # Later motion after a stale window holds from itself.
-        ((("motion", -5.0), ("motion", -2.0)), 4.1),
-    ],
-    ids=["motion-holds", "late-op-response-holds", "later-motion-holds"],
-)
-async def test_deferred_update_reschedules_to_the_standing_floor(
-    stamps, expected_delay
-):
-    """Within the hold the update reschedules by exactly the floor minus now."""
+async def test_deferred_update_reschedules_to_the_standing_floor():
+    """Within the hold the update reschedules by exactly the floor minus now:
+    a later stamp carries the floor forward, and a shorter one stamped after
+    it leaves the floor where it stands.
+    """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:5a")
     # A fake clock ahead of NEVER_TIME, which is a day behind the real one.
     now = NEVER_TIME + 90000.0
-    delays = {
-        "motion": LOCK_STALE_STATE_DEBOUNCE_DELAY,
-        "op_response": POST_OP_RESPONSE_DEBOUNCE_DELAY,
-    }
-    for moment, offset in stamps:
-        with patch("yalexs_ble.push.time.monotonic", return_value=now + offset):
-            push_lock._hold_update(delays[moment])
+    with patch("yalexs_ble.push.time.monotonic", return_value=now - 4.0):
+        push_lock._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+    first_floor = push_lock._earliest_update_time
+    with patch("yalexs_ble.push.time.monotonic", return_value=now - 2.0):
+        push_lock._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+    standing_floor = push_lock._earliest_update_time
+    assert standing_floor > first_floor
 
     with (
         patch("yalexs_ble.push.time.monotonic", return_value=now),
         patch.object(push_lock, "_schedule_future_update") as mock_reschedule,
     ):
+        push_lock._hold_update(1.0)
+        assert push_lock._earliest_update_time == standing_floor
         push_lock._deferred_update()
 
     mock_reschedule.assert_called_once()
-    assert mock_reschedule.call_args.args[0] == pytest.approx(expected_delay)
+    assert mock_reschedule.call_args.args[0] == pytest.approx(
+        LOCK_STALE_STATE_DEBOUNCE_DELAY - 2.0
+    )
 
 
 @pytest.mark.asyncio
@@ -5986,7 +5978,7 @@ async def test_external_op_response_alone_defers_poll():
 
     mock_reschedule.assert_called_once()
     assert mock_reschedule.call_args.args[0] == pytest.approx(
-        POST_OP_RESPONSE_DEBOUNCE_DELAY
+        LOCK_STALE_STATE_DEBOUNCE_DELAY
     )
 
 
