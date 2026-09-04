@@ -4112,7 +4112,7 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
-        pytest.raises(OperationIncompleteError),
+        pytest.raises(OperationIncompleteError) as raised,
     ):
         await push_lock.lock()
 
@@ -4120,6 +4120,7 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
     assert push_lock._seen_intervention_status is None
+    assert "dropped after the jam was reported" in str(raised.value)
 
 
 @pytest.mark.asyncio

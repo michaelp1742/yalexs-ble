@@ -1132,8 +1132,9 @@ class PushLock:
                 # retry set; the result truly never arrived.
                 raise OperationIncompleteError(
                     f"{self.name}: the lock reported {recorded} while "
-                    f"{op_attr} was in flight; the command was not re-sent "
-                    f"and the result is unknown"
+                    f"{op_attr} was in flight and the attempt ended with "
+                    f"{ex}; the command was not re-sent and the result is "
+                    f"unknown"
                 ) from ex
             # Close the window so the next attempt re-stamps at its
             # write-success; _finalize_operation applies the outcome if none
