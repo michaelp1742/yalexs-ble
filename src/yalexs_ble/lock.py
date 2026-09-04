@@ -253,7 +253,7 @@ class Lock:
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
         # Called when a LOCK/UNLOCK op-response is parsed, whoever issued
-        # the command. Externally started operations mostly produce none;
+        # the command. Externally started operations produce none;
         # a failure report is the exception.
         self._op_response_callback = op_response_callback
         # byte[15] of the most recent op-response: 0x00 success, non-zero =
@@ -376,11 +376,11 @@ class Lock:
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
                 and len(state) > 0x0F
             ):
+                result = state[0x0F]
+                self._last_op_error = result
                 self._run_stream_hook(
                     self._op_response_callback, "op_response_callback"
                 )
-                result = state[0x0F]
-                self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
                     solicited = state[1] == self._awaited_operation_opcode
                     if solicited and result in MECHANICAL_OPERATION_ERRORS:

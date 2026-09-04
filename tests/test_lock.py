@@ -1988,10 +1988,8 @@ def test_op_response_callback_fires_and_an_ack_carries_nothing() -> None:
     op_calls: list[int] = []
     lock = _make_lock(op_response_callback=lambda: op_calls.append(1))
 
-    lock_ack = lock._parse_state(bytes.fromhex("aa0b00490000000000000000000000000200"))
-    unlock_ack = lock._parse_state(
-        bytes.fromhex("aa0a004a0000000000000000000000000200")
-    )
+    lock_ack = lock._parse_state(bytes.fromhex(_LOCK_ACK_HEX))
+    unlock_ack = lock._parse_state(bytes.fromhex(_UNLOCK_ACK_HEX))
 
     assert lock_ack is not None
     assert unlock_ack is not None
@@ -2005,15 +2003,27 @@ def test_op_response_callback_fires_and_an_ack_carries_nothing() -> None:
     # it; a failure also arrives for an operation started at the lock or in
     # the app, which is the unarmed frame here.
     lock._awaited_operation_opcode = Commands.UNLOCK.value
-    success = lock._parse_state(bytes.fromhex("bb0a003b0000000000000000000000000000"))
+    success = lock._parse_state(_op_response_frame(Commands.UNLOCK))
     lock._awaited_operation_opcode = None
-    failure = lock._parse_state(bytes.fromhex("bb0a001c00000000000000000000001f0000"))
+    failure = lock._parse_state(
+        _op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION)
+    )
 
     assert op_calls == [1, 1]
     assert success is not None
     assert failure is not None
     assert list(success) == []
     assert list(failure) == [LockStatus.JAMMED]
+
+
+def test_op_response_callback_sees_the_frames_result() -> None:
+    """A hook reading the last result off the lock sees the frame it fires for."""
+    seen: list[int | None] = []
+    lock = _make_lock(op_response_callback=lambda: seen.append(lock._last_op_error))
+
+    lock._parse_state(_op_response_frame(Commands.LOCK, OperationError.MECH_POSITION))
+
+    assert seen == [OperationError.MECH_POSITION.value]
 
 
 @pytest.mark.asyncio
