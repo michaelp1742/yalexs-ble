@@ -667,31 +667,29 @@ class Session:
             disconnected_futures.discard(disconnected_future)
             self._first_request = False
 
-    def _outcome_after_disconnect(
+    def _outcome_after_failure(
         self, progress: OperationProgress, command_name: str, err: Exception
     ) -> bytes | None:
-        """Classify a lost link by how far the operation got.
+        """Classify a failed operation by how far it got.
 
-        Returns the op-response when the frame was recorded before the wait
-        was lost, raises OperationIncompleteError once the command was
-        acknowledged and the result is therefore unknown, and returns None
-        while nothing was acknowledged, which leaves the caller to raise the
-        retryable error the drop came in as.
+        Returns the op-response when one was recorded before the failure,
+        raises OperationIncompleteError once the command was acknowledged and
+        the result is therefore unknown, and returns None while nothing was
+        acknowledged, which leaves the caller to raise the failure as it came
+        in, retryable.
         """
         if (result := progress.result) is not None:
-            # The op-response arrived in the same event-loop turn as the
-            # disconnect; report the recorded result.
             _LOGGER.debug(
-                "%s: Disconnected in the same turn as the op-response to "
-                "%s; returning the recorded result",
+                "%s: %s failed in the same turn as its op-response arrived; "
+                "returning the recorded result",
                 self.name,
                 command_name,
             )
             return self._completed(result, progress, command_name)
         if progress.acknowledged:
             raise OperationIncompleteError(
-                f"{self.name}: Disconnected while awaiting the op-response "
-                f"to {command_name}; the result is unknown"
+                f"{self.name}: {command_name} failed after the lock "
+                f"acknowledged it: {err!r}; the result is unknown"
             ) from err
         return None
 
@@ -708,12 +706,11 @@ class Session:
     ) -> bytes:
         """Execute a mechanical operation command with the staged wait.
 
-        Failures up to the acknowledgment stay retryable, so the caller's
-        retry decorator re-sends early. The acknowledgment has no mechanical
-        delay, so its absence means the command was not delivered or the
-        acknowledgment was dropped; an op-response that arrives anyway shows
-        it was dropped. Later failures raise OperationIncompleteError, which
-        ends the retry attempts with the result unknown.
+        A failure is classified by how far the operation got, whatever raised
+        it. Nothing acknowledged: the failure keeps its own type, so the
+        caller's retry decorator re-sends. Acknowledged: the lock has the
+        command and the result is unknown, so the failure ends the attempts as
+        OperationIncompleteError. Op-response recorded: it is returned.
 
         response_timeout bounds the whole operation, command write to
         op-response, measured from the moment the command is issued. On
@@ -754,21 +751,21 @@ class Session:
                     write_success_callback,
                     wait_for_ack,
                 )
-        except DisconnectedError as err:
-            result = self._outcome_after_disconnect(progress, command_name, err)
-            if result is not None:
-                return result
+        except OperationIncompleteError:
             raise
-        except BleakError as err:
-            if self._first_request and util.is_key_error(err):
-                raise AuthError(
-                    f"Authentication error: key or slot (key index) is incorrect: {err}"
-                ) from err
-            if util.is_disconnected_error(err):
-                result = self._outcome_after_disconnect(progress, command_name, err)
-                if result is not None:
-                    return result
-                raise DisconnectedError(f"{self.name}: {err}") from err
+        except Exception as err:
+            if (
+                result := self._outcome_after_failure(progress, command_name, err)
+            ) is not None:
+                return result
+            if isinstance(err, BleakError):
+                if self._first_request and util.is_key_error(err):
+                    raise AuthError(
+                        "Authentication error: key or slot (key index) is "
+                        f"incorrect: {err}"
+                    ) from err
+                if util.is_disconnected_error(err):
+                    raise DisconnectedError(f"{self.name}: {err}") from err
             raise
         finally:
             disconnected_futures.discard(disconnected_future)

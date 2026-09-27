@@ -1781,6 +1781,92 @@ async def test_errored_write_still_reports_the_write_as_attempted() -> None:
         )
 
     assert progress.write_attempted is True
+    assert progress.acknowledged is False
+
+
+def _write_feeding(
+    session: Session, frames: list[bytearray], error: BaseException
+) -> Callable[..., None]:
+    """Build a write that delivers frames before it fails, as the host can."""
+
+    def _write(*_: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+        raise error
+
+    return _write
+
+
+@pytest.mark.asyncio
+async def test_a_write_error_after_the_acknowledgment_is_operation_incomplete() -> None:
+    """A write that errors once its acknowledgment is recorded is not retried."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    client.write_gatt_char.side_effect = _write_feeding(
+        session, [_with_checksum(_ACK_SECUREMODE)], BleakError("write failed")
+    )
+
+    with pytest.raises(OperationIncompleteError, match="write failed"):
+        await session.execute_operation(
+            session.build_operation_command(Commands.LOCK, 0x04),
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=progress,
+        )
+
+    assert client.write_gatt_char.await_count == 1
+    assert progress.acknowledged is True
+
+
+@pytest.mark.asyncio
+async def test_a_write_timeout_after_the_acknowledgment_is_operation_incomplete() -> (
+    None
+):
+    """A write that stalls once its acknowledgment is recorded is not retried."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    client.write_gatt_char.side_effect = _write_feeding(
+        session, [_with_checksum(_ACK_SECUREMODE)], TimeoutError()
+    )
+
+    with pytest.raises(OperationIncompleteError, match="TimeoutError"):
+        await session.execute_operation(
+            session.build_operation_command(Commands.LOCK, 0x04),
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=progress,
+        )
+
+    assert client.write_gatt_char.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_write_error_after_the_op_response_returns_the_result() -> None:
+    """A write that errors once its op-response is recorded returns that result."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+    client.write_gatt_char.side_effect = _write_feeding(
+        session,
+        [_with_checksum(_ACK_SECUREMODE), op_response],
+        BleakError("write failed"),
+    )
+
+    result = await session.execute_operation(
+        session.build_operation_command(Commands.LOCK, 0x04),
+        "force_securemode",
+        ack_matcher=_ack_matcher(0x0B, 0x04),
+        response_matcher=_operation_response_matcher(0x0B),
+        response_timeout=5.0,
+        progress=progress,
+    )
+
+    assert result == bytes(op_response)
+    assert client.write_gatt_char.await_count == 1
 
 
 @pytest.mark.asyncio
