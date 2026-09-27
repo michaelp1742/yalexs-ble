@@ -1202,6 +1202,12 @@ class PushLock:
             raise TimeoutError(
                 f"{self.name}: Lock did not confirm the auto lock setting write"
             ) from err
+        finally:
+            if self._running:
+                # Scheduled once the attempts are over: the next cycle reads
+                # the new value back and carries whatever poll the cancel
+                # inside the attempts dropped; the floor still paces it.
+                self._schedule_future_update_with_debounce(0)
 
     @retry_bluetooth_connection_error(attempts=AUTO_LOCK_WRITE_ATTEMPTS)
     async def _set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
