@@ -680,10 +680,11 @@ class Session:
         """
         if (result := progress.result) is not None:
             _LOGGER.debug(
-                "%s: %s failed in the same turn as its op-response arrived; "
+                "%s: %s failed after its op-response was recorded: %r; "
                 "returning the recorded result",
                 self.name,
                 command_name,
+                err,
             )
             return self._completed(result, progress, command_name)
         if progress.acknowledged:
@@ -707,10 +708,10 @@ class Session:
         """Execute a mechanical operation command with the staged wait.
 
         A failure is classified by how far the operation got, whatever raised
-        it. Nothing acknowledged: the failure keeps its own type, so the
-        caller's retry decorator re-sends. Acknowledged: the lock has the
-        command and the result is unknown, so the failure ends the attempts as
-        OperationIncompleteError. Op-response recorded: it is returned.
+        it: an op-response recorded before the failure is returned; a failure
+        after the acknowledgment ends the attempts as OperationIncompleteError,
+        the result unknown; a failure with nothing acknowledged is raised as
+        execute() raises it, for the caller's retry decorator to re-send.
 
         response_timeout bounds the whole operation, command write to
         op-response, measured from the moment the command is issued. On
@@ -753,6 +754,9 @@ class Session:
                 )
         except OperationIncompleteError:
             raise
+        # Every failure, whatever its type: the retry set reaches past
+        # BleakError to AttributeError, EOFError and BrokenPipeError, and none
+        # of them may reach a retry once the lock has acknowledged the command.
         except Exception as err:
             if (
                 result := self._outcome_after_failure(progress, command_name, err)
