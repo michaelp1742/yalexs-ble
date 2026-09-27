@@ -1584,8 +1584,12 @@ class PushLock:
         return True
 
     @operation_lock
-    @retry_bluetooth_connection_error
     async def _update(self) -> None:
+        """Run one update cycle under the operation lock."""
+        await self._locked_update()
+
+    @retry_bluetooth_connection_error
+    async def _locked_update(self) -> None:
         """Update the lock state.
 
         Returns nothing. Every value this cycle asks for is applied as the
@@ -1996,7 +2000,18 @@ class PushLock:
             return
         _LOGGER.debug("%s: Starting deferred update", self.name)
         try:
-            await self._update()
+            async with self._operation_lock:
+                # Read under the lock: an operation may have run between the
+                # timer's own check and this task taking the lock, and its exit
+                # stamped the floor for the position the lock was leaving.
+                now = time.monotonic()
+                if now < self._earliest_update_time:
+                    _LOGGER.debug(
+                        "%s: Rescheduling update to avoid stale state", self.name
+                    )
+                    self._schedule_future_update(self._earliest_update_time - now)
+                    return
+                await self._locked_update()
             self._set_update_state(None)
         except AuthError as ex:
             self._set_update_state(ex)
