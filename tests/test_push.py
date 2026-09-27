@@ -4284,12 +4284,13 @@ async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
 
 @pytest.mark.asyncio
 async def test_window_filter_drops_lock_status_admits_the_door_member() -> None:
-    """Literal filter opened via write-success: even mid-window JAMMED is dropped.
+    """The window opened at write-success refuses every lock status and records a jam.
 
-    Distinct from the existing window tests (which set the flag directly and do
-    not feed JAMMED): the window is opened through the real
-    _operation_write_success path, and mid-window JAMMED is dropped with NO
-    special-casing, while the door member of the same frame still passes.
+    Distinct from the existing window tests, which set the flag directly and
+    do not feed JAMMED: the window is opened through the real
+    _operation_write_success path. A mid-window position is refused, a
+    mid-window JAMMED is refused from the display and recorded for the
+    operation's exit, and the door member of the same frame still passes.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3b")
 
@@ -4299,19 +4300,20 @@ async def test_window_filter_drops_lock_status_admits_the_door_member() -> None:
     assert push_lock.lock_status is LockStatus.LOCKING
     assert push_lock._operation_window_open is True
 
-    # A foreign settle mid-window is dropped (literal filter).
+    # A foreign settle mid-window is refused.
     push_lock._update_any_state([LockStatus.LOCKED])
     assert push_lock.lock_status is LockStatus.LOCKING
 
-    # Foreign jam evidence mid-window is dropped too (no special-casing), and it
-    # arms no hold; the window check comes before the jam-hold logic.
+    # A mid-window JAMMED is refused from the display too; it is recorded
+    # for the operation's exit.
     push_lock._update_any_state([LockStatus.JAMMED])
     assert push_lock.lock_status is LockStatus.LOCKING
+    assert push_lock._seen_intervention_status is LockStatus.JAMMED
+    # The window check comes before the hold, so the JAMMED arms none.
     assert push_lock._jammed_hold_deadline == NEVER_TIME
 
-    # A door event is the one status the lock sends during an operation, and it
-    # still reaches the display: only the lock member goes through
-    # _admit_lock_status.
+    # A door value in the same frame still reaches the display: only the lock
+    # member goes through _admit_lock_status.
     push_lock._update_any_state([DoorStatus.OPENED])
     assert push_lock.door_status is DoorStatus.OPENED
 
@@ -4902,11 +4904,9 @@ async def test_unlatching_a_secured_lock_animates_then_releases_the_secure_lock(
 async def test_no_update_cycle_is_armed_inside_an_operation() -> None:
     """Nothing the operation applies arms a cycle while the operation runs.
 
-    A cycle armed here waits on the operation lock and runs the instant the
-    operation ends, inside the post-operation debounce delay the stale-state
-    guard exists to protect. The transitional and the completed status are
-    applied by the operation itself, so they arm nothing; the status poll is
-    scheduled once the operation is over.
+    The transitional and the completed status are applied by the operation
+    itself, so they arm nothing; the status poll is scheduled once the
+    operation is over.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:43")
     # A known prior status, so a change to the transitional would arm a resync.
