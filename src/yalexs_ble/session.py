@@ -630,6 +630,20 @@ class Session:
             # it means a battery pull is required to recover.
             await asyncio.sleep(COOLDOWN_TIME - cooldown_remain)
 
+    def _raise_for_bleak_error(self, err: BleakError) -> None:
+        """Raise the error a BleakError from a write stands for.
+
+        A key error on the first request is an AuthError and a lost link is
+        a DisconnectedError; any other BleakError returns, to be raised as
+        it is.
+        """
+        if self._first_request and util.is_key_error(err):
+            raise AuthError(
+                f"Authentication error: key or slot (key index) is incorrect: {err}"
+            ) from err
+        if util.is_disconnected_error(err):
+            raise DisconnectedError(f"{self.name}: {err}") from err
+
     async def execute(
         self,
         command: bytearray,
@@ -656,12 +670,7 @@ class Session:
             ):
                 return await self._write(command, command_name, response_matcher)
         except BleakError as err:
-            if self._first_request and util.is_key_error(err):
-                raise AuthError(
-                    f"Authentication error: key or slot (key index) is incorrect: {err}"
-                ) from err
-            if util.is_disconnected_error(err):
-                raise DisconnectedError(f"{self.name}: {err}") from err
+            self._raise_for_bleak_error(err)
             raise
         finally:
             disconnected_futures.discard(disconnected_future)
@@ -763,13 +772,7 @@ class Session:
             ) is not None:
                 return result
             if isinstance(err, BleakError):
-                if self._first_request and util.is_key_error(err):
-                    raise AuthError(
-                        "Authentication error: key or slot (key index) is "
-                        f"incorrect: {err}"
-                    ) from err
-                if util.is_disconnected_error(err):
-                    raise DisconnectedError(f"{self.name}: {err}") from err
+                self._raise_for_bleak_error(err)
             raise
         finally:
             disconnected_futures.discard(disconnected_future)
