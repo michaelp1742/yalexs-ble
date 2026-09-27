@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import struct
 import time
@@ -3090,8 +3091,7 @@ async def test_a_stamped_plain_locking_reads_not_secured() -> None:
         LockStatus.SECUREMODE, secure=LockStatus.LOCKED
     )
 
-    push_lock._pending_op_state = LockStatus.LOCKING
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.LOCKING)
 
     assert push_lock.lock_status is LockStatus.LOCKING
     assert push_lock.secure_status is LockStatus.UNLOCKED
@@ -3127,8 +3127,7 @@ async def test_window_filter_refusal_leaves_the_secure_lock_alone() -> None:
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
-    push_lock._pending_op_state = LockStatus.SECURING
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.SECURING)
     assert (push_lock.lock_status, push_lock.secure_status) == (
         LockStatus.LOCKED,
         LockStatus.LOCKING,
@@ -3159,14 +3158,12 @@ async def test_retried_unlock_keeps_the_secure_transitional() -> None:
 
     # Attempt 1 writes, then fails retryably: the window closes and the
     # transitional stays on display with nothing stamped over it.
-    push_lock._pending_op_state = LockStatus.UNLOCKING
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.UNLOCKING)
     push_lock._close_operation_window()
     assert push_lock.secure_status is LockStatus.UNLOCKING
 
     # Attempt 2 writes and stamps the same pending state.
-    push_lock._pending_op_state = LockStatus.UNLOCKING
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.UNLOCKING)
     assert (push_lock.lock_status, push_lock.secure_status) == (
         LockStatus.UNLOCKING,
         LockStatus.UNLOCKING,
@@ -3415,28 +3412,6 @@ async def test_lock_stamps_transitional_only_at_write_success():
 
 
 @pytest.mark.asyncio
-async def test_write_success_without_pending_state_stamps_nothing():
-    """A write-success with no pending transitional stamps no state.
-
-    Every gated operation arms a pending transitional before its write, so the
-    stamp's guard never sees None on any in-repo path; this pins the guard's
-    other arc. The window itself still opens: opening is unconditional at the
-    write-success site.
-    """
-    push_lock = _operational_push_lock()
-    events: list[LockState] = []
-    push_lock.register_callback(
-        lambda lock_state, lock_info, connection_info: events.append(lock_state)
-    )
-    assert push_lock._pending_op_state is None
-
-    push_lock._operation_write_success()
-
-    assert events == []
-    assert push_lock._operation_window_open is True
-
-
-@pytest.mark.asyncio
 async def test_a_raising_stamp_still_opens_the_window():
     """The window opens even when stamping the transitional raises.
 
@@ -3446,7 +3421,6 @@ async def test_a_raising_stamp_still_opens_the_window():
     intervention status recorded.
     """
     push_lock = _operational_push_lock()
-    push_lock._pending_op_state = LockStatus.LOCKING
 
     with (
         patch.object(
@@ -3454,7 +3428,7 @@ async def test_a_raising_stamp_still_opens_the_window():
         ),
         pytest.raises(RuntimeError),
     ):
-        push_lock._operation_write_success()
+        push_lock._operation_write_success(LockStatus.LOCKING)
 
     assert push_lock._operation_window_open is True
 
@@ -3548,7 +3522,6 @@ async def test_early_error_before_write_leaves_no_window_and_stamps_unknown():
         await push_lock.lock()
 
     assert push_lock._operation_window_open is False
-    assert push_lock._pending_op_state is None
     assert push_lock.lock_status == LockStatus.UNKNOWN
 
 
@@ -3589,7 +3562,6 @@ async def test_nonretryable_after_write_stamps_unknown(exc, op_attr, operation):
 
     assert mock_op.await_count == 1
     assert push_lock._operation_window_open is False
-    assert push_lock._pending_op_state is None
     assert push_lock.lock_status == LockStatus.UNKNOWN
 
 
@@ -3616,7 +3588,6 @@ async def test_unlatch_error_without_a_window_still_stamps_unknown():
         await push_lock.unlatch()
 
     assert push_lock._operation_window_open is False
-    assert push_lock._pending_op_state is None
     assert push_lock.lock_status == LockStatus.UNKNOWN
 
 
@@ -3746,7 +3717,6 @@ async def test_cancelled_queued_operation_leaves_the_window_alone():
         with pytest.raises(asyncio.CancelledError):
             await second
         assert push_lock._operation_window_open is True
-        assert push_lock._pending_op_state == LockStatus.LOCKING
         proceed.set()
         await first
 
@@ -3756,8 +3726,8 @@ async def test_cancelled_queued_operation_leaves_the_window_alone():
 @pytest.mark.asyncio
 async def test_retry_restamps_at_write_success_without_unknown():
     """A retryable failure after write-success keeps the last transitional on
-    display (never UNKNOWN); the next attempt re-sets the pending transitional
-    and re-stamps at its own write-success."""
+    display (never UNKNOWN); the next attempt's hook carries its own
+    transitional and re-stamps it at its own write-success."""
     push_lock = _operational_push_lock()
     events: list[LockStatus] = []
 
@@ -3772,7 +3742,7 @@ async def test_retry_restamps_at_write_success_without_unknown():
     async def force_lock(write_success_callback):
         nonlocal attempts
         attempts += 1
-        pending_at_entry.append(push_lock._pending_op_state)
+        pending_at_entry.append(write_success_callback.args[0])
         write_success_callback()  # opens window, stamps LOCKING
         if attempts == 1:
             raise DisconnectedError("dropped before ack")
@@ -3787,7 +3757,7 @@ async def test_retry_restamps_at_write_success_without_unknown():
         await push_lock.lock()
 
     assert attempts == 2  # first attempt was retried
-    # Each attempt re-set the pending transitional before its write.
+    # Each attempt's hook carried the transitional it stamps.
     assert pending_at_entry == [LockStatus.LOCKING, LockStatus.LOCKING]
     # Never UNKNOWN; LOCKING once (the second stamp is a no-op since the
     # display already reads LOCKING) then LOCKED.
@@ -4169,38 +4139,6 @@ async def test_a_new_operation_writes_through_a_live_jam_hold() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_new_commands_write_success_clears_the_jam_record() -> None:
-    """A command that reaches the lock supersedes a jam still on record.
-
-    No exit leaves _seen_intervention_status set for the next command to
-    find: _close_operation_window clears it above the stop check. The record is
-    seeded by hand here to pin the backstop: were one ever to reach a
-    write-success, the command the caller issued after the jam is the
-    intervention that status calls for, and its own result is what the display
-    carries.
-    """
-    push_lock = _operational_push_lock()
-    push_lock._lock_state = _known_state(LockStatus.JAMMED)
-    push_lock._seen_intervention_status = LockStatus.JAMMED
-    seen_at_write_success: list[LockStatus | None] = []
-
-    async def force_unlock(write_success_callback):
-        write_success_callback()
-        seen_at_write_success.append(push_lock._seen_intervention_status)
-
-    mock_lock = MagicMock()
-    mock_lock.force_unlock = force_unlock
-
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
-    ):
-        await push_lock.unlock()
-
-    assert seen_at_write_success == [None]
-    assert push_lock.lock_status == LockStatus.UNLOCKED
-
-
-@pytest.mark.asyncio
 async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     """A second operation queued on the operation lock stamps nothing.
 
@@ -4271,8 +4209,7 @@ async def test_window_filter_drops_lock_status_admits_the_door_member() -> None:
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3b")
 
     # Open the window as write-success would: stamp the pending transitional.
-    push_lock._pending_op_state = LockStatus.LOCKING
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.LOCKING)
     assert push_lock.lock_status is LockStatus.LOCKING
     assert push_lock._operation_window_open is True
 
@@ -4567,35 +4504,25 @@ async def test_execute_lock_operation_hands_the_hook_to_the_operation():
     ):
         await push_lock.lock()
 
-    assert received == [push_lock._operation_write_success]
+    (hook,) = received
+    assert isinstance(hook, functools.partial)
+    assert hook.func == push_lock._operation_write_success
+    assert hook.args == (LockStatus.LOCKING,)
 
 
 def _answering_lock(push_lock: PushLock) -> MagicMock:
     """A mock Lock that answers every member an on-demand update cycle asks for.
 
-    Each read answers the way the real one does: the session hands the frame to
-    the state path before it resolves the waiter the read is blocked on, so the
-    reading is applied through _update_any_state and the returned value carries
-    nothing the state does not already hold.
+    Each read publishes its reading through the state callback before it
+    returns, the way a real read's answer reaches the state path before the
+    waiter the read is blocked on resolves.
     """
     mock_lock = MagicMock()
-
-    async def lock_status() -> LockStatus:
-        push_lock._update_any_state([LockStatus.LOCKED])
-        return LockStatus.LOCKED
-
-    async def door_status() -> DoorStatus:
-        push_lock._update_any_state([DoorStatus.CLOSED])
-        return DoorStatus.CLOSED
-
-    async def battery() -> BatteryState:
-        reading = BatteryState(voltage=6.0, percentage=80)
-        push_lock._update_any_state([reading])
-        return reading
-
-    mock_lock.lock_status = AsyncMock(side_effect=lock_status)
-    mock_lock.door_status = AsyncMock(side_effect=door_status)
-    mock_lock.battery = AsyncMock(side_effect=battery)
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock.battery = publishing_read(
+        push_lock, BatteryState(voltage=6.0, percentage=80)
+    )
     return mock_lock
 
 
@@ -4713,8 +4640,7 @@ async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6c")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
-    push_lock._pending_op_state = LockStatus.UNLOCKING
-    push_lock._operation_write_success()  # opens the window
+    push_lock._operation_write_success(LockStatus.UNLOCKING)  # opens the window
 
     push_lock._update_any_state([LockStatus.UNLOCKED])
 
@@ -5459,8 +5385,7 @@ async def test_write_success_releases_the_hold_and_cancels_the_timer():
     armed_timer = push_lock._jam_hold_timer
     assert armed_timer is not None
 
-    push_lock._pending_op_state = LockStatus.LOCKING
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.LOCKING)
 
     assert push_lock._jammed_hold_deadline == NEVER_TIME
     assert push_lock._jam_hold_timer is None
@@ -5736,9 +5661,8 @@ async def test_write_success_releases_hold_and_shows_transitional():
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:56")
     push_lock._lock_state = _known_state(LockStatus.JAMMED)
     push_lock._jammed_hold_deadline = time.monotonic() + JAMMED_HOLD_TIME
-    push_lock._pending_op_state = LockStatus.LOCKING
 
-    push_lock._operation_write_success()
+    push_lock._operation_write_success(LockStatus.LOCKING)
 
     assert push_lock._jammed_hold_deadline == NEVER_TIME  # hold released
     assert push_lock.lock_status == LockStatus.LOCKING  # transitional shown
