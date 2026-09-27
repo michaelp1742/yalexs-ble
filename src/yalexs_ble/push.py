@@ -320,9 +320,8 @@ class PushLock:
     """A lock with push updates."""
 
     # mypy takes the type of an attribute from its assignment, and
-    # _init_operation_state assigns these fields nothing but None, so without
-    # these declarations the inferred type would be None.
-    _pending_op_state: LockStatus | None
+    # _init_operation_state assigns this field nothing but None, so without
+    # this declaration the inferred type would be None.
     _operation_outcome: LockStatus | None
 
     def __init__(
@@ -751,11 +750,10 @@ class PushLock:
     def _init_operation_state(self) -> None:
         """Initialize the per-operation fields.
 
-        The operation lock allows one operation at a time; these three
+        The operation lock allows one operation at a time; these two
         describe it. Each is set again as an operation reaches the point it
         describes, so this only makes them readable before the first one.
         """
-        self._pending_op_state = None
         self._operation_outcome = None
         self._operation_window_open = False
 
@@ -780,7 +778,7 @@ class PushLock:
         finally:
             self._finalize_operation()
 
-    def _operation_write_success(self) -> None:
+    def _operation_write_success(self, pending_state: LockStatus) -> None:
         """The command write reached the lock: the single state-action moment.
 
         Order matters: stamp the operation's transitional while the window is
@@ -788,18 +786,9 @@ class PushLock:
         a finally, because the session contains an exception from this hook
         and runs the staged wait to its end: a stamp that raised must not
         leave the whole operation running with the window closed.
-
-        Clearing _seen_intervention_status is a backstop, so no record
-        reaches a new command's write-success. A record that did reach here
-        would be superseded anyway: the command a caller issued after it is the
-        intervention the status calls for, and its outcome is the newer truth.
         """
-        self._seen_intervention_status = None
         try:
-            if self._pending_op_state is not None:
-                # The None check only narrows the type; every caller is inside
-                # an operation that set it.
-                self._update_any_state([self._pending_op_state], arm_resync=False)
+            self._update_any_state([pending_state], arm_resync=False)
         finally:
             self._operation_window_open = True
 
@@ -811,7 +800,6 @@ class PushLock:
         path only gets here with it already clear.
         """
         self._operation_window_open = False
-        self._pending_op_state = None
         self._seen_intervention_status = None
 
     def _finalize_operation(self) -> None:
@@ -897,16 +885,15 @@ class PushLock:
                 f"{self.name}: Lock operation not possible because not running"
             )
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
-        # Re-set on every attempt: the transitional this attempt stamps at
-        # its write-success.
-        self._pending_op_state = pending_state
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
             # The write-success hook is what stamps the transitional and
             # opens the window, so only this operation can open one.
             await getattr(lock, op_attr)(
-                write_success_callback=self._operation_write_success
+                write_success_callback=functools.partial(
+                    self._operation_write_success, pending_state
+                )
             )
         except OperationIncompleteError:
             # Listed so it reaches the caller as itself: the arm below
