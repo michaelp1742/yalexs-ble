@@ -361,21 +361,18 @@ class Lock:
                     if solicited and result in MECHANICAL_OPERATION_ERRORS:
                         # The caller learns of this failure from
                         # OperationFailedError; debug is enough here.
-                        _LOGGER.debug(
-                            "%s: Operation failed with result 0x%02X (%s)",
-                            self.name,
-                            result,
-                            _describe_operation_error(result),
-                        )
+                        level = logging.DEBUG
                     else:
                         # An unexpected code, or a failure nothing of ours
                         # awaits.
-                        _LOGGER.warning(
-                            "%s: Operation failed with result 0x%02X (%s)",
-                            self.name,
-                            result,
-                            _describe_operation_error(result),
-                        )
+                        level = logging.WARNING
+                    _LOGGER.log(
+                        level,
+                        "%s: Operation failed with result 0x%02X (%s)",
+                        self.name,
+                        result,
+                        _describe_operation_error(result),
+                    )
                     # Every failure needs a person at the lock, so all
                     # display as JAMMED.
                     return [LockStatus.JAMMED]
