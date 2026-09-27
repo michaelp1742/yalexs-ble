@@ -5399,8 +5399,7 @@ async def test_stop_releases_the_jam_hold():
 
     The timer cannot fire after the stop and schedule a cycle on a lock nothing is
     watching, and no deadline is left behind to mask the lock's status on a
-    watcher started again, where nothing would be armed to end the hold or to
-    ask the lock what the mechanism is doing now.
+    watcher started again.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:4c")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
@@ -5448,10 +5447,9 @@ async def test_a_teardown_returns_every_cross_operation_carrier_to_its_initial_v
     Both halves below were real defects. A jam recorded while the watcher was
     stopped survived the early return of _finalize_operation and ended the
     next operation's attempt ladder as OperationIncompleteError; a hold deadline
-    the stop left behind masked the lock's status on a watcher started again,
-    with no timer left to end the hold or to ask the lock. Each was a single
-    exit that did not discharge what it should, which is why this asks the
-    object as a whole rather than walking the exits.
+    the stop left behind masked the lock's status on a watcher started again.
+    Each was a single exit that did not discharge what it should, which is
+    why this asks the object as a whole rather than walking the exits.
     """
     defaults = _carrier_defaults()
     carriers = {

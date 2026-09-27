@@ -1821,10 +1821,10 @@ class PushLock:
         self._cancel_future_update()
         # Release the hold with its timer: a stopped watcher has no
         # display, and a leftover deadline would mask the status on a
-        # restarted watcher with no timer to end it. A status frame
-        # arriving between here and the disconnect may arm the hold again,
-        # and the update cycle that timer schedules is dropped by
-        # _execute_deferred_update, which returns while _running is False.
+        # restarted watcher. A status frame arriving between here and the
+        # disconnect may arm the hold again, and the update cycle that
+        # timer schedules is dropped by _execute_deferred_update, which
+        # returns while _running is False.
         self._release_jam_hold()
         self.background_task(self._execute_forced_disconnect("stopping"))
 
