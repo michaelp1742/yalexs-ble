@@ -927,6 +927,10 @@ class PushLock:
             return
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
+        # A cycle armed while the operation ran would displace the delay
+        # chosen below; the exit owns the next poll, and that poll serves
+        # whatever the cleared cycle was for.
+        self._cancel_future_update()
         # A live hold schedules nothing here; its timer polls the lock at
         # the deadline.
         if time.monotonic() >= self._jammed_hold_deadline:
@@ -987,9 +991,9 @@ class PushLock:
         # The handle that ran this callback is spent.
         self._jam_hold_timer = None
         if self._operation_lock.locked():
-            # A cycle armed here would sit in the deferred-update slot, and
-            # the debounce would displace the delay the operation's exit
-            # chooses. The timer retries instead.
+            # A cycle armed here would sit in the deferred-update slot, which
+            # the operation's exit clears, and the hold's poll would go with
+            # it. The timer retries instead.
             self._schedule_jam_hold_timer(DEADLINE_WAKEUP_RETRY_DELAY)
             return
         # Remove LockStatus so the cycle asks the lock instead of trusting
