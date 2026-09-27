@@ -3208,6 +3208,45 @@ async def test_deferred_update_backs_off_while_an_operation_holds_the_lock() -> 
 
 
 @pytest.mark.asyncio
+async def test_deferred_update_reads_the_floor_under_the_operation_lock() -> None:
+    """A cycle queued behind an operation reads the floor its exit stamped.
+
+    The timer's checks passed before the operation took the lock, so the
+    cycle's task waits on the lock; once the exit stamps the floor and
+    releases it, the cycle re-arms for the remainder and polls nothing.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
+    mock_lock = _answering_lock(push_lock)
+    push_lock._first_update_future = asyncio.get_running_loop().create_future()
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(
+            push_lock, "_read_auto_lock_setting", AsyncMock(return_value=False)
+        ),
+    ):
+        await push_lock._operation_lock.acquire()
+        task = asyncio.create_task(push_lock._execute_deferred_update())
+        await asyncio.sleep(0)
+        # The operation's exit stamps the floor before it releases the lock.
+        push_lock._earliest_update_time = (
+            time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        )
+        push_lock._operation_lock.release()
+        await task
+
+    mock_lock.lock_status.assert_not_awaited()
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    due_in = handle.when() - push_lock.loop.time()
+    assert (
+        LOCK_STALE_STATE_DEBOUNCE_DELAY - 1 < due_in <= LOCK_STALE_STATE_DEBOUNCE_DELAY
+    )
+    assert not push_lock._first_update_future.done()
+    push_lock._cancel_future_update()
+
+
+@pytest.mark.asyncio
 async def test_lock_stamps_transitional_only_at_write_success():
     """The LOCKING transitional is stamped only when the command write reaches
     the lock (write-success), never at issue time, and exactly once."""
