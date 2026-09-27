@@ -4777,59 +4777,19 @@ async def test_every_operation_exit_schedules_the_status_poll(
 
 
 @pytest.mark.asyncio
-async def test_the_status_poll_keeps_a_sooner_pending_update() -> None:
-    """The status poll inherits the debounce, so a sooner update is kept.
-
-    _finalize_operation schedules the status poll through the deferred-update
-    debounce. An update already due sooner than the keep-alive interval keeps
-    its slot; an undebounced request would displace it a full interval out.
-    Keeping it costs nothing, because the floor _finalize_operation stamps
-    holds the poll itself back: the sooner cycle falls due, finds the floor, and
-    re-arms for the remainder instead of reading the lock before it has passed.
-    """
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
-    push_lock._schedule_future_update(1.0)
-    handle = push_lock._cancel_deferred_update
-    assert handle is not None
-
-    push_lock._finalize_operation()
-
-    assert push_lock._force_lock_status_poll is True
-    # The sooner cycle is untouched: same handle, still due within a second.
-    assert push_lock._cancel_deferred_update is handle
-    remaining = handle.when() - push_lock.loop.time()
-    assert 0 < remaining <= 1.0
-
-    # It fires early and reads nothing: the floor re-arms it for its remainder.
-    push_lock._deferred_update()
-
-    assert push_lock._update_task is None
-    rearmed = push_lock._cancel_deferred_update
-    assert rearmed is not None and rearmed is not handle
-    assert (
-        LOCK_STALE_STATE_DEBOUNCE_DELAY - 1.0
-        < rearmed.when() - push_lock.loop.time()
-        <= LOCK_STALE_STATE_DEBOUNCE_DELAY
-    )
-    push_lock._cancel_future_update()
-
-
-@pytest.mark.asyncio
 async def test_a_collapsed_schedule_still_waits_for_the_floor() -> None:
-    """A cycle the debounce shortens cannot poll the lock before the floor.
+    """_schedule_future_update never arms a cycle before the floor.
 
     An update already due inside the coalescing interval makes the debounce
-    rewrite any request to that interval, so the poll _finalize_operation asks
-    for is not the delay the cycle gets. The floor is what holds the poll: the
-    collapsed request is armed for the remainder of that delay instead
-    of firing 25 ms after the operation, when the lock still reports the
-    pre-operation position.
+    rewrite a request to that interval. _schedule_future_update arms the
+    shortened request for the remainder of the floor instead, so the cycle
+    cannot poll the lock while it still reports the position it is leaving.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:65")
-    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     push_lock._schedule_future_update(0.01)
+    push_lock._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
 
-    push_lock._finalize_operation()
+    push_lock._schedule_future_update_with_debounce(KEEP_ALIVE_TIME)
 
     handle = push_lock._cancel_deferred_update
     assert handle is not None
@@ -4838,6 +4798,44 @@ async def test_a_collapsed_schedule_still_waits_for_the_floor() -> None:
         < handle.when() - push_lock.loop.time()
         <= LOCK_STALE_STATE_DEBOUNCE_DELAY
     )
+    push_lock._cancel_future_update()
+
+
+@pytest.mark.asyncio
+async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> None:
+    """The operation's exit clears a cycle armed while it ran and schedules its own.
+
+    A keep-alive falling due mid-operation arms a cycle; the exit replaces it
+    with the poll it chooses for its outcome, the keep-alive for a settled
+    position, and nothing polls the lock in between.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:69")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    mock_lock = _answering_lock(push_lock)
+    armed_mid_operation: list[asyncio.TimerHandle | None] = []
+
+    async def force_lock(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()
+        # Stands in for a keep-alive falling due while the operation runs.
+        push_lock._schedule_future_update_with_debounce(KEEP_ALIVE_TIME)
+        armed_mid_operation.append(push_lock._cancel_deferred_update)
+
+    mock_lock.force_lock = force_lock
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    assert push_lock.lock_status == LockStatus.LOCKED
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert armed_mid_operation[0] is not None
+    assert handle is not armed_mid_operation[0]
+    assert (
+        KEEP_ALIVE_TIME - 1 < handle.when() - push_lock.loop.time() <= KEEP_ALIVE_TIME
+    )
+    mock_lock.lock_status.assert_not_awaited()
     push_lock._cancel_future_update()
 
 
