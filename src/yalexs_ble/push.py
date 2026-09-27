@@ -894,6 +894,10 @@ class PushLock:
             return
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
+        # A cycle armed while the operation ran would displace the delay
+        # chosen below; the exit owns the next poll, and that poll serves
+        # whatever the cleared cycle was for.
+        self._cancel_future_update()
         # A settled pair waits the keep-alive; an unsettled one polls at
         # the stale-state debounce, the earliest a poll answers with the
         # motor stopped. The two motion values are the only transitional
