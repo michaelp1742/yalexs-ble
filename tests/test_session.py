@@ -628,7 +628,9 @@ _FOREIGN_ACK = "aa0b00000000000000000000000000000200"
 async def test_execute_operation_happy_path() -> None:
     """Write, then ack, then op-response: returns the op-response bytes.
 
-    write_success_callback fires once, before the ack is delivered.
+    The fixture delivers the ack after the write returns, so the
+    write-success callback fires before it; the host's usual order is the
+    twin below.
     """
     order: list[str] = []
     session, client = _make_operation_session()
@@ -666,6 +668,57 @@ async def test_execute_operation_happy_path() -> None:
     write_cb.assert_called_once()
     # The callback fired before the ack was delivered.
     assert order == ["write", "ack"]
+
+
+def _write_delivering(session: Session, frames: list[bytearray]) -> Callable[..., None]:
+    """Build a write that delivers frames before it returns, as the host
+    usually does."""
+
+    def _write(*_: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+
+    return _write
+
+
+@pytest.mark.asyncio
+async def test_execute_operation_happy_path_with_the_ack_inside_the_write() -> None:
+    """The ack handled inside the write call, the host's usual order, completes
+    the same way."""
+    order: list[str] = []
+
+    def record_ack(frame: bytes) -> None:
+        if frame[0] == 0xAA:
+            order.append("ack")
+
+    session, client = _make_operation_session(record_ack)
+    write_cb = MagicMock(side_effect=lambda: order.append("write"))
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.LOCK, 0x04)
+    ack = _with_checksum(_ACK_SECUREMODE)
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+    client.write_gatt_char.side_effect = _write_delivering(session, [ack])
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        session._notify(0, bytearray(op_response))
+
+    feeder = asyncio.create_task(feed())
+    result = await session.execute_operation(
+        command,
+        "force_securemode",
+        ack_matcher=_ack_matcher(0x0B, 0x04),
+        response_matcher=_operation_response_matcher(0x0B),
+        response_timeout=5.0,
+        progress=progress,
+        write_success_callback=write_cb,
+    )
+    await feeder
+
+    assert result == bytes(op_response)
+    assert progress.acknowledged is True
+    write_cb.assert_called_once()
+    assert order == ["ack", "write"]
 
 
 @pytest.mark.asyncio
@@ -1286,11 +1339,11 @@ async def test_execute_operation_pays_the_cooldown_before_its_write(
 # Disconnect / auth contract of the operation wait
 #
 # The pre/post-acknowledgment retry hinge: a failure BEFORE the ack keeps its
-# retryable type; once acknowledged the result is unknown, so any failure
-# becomes the non-retryable OperationIncompleteError and the command is
-# never silently re-sent. These tests pin that contract so a future change
-# that makes an acknowledged operation retryable again fails the suite
-# instead of shipping.
+# retryable type; once acknowledged, and with no op-response recorded, the
+# result is unknown, so any failure becomes the non-retryable
+# OperationIncompleteError and the command is never silently re-sent. These
+# tests pin that contract so a future change that makes an acknowledged
+# operation retryable again fails the suite instead of shipping.
 # =========================================================================== #
 def _fire_disconnect(session: Session) -> None:
     """Resolve the operation's disconnected future, as a link drop would.
@@ -1743,72 +1796,6 @@ async def test_a_write_error_after_an_unacknowledged_op_response_logs_the_comple
     assert result == bytes(op_response)
     assert progress.acknowledged is False
     assert "completed on its op-response; no acknowledgment was received" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_bleak_disconnect_after_ack_is_operation_incomplete() -> None:
-    """Defensive branch: a BleakError disconnect surfacing AFTER the ack is also
-    treated as an unknown result (OperationIncompleteError), not a retry."""
-    session, _ = _make_operation_session()
-    progress = OperationProgress()
-
-    def _boom(
-        command: bytearray,
-        command_name: str,
-        ack_matcher: Callable[[bytes], bool],
-        response_matcher: Callable[[bytes], bool],
-        response_timeout: float,
-        progress: OperationProgress,
-        write_success_callback: Callable[[], None] | None = None,
-    ) -> bytes:
-        progress.acknowledged = True
-        raise BleakError("device disconnected")
-
-    with (
-        patch.object(session, "_locked_write_operation", AsyncMock(side_effect=_boom)),
-        pytest.raises(OperationIncompleteError),
-    ):
-        await session.execute_operation(
-            session.build_operation_command(Commands.LOCK, 0x04),
-            "force_securemode",
-            ack_matcher=_ack_matcher(0x0B, 0x04),
-            response_matcher=_operation_response_matcher(0x0B),
-            response_timeout=5.0,
-            progress=progress,
-        )
-
-
-@pytest.mark.asyncio
-async def test_bleak_disconnect_in_one_turn_with_the_op_response_returns_it() -> None:
-    """The same twin on the BleakError arm: a recorded result still stands."""
-    session, _ = _make_operation_session()
-    progress = OperationProgress()
-    op_response = bytes(_with_checksum(_OP_RESPONSE_OK))
-
-    def _boom(
-        command: bytearray,
-        command_name: str,
-        ack_matcher: Callable[[bytes], bool],
-        response_matcher: Callable[[bytes], bool],
-        response_timeout: float,
-        progress: OperationProgress,
-        write_success_callback: Callable[[], None] | None = None,
-    ) -> bytes:
-        progress.acknowledged = True
-        progress.result = op_response
-        raise BleakError("device disconnected")
-
-    with patch.object(session, "_locked_write_operation", AsyncMock(side_effect=_boom)):
-        result = await session.execute_operation(
-            session.build_operation_command(Commands.LOCK, 0x04),
-            "force_securemode",
-            ack_matcher=_ack_matcher(0x0B, 0x04),
-            response_matcher=_operation_response_matcher(0x0B),
-            response_timeout=5.0,
-            progress=progress,
-        )
-
-    assert result == op_response
 
 
 @pytest.mark.asyncio
