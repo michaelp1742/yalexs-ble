@@ -495,14 +495,7 @@ class Session:
                 # residual is accepted: requiring the acknowledgment first
                 # would instead drop a genuine op-response whose
                 # acknowledgment was lost.
-                if not progress.acknowledged:
-                    _LOGGER.info(
-                        "%s: %s completed on its op-response; no "
-                        "acknowledgment was received",
-                        self.name,
-                        command_name,
-                    )
-                return result_future.result()
+                return self._completed(result_future.result(), progress, command_name)
             if ack_future not in done:
                 raise TimeoutError(
                     f"{self.name}: No acknowledgment to {command_name} within "
@@ -524,7 +517,7 @@ class Session:
                         self.name,
                         command_name,
                     )
-                    return recorded
+                    return self._completed(recorded, progress, command_name)
                 raise OperationIncompleteError(
                     f"{self.name}: {command_name} was acknowledged but no "
                     f"op-response arrived within {response_timeout}s of the "
@@ -540,6 +533,25 @@ class Session:
             if self._notify_future is result_future:
                 self._notify_future = None
                 self._notify_matcher = None
+        return self._completed(result, progress, command_name)
+
+    def _completed(
+        self, result: bytes, progress: OperationProgress, command_name: str
+    ) -> bytes:
+        """Return the op-response, logging a completion the lock never acknowledged.
+
+        The op-response is matched on the opcode alone, so a completion with
+        no acknowledgment recorded means either the acknowledgment was
+        dropped or a previous same-opcode command's late op-response
+        completed this wait. This line is the only trace of either in a
+        field log, so every completion path returns through here.
+        """
+        if not progress.acknowledged:
+            _LOGGER.info(
+                "%s: %s completed on its op-response; no acknowledgment was received",
+                self.name,
+                command_name,
+            )
         return result
 
     async def start_notify(self) -> None:
@@ -644,12 +656,13 @@ class Session:
         """
         if (result := progress.result) is not None:
             _LOGGER.debug(
-                "%s: %s failed in the same turn as its op-response arrived; "
+                "%s: %s failed after its op-response was recorded: %r; "
                 "returning the recorded result",
                 self.name,
                 command_name,
+                err,
             )
-            return result
+            return self._completed(result, progress, command_name)
         if progress.acknowledged:
             raise OperationIncompleteError(
                 f"{self.name}: {command_name} failed after the lock "
@@ -670,10 +683,10 @@ class Session:
         """Execute a mechanical operation command with the staged wait.
 
         A failure is classified by how far the operation got, whatever raised
-        it. Nothing acknowledged: the failure keeps its own type, so the
-        caller's retry decorator re-sends. Acknowledged: the lock has the
-        command and the result is unknown, so the failure ends the attempts as
-        OperationIncompleteError. Op-response recorded: it is returned.
+        it: an op-response recorded before the failure is returned; a failure
+        after the acknowledgment ends the attempts as OperationIncompleteError,
+        the result unknown; a failure with nothing acknowledged is raised as
+        execute() raises it, for the caller's retry decorator to re-send.
 
         response_timeout is the budget for the whole exchange, measured from
         the moment the command is issued. Size it above ACK_TIMEOUT: the
@@ -708,6 +721,9 @@ class Session:
                 )
         except OperationIncompleteError:
             raise
+        # Every failure, whatever its type: the retry set reaches past
+        # BleakError to AttributeError, EOFError and BrokenPipeError, and none
+        # of them may reach a retry once the lock has acknowledged the command.
         except Exception as err:
             if (
                 result := self._outcome_after_failure(progress, command_name, err)
