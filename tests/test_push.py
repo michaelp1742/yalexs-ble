@@ -4204,7 +4204,13 @@ async def test_jam_inside_the_window_replaces_the_unknown_of_a_lost_result() -> 
 
 
 @pytest.mark.asyncio
-async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [DisconnectedError("dropped after the jam was reported"), TimeoutError()],
+)
+async def test_jam_inside_the_window_ends_the_attempt_ladder(
+    error: Exception,
+) -> None:
     """A retryable failure after a jam was reported does not re-send.
 
     The retryable types mean the command may never have been delivered, so the
@@ -4221,7 +4227,7 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
         attempts += 1
         write_success_callback()
         push_lock._update_any_state([LockStatus.JAMMED])
-        raise DisconnectedError("dropped after the jam was reported")
+        raise error
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -4237,7 +4243,7 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
     assert push_lock._seen_intervention_status is None
-    assert "dropped after the jam was reported" in str(raised.value)
+    assert repr(error) in str(raised.value)
 
 
 @pytest.mark.asyncio
