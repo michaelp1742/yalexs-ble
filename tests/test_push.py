@@ -6080,7 +6080,7 @@ async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
     A cycle falling due while the operation lock is held is re-armed rather
     than created, so it cannot sit on the lock and poll the instant the
     op-response lands, while the lock still reports the position it is
-    leaving. The retry finds the floor stamped again at the operation's exit.
+    leaving. The operation's exit then replaces that cycle with its own poll.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
@@ -6121,17 +6121,11 @@ async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
 
     # The operation's own outcome is what the display carries.
     assert push_lock.lock_status == LockStatus.UNLATCHED
-    mock_lock.lock_status.assert_not_awaited()
-
-    # The retry finds the floor pushed out again, by _finalize_operation this
-    # time: our own operation ends there, later than the op-response before it.
-    with patch.object(push_lock, "_schedule_future_update") as mock_reschedule:
-        push_lock._deferred_update()
-
-    assert push_lock._update_task is None
-    mock_reschedule.assert_called_once()
-    assert mock_reschedule.call_args.args[0] == pytest.approx(
-        LOCK_STALE_STATE_DEBOUNCE_DELAY, abs=0.1
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert (
+        KEEP_ALIVE_TIME - 1 < handle.when() - push_lock.loop.time() <= KEEP_ALIVE_TIME
     )
+    mock_lock.lock_status.assert_not_awaited()
     push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
