@@ -1872,6 +1872,34 @@ async def test_a_write_error_after_the_op_response_returns_the_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_write_error_after_an_unacknowledged_op_response_logs_the_completion(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A completion no acknowledgment preceded is logged whether or not the
+    write failed."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+    client.write_gatt_char.side_effect = _write_feeding(
+        session, [op_response], BleakError("write failed")
+    )
+
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        result = await session.execute_operation(
+            session.build_operation_command(Commands.LOCK, 0x04),
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=progress,
+        )
+
+    assert result == bytes(op_response)
+    assert progress.acknowledged is False
+    assert "completed on its op-response; no acknowledgment was received" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_bleak_disconnect_after_ack_is_operation_incomplete() -> None:
     """Defensive branch: a BleakError disconnect surfacing AFTER the ack is also
     treated as an unknown result (OperationIncompleteError), not a retry."""
