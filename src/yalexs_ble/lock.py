@@ -184,9 +184,8 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 
     The acknowledgment carries the operation byte the command was sent
     with, which is what tells a securemode acknowledgment from a plain
-    lock's on the shared Lock opcode. An op-response carries 0x00 there
-    whatever the operation, which is why _operation_response_matcher
-    matches the opcode alone.
+    lock's on the shared Lock opcode. The op-response is matched on the
+    opcode alone, by _operation_response_matcher.
     """
 
     def _matches(data: bytes) -> bool:

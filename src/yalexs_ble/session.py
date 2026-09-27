@@ -256,9 +256,9 @@ class Session:
             # the lock: the stack emits them on its own, so one carries no
             # signal about the link or the command in flight, and it was a
             # no-op here before the length gate existed. A truncated frame is
-            # different — it is evidence the response itself was corrupted —
-            # so it fails the armed wait below and triggers a re-send, while
-            # this is dropped without touching the wait.
+            # different: it is evidence the response itself was corrupted, so
+            # it is rejected below, while this is dropped without touching the
+            # wait.
             _LOGGER.debug("%s: Dropping empty notification", self.name)
             return
         if len(data) != RESPONSE_FRAME_LEN:
