@@ -619,6 +619,7 @@ def _make_operation_session(
 # securemode = LOCK opcode (0x0B) with operation byte 0x04.
 _ACK_SECUREMODE = "aa0b00000400000000000000000000000200"
 _OP_RESPONSE_OK = "bb0b00000000000000000000000000000200"
+_OP_RESPONSE_FAILED = "bb0b000000000000000000000000001f0200"
 _SETTLED_STATUS = "bb0200000200000000000000000000000200"
 _FOREIGN_ACK = "aa0b00000000000000000000000000000200"
 
@@ -1181,7 +1182,8 @@ async def test_execute_with_response_matcher_skips_nonmatching_and_bad_frames() 
     def matcher(data: bytes) -> bool:
         return len(data) > 1 and data[0] == 0xBB and data[1] == 0x02
 
-    nonmatching = _with_checksum(_OP_RESPONSE_OK)  # valid 0xBB 0x0B, wrong op
+    # valid 0xBB 0x0B failure report, wrong opcode for this wait
+    nonmatching = _with_checksum(_OP_RESPONSE_FAILED)
     good = _with_checksum(_SETTLED_STATUS)  # valid 0xBB 0x02, matches
     bad = _with_checksum(_SETTLED_STATUS)
     bad[0x03] = (bad[0x03] + 1) & 0xFF  # corrupt the checksum
@@ -1284,11 +1286,11 @@ async def test_execute_operation_pays_the_cooldown_before_its_write(
 # Disconnect / auth contract of the operation wait
 #
 # The pre/post-acknowledgment retry hinge: a failure BEFORE the ack keeps its
-# retryable type (the command never moved the motor); once acknowledged the
-# result is unknown, so a disconnect or timeout becomes the non-retryable
-# OperationIncompleteError and the command is never silently re-sent. These
-# tests pin that contract so a future change that makes an acknowledged
-# operation retryable again fails the suite instead of shipping.
+# retryable type; once acknowledged the result is unknown, so any failure
+# becomes the non-retryable OperationIncompleteError and the command is
+# never silently re-sent. These tests pin that contract so a future change
+# that makes an acknowledged operation retryable again fails the suite
+# instead of shipping.
 # =========================================================================== #
 def _fire_disconnect(session: Session) -> None:
     """Resolve the operation's disconnected future, as a link drop would.
