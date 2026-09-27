@@ -1809,6 +1809,36 @@ async def test_force_unlatch_converts_every_post_write_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error", [TimeoutError(), EOFError()])
+async def test_force_unlatch_names_a_failure_without_a_message(
+    error: Exception,
+) -> None:
+    """A failure with no message is named in the UnlatchError by its repr."""
+    lock = _make_lock()
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+
+    async def _fail(
+        command: bytearray,
+        command_name: str,
+        response_timeout: float,
+        progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
+    ) -> None:
+        assert progress is not None
+        progress.write_attempted = True
+        raise error
+
+    lock._execute_operation_command = _fail  # type: ignore[method-assign]
+    with pytest.raises(UnlatchError) as excinfo:
+        await lock.force_unlatch()
+    assert str(excinfo.value).endswith(repr(error))
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [

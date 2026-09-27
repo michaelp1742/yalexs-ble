@@ -689,7 +689,7 @@ class Lock:
                 raise UnlatchError(
                     f"{self.name}: Unlatch failed after the command write was "
                     f"attempted, and a repeated unlatch opens the door again, "
-                    f"so it was not retried: {err}"
+                    f"so it was not retried: {err!r}"
                 ) from err
             raise
         _LOGGER.debug("%s: Finished unlatching", self.name)
