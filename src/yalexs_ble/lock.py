@@ -217,6 +217,9 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     """Match the op-response (0xBB + the sent opcode), emitted when the
     motor stops.
+
+    The operation byte is not matched: a securemode op-response carries
+    0x00 there, the same as a plain lock's.
     """
 
     def _matches(data: bytes) -> bool:
