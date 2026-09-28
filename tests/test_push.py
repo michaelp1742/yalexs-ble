@@ -1,5 +1,4 @@
 import asyncio
-import functools
 import logging
 import struct
 import time
@@ -3286,10 +3285,8 @@ async def test_failed_operation_anchors_the_stale_state_debounce() -> None:
 async def test_deferred_update_backs_off_while_an_operation_holds_the_lock() -> None:
     """A cycle falling due mid-operation backs off rather than queueing.
 
-    The floor can lapse while the motion is still running, and a cycle
-    created there would wait on the operation lock and poll the lock the
-    moment the operation released it, inside the post-operation debounce delay
-    the operation is about to stamp.
+    The floor can lapse while the motion is still running; a cycle created
+    there would sit on the operation lock until the operation released it.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:38")
     # The floor has lapsed, so only the operation lock is left to hold the
@@ -3711,14 +3708,16 @@ async def test_retry_restamps_at_write_success_without_unknown():
 
     push_lock.register_callback(cb)
 
-    pending_at_entry: list[LockStatus | None] = []
+    after_each_hook: list[tuple[LockStatus, bool]] = []
     attempts = 0
 
     async def force_lock(write_success_callback):
         nonlocal attempts
         attempts += 1
-        pending_at_entry.append(write_success_callback.args[0])
         write_success_callback()  # opens window, stamps LOCKING
+        after_each_hook.append(
+            (push_lock.lock_status, push_lock._operation_window_open)
+        )
         if attempts == 1:
             raise DisconnectedError("dropped before ack")
 
@@ -3732,8 +3731,11 @@ async def test_retry_restamps_at_write_success_without_unknown():
         await push_lock.lock()
 
     assert attempts == 2  # first attempt was retried
-    # Each attempt's hook carried the transitional it stamps.
-    assert pending_at_entry == [LockStatus.LOCKING, LockStatus.LOCKING]
+    # Each attempt's hook stamps the transitional and opens the window.
+    assert after_each_hook == [
+        (LockStatus.LOCKING, True),
+        (LockStatus.LOCKING, True),
+    ]
     # Never UNKNOWN; LOCKING once (the second stamp is a no-op since the
     # display already reads LOCKING) then LOCKED.
     assert LockStatus.UNKNOWN not in events
@@ -4319,13 +4321,12 @@ async def test_window_filter_drops_lock_status_admits_the_door_member() -> None:
 
     # A mid-window JAMMED is refused from the display too; it is recorded
     # for the operation's exit.
-    push_lock._update_any_state([LockStatus.JAMMED])
+    push_lock._update_any_state([LockStatus.JAMMED, DoorStatus.OPENED])
     assert push_lock.lock_status is LockStatus.LOCKING
     assert push_lock._seen_intervention_status is LockStatus.JAMMED
 
     # A door value in the same frame still reaches the display: only the lock
     # member goes through _admit_lock_status.
-    push_lock._update_any_state([DoorStatus.OPENED])
     assert push_lock.door_status is DoorStatus.OPENED
 
 
@@ -4567,7 +4568,7 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
 async def test_execute_lock_operation_hands_the_hook_to_the_operation():
     """The gated path passes its own write-success hook to the operation."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:53")
-    received: list[object] = []
+    received: list[Callable[[], None]] = []
 
     async def force_lock(write_success_callback):
         received.append(write_success_callback)
@@ -4581,9 +4582,9 @@ async def test_execute_lock_operation_hands_the_hook_to_the_operation():
         await push_lock.lock()
 
     (hook,) = received
-    assert isinstance(hook, functools.partial)
-    assert hook.func == push_lock._operation_write_success
-    assert hook.args == (LockStatus.LOCKING,)
+    hook()
+    assert push_lock.lock_status is LockStatus.LOCKING
+    assert push_lock._operation_window_open is True
 
 
 def _answering_lock(push_lock: PushLock) -> MagicMock:
