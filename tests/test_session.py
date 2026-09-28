@@ -727,11 +727,10 @@ async def test_a_raising_write_success_callback_does_not_abort_the_staged_wait(
 ) -> None:
     """A write_success_callback that raises is contained, and the wait goes on.
 
-    The hook runs after the command is confirmed delivered, so an exception
-    escaping it would abandon a wait whose motor may be running, and the
-    escaped type would be retried upstream and re-send the command. The
-    exception is logged at error level, since a raising hook is a bug in the
-    caller, and the staged wait still completes on its op-response.
+    The hook runs once the command is delivered, so an exception escaping it
+    would abandon a wait whose motor may be running. The exception is logged
+    at error level, since a raising hook is a bug in the caller, and the
+    staged wait still completes on its op-response.
     """
     session, client = _make_operation_session()
     write_cb = MagicMock(side_effect=RuntimeError("hook bug"))
@@ -903,8 +902,8 @@ async def test_operation_wait_skips_a_corrupt_frame_after_the_acknowledgment() -
     The acknowledgment's own arming is cleared the moment it arrives, so the
     op-response stage looks exactly like a plain wait; _operation_progress is
     what still marks it as an operation. Keying the skip on the acknowledgment
-    arming instead would error this wait and re-send a mechanical command the
-    lock has already taken.
+    arming instead would end this wait on a frame that was not its answer,
+    with the lock already running the command.
     """
     session, client = _make_operation_session()
     progress = OperationProgress()
