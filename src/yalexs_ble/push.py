@@ -978,9 +978,8 @@ class PushLock:
                 )
             )
         except OperationFailedError:
-            # The parser's JAMMED landed inside our own window and stands
-            # recorded there for _finalize_operation; the outcome is its
-            # backstop, and the raise tells the caller.
+            # The parser's JAMMED stands recorded for _finalize_operation; the
+            # outcome is its backstop, and the raise tells the caller.
             self._operation_outcome = LockStatus.JAMMED
             _LOGGER.debug(
                 "%s: %s reported failure; recording JAMMED", self.name, op_attr
