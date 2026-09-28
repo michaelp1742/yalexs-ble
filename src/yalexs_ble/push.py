@@ -1125,8 +1125,10 @@ class PushLock:
         except Exception as ex:
             if (recorded := self._seen_intervention_status) is not None:
                 # A retry would drive the motor into a mechanism that needs
-                # attention, so end the attempts with a type outside the
-                # retry set; the result truly never arrived.
+                # attention, so the attempts end with a type outside the retry set,
+                # whatever failed and however early: the record spans the whole
+                # operation, so a failure before any write ends them too, and an
+                # AuthError converted here is counted by the next update cycle's own.
                 raise OperationIncompleteError(
                     f"{self.name}: the lock reported {recorded} while "
                     f"{op_attr} was in flight and the attempt ended with "
