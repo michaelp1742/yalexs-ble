@@ -4481,6 +4481,50 @@ async def test_a_jam_with_no_operation_in_flight_is_not_recorded() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("report", "displayed", "hold_stands"),
+    [
+        ([_OP_RESPONSE_OK], LockStatus.LOCKED, False),
+        ([_STATUS_PUSH_JAMMED, _OP_RESPONSE_OK], LockStatus.JAMMED, True),
+    ],
+    ids=["answer", "jam-reported-with-the-answer"],
+)
+async def test_the_locks_answer_releases_the_hold_at_the_exit(
+    report: list[str], displayed: LockStatus, hold_stands: bool
+) -> None:
+    """The lock's answer releases a live hold when the write call then fails.
+
+    A write that fails after the lock has answered never runs the
+    write-success hook that releases the hold, and the session still returns
+    the answer. The exit releases the hold before it applies the answer, so
+    the display shows it; a jam the lock reported during the operation still
+    stands, with its hold.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:75")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    push_lock._update_any_state([LockStatus.JAMMED])
+    held_deadline = push_lock._jammed_hold_deadline
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, *report)]
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(session, frames, BleakError("write failed"))
+    )
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert push_lock.lock_status is displayed
+    assert push_lock._jammed_hold_deadline == (
+        held_deadline if hold_stands else NEVER_TIME
+    )
+    assert (push_lock._jam_hold_timer is not None) is hold_stands
+    push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     """A second operation queued on the operation lock stamps nothing.
 
