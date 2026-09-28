@@ -918,6 +918,15 @@ class PushLock:
             # Stopped mid-operation: the window is closed, but the actions
             # below would arm timers on a lock nothing is watching.
             return
+        if (
+            outcome is not None
+            and outcome is not LockStatus.UNKNOWN
+            and recorded is None
+        ):
+            # The lock answered the command, which supersedes a held status
+            # the way the command's write-success does; a write that failed
+            # after the answer never ran that hook.
+            self._release_jam_hold()
         if outcome is not None:
             self._update_any_state([outcome], arm_resync=False)
         # A cycle armed while the operation ran would displace the delay
