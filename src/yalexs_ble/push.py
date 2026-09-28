@@ -953,18 +953,19 @@ class PushLock:
         # chosen below; the exit owns the next poll, and that poll serves
         # whatever the cleared cycle was for.
         self._cancel_future_update()
-        # A live hold schedules nothing here; its timer polls the lock at
-        # the deadline.
-        if time.monotonic() >= self._jammed_hold_deadline:
+        if self._always_connected and not self.is_connected:
+            # An always-connected lock whose link dropped meanwhile polls at
+            # the stale-state debounce, hold or no hold: the slot cleared
+            # above held its reconnect, and this cycle is that reconnect.
+            self._schedule_future_update_with_debounce(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+        elif time.monotonic() >= self._jammed_hold_deadline:
             # A settled pair waits the keep-alive; an unsettled one polls at
             # the stale-state debounce. The two motion values are the only
             # transitional readings the projection publishes on the secure
-            # channel. An always-connected lock whose link dropped meanwhile
-            # polls at the debounce too: that cycle is its reconnect.
-            if (
-                self.lock_status in POSITION_READINGS
-                and self.secure_status not in (LockStatus.LOCKING, LockStatus.UNLOCKING)
-                and (self.is_connected or not self._always_connected)
+            # channel.
+            if self.lock_status in POSITION_READINGS and self.secure_status not in (
+                LockStatus.LOCKING,
+                LockStatus.UNLOCKING,
             ):
                 delay = KEEP_ALIVE_TIME
             else:

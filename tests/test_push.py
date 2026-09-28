@@ -5463,12 +5463,16 @@ async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("link_drops", "delay"),
-    [(True, LOCK_STALE_STATE_DEBOUNCE_DELAY), (False, KEEP_ALIVE_TIME)],
-    ids=["link-dropped", "link-up"],
+    ("link_drops", "held", "delay"),
+    [
+        (True, False, LOCK_STALE_STATE_DEBOUNCE_DELAY),
+        (False, False, KEEP_ALIVE_TIME),
+        (True, True, LOCK_STALE_STATE_DEBOUNCE_DELAY),
+    ],
+    ids=["link-dropped", "link-up", "link-dropped-under-a-hold"],
 )
 async def test_the_exit_keeps_the_reconnect_an_always_connected_lock_owes(
-    link_drops: bool, delay: float
+    link_drops: bool, held: bool, delay: float
 ) -> None:
     """An always-connected lock whose link dropped reconnects at the floor.
 
@@ -5482,6 +5486,8 @@ async def test_the_exit_keeps_the_reconnect_an_always_connected_lock_owes(
     push_lock._running = True
     push_lock._advertisement_data = _advertisement({})
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    if held:
+        push_lock._update_any_state([LockStatus.JAMMED])
     push_lock._ble_device = MagicMock()
     lock = push_lock._get_lock_instance()
     lock.client = MagicMock(is_connected=True)
@@ -5493,19 +5499,29 @@ async def test_the_exit_keeps_the_reconnect_an_always_connected_lock_owes(
         write_success_callback: Callable[[], None] | None = None,
     ) -> None:
         assert write_success_callback is not None
+        if held:
+            # Stands in for a link that drops after the lock acknowledged the
+            # command and before the write call returned: the write-success
+            # that would release the hold never runs, and the operation ends
+            # without a result.
+            lock.disconnected()
+            raise OperationIncompleteError("link dropped before the write returned")
         write_success_callback()
         if link_drops:
             lock.disconnected()
 
     lock.force_lock = force_lock  # type: ignore[method-assign]
 
-    await push_lock.lock()
+    with pytest.raises(OperationIncompleteError) if held else nullcontext():
+        await push_lock.lock()
 
     handle = push_lock._cancel_deferred_update
     assert handle is not None
     assert delay - 1 < handle.when() - push_lock.loop.time() <= delay
+    assert (time.monotonic() < push_lock._jammed_hold_deadline) is held
     push_lock._cancel_future_update()
     push_lock._cancel_keepalive_timer()
+    push_lock._cancel_jam_hold_timer()
 
 
 @pytest.mark.asyncio
