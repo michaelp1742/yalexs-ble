@@ -1959,6 +1959,20 @@ class PushLock:
             future_update_time, self._deferred_update
         )
 
+    def _wait_for_the_floor(self, now: float) -> bool:
+        """Re-arm the cycle for the floor's remainder unless a timer already stands.
+
+        True when the floor still holds, so the caller polls nothing now. A
+        standing timer re-checks the floor when it fires, so the cycle
+        yields to it.
+        """
+        if now >= self._earliest_update_time:
+            return False
+        if self._cancel_deferred_update is None:
+            _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
+            self._schedule_future_update(self._earliest_update_time - now)
+        return True
+
     def _deferred_update(self) -> None:
         """Update the lock state."""
         self._cancel_future_update()
@@ -1969,11 +1983,8 @@ class PushLock:
             )
             self._schedule_future_update_with_debounce(UPDATE_IN_PROGRESS_DEFER_SECONDS)
             return
-        if now < self._earliest_update_time:
-            # The floor moved after this cycle was armed; re-arm for the
-            # remainder. The fired timer is spent, so nothing coalesces.
-            _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
-            self._schedule_future_update(self._earliest_update_time - now)
+        if self._wait_for_the_floor(now):
+            # The floor moved after this cycle was armed.
             return
         if self._operation_lock.locked():
             # The cycle is re-armed rather than created, so it does not sit
@@ -2004,15 +2015,10 @@ class PushLock:
         _LOGGER.debug("%s: Starting deferred update", self.name)
         try:
             async with self._operation_lock:
-                # Read under the lock: an operation may have run between the
-                # timer's own check and this task taking the lock, and its exit
-                # stamped the floor for the position the lock was leaving.
-                now = time.monotonic()
-                if now < self._earliest_update_time:
-                    _LOGGER.debug(
-                        "%s: Rescheduling update to avoid stale state", self.name
-                    )
-                    self._schedule_future_update(self._earliest_update_time - now)
+                # Read under the lock: an operation may have run between the timer's
+                # own check and this task taking the lock, and its exit stamped the
+                # floor and scheduled its own poll.
+                if self._wait_for_the_floor(time.monotonic()):
                     return
                 await self._locked_update()
             self._set_update_state(None)
