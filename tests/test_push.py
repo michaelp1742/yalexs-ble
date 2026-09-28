@@ -2068,6 +2068,22 @@ async def test_set_auto_lock_write_on_a_stopped_watcher_arms_nothing() -> None:
     assert push_lock._cancel_deferred_update is None
 
 
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_with_an_invalid_duration_arms_nothing() -> None:
+    """A write refused for its duration connects nothing and arms nothing."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6e")
+    ensure_connected = AsyncMock()
+
+    with (
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        pytest.raises(ValueError, match="Invalid auto lock duration: 45"),
+    ):
+        await push_lock.set_auto_lock_duration(45)
+
+    ensure_connected.assert_not_awaited()
+    assert push_lock._cancel_deferred_update is None
+
+
 # ---------------------------------------------------------------------------
 # Auto lock read: the four settings-command outcomes (see
 # notes/yale/autolock_settings_command_outcome_taxonomy.md), each with and
