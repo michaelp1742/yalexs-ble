@@ -920,7 +920,7 @@ class PushLock:
             # op-response; the operation applies its own outcome. Door and
             # battery values in the same frame are unaffected.
             _LOGGER.debug(
-                "%s: Operation in flight, not accepting lock status %s",
+                "%s: Operation window open, not accepting lock status %s",
                 self.name,
                 incoming,
             )
