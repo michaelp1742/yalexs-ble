@@ -841,8 +841,11 @@ class PushLock:
         self._cancel_future_update()
         # A settled status waits the keep-alive; an unsettled one polls at
         # the stale-state debounce, the earliest a poll answers with the
-        # motor stopped.
-        if self.lock_status in POSITION_READINGS:
+        # motor stopped. An always-connected lock whose link dropped
+        # meanwhile polls at the debounce too: that cycle is its reconnect.
+        if self.lock_status in POSITION_READINGS and (
+            self.is_connected or not self._always_connected
+        ):
             delay = KEEP_ALIVE_TIME
         else:
             delay = LOCK_STALE_STATE_DEBOUNCE_DELAY
