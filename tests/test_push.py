@@ -3310,42 +3310,88 @@ async def test_deferred_update_backs_off_while_an_operation_holds_the_lock() -> 
 
 
 @pytest.mark.asyncio
-async def test_deferred_update_reads_the_floor_under_the_operation_lock() -> None:
-    """A cycle queued behind an operation reads the floor its exit stamped.
+async def test_a_cycle_queued_behind_an_operation_yields_to_the_exits_poll() -> None:
+    """A cycle queued behind an operation leaves the exit's poll standing.
 
     The timer's checks passed before the operation took the lock, so the
-    cycle's task waits on the lock; once the exit stamps the floor and
-    releases it, the cycle re-arms for the remainder and polls nothing.
+    cycle's task waits on the lock. Once the operation ends, the cycle finds
+    the floor its exit stamped and the timer its exit scheduled, which
+    re-checks the floor when it fires, so the cycle polls nothing and arms
+    nothing.
     """
+    # Not always connected, so the exit's poll waits the keep-alive whatever the link.
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
-    mock_lock = _answering_lock(push_lock)
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     push_lock._first_update_future = asyncio.get_running_loop().create_future()
+    mock_lock = _answering_lock(push_lock)
+    proceed = asyncio.Event()
+
+    async def force_lock(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()
+        await proceed.wait()
+
+    mock_lock.force_lock = force_lock
+    finalize = push_lock._finalize_operation
+    exit_handles: list[asyncio.TimerHandle | None] = []
+
+    def finalize_and_record() -> None:
+        finalize()
+        exit_handles.append(push_lock._cancel_deferred_update)
 
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch.object(
             push_lock, "_read_auto_lock_setting", AsyncMock(return_value=False)
         ),
+        patch.object(push_lock, "_finalize_operation", side_effect=finalize_and_record),
     ):
-        await push_lock._operation_lock.acquire()
-        task = asyncio.create_task(push_lock._execute_deferred_update())
-        await asyncio.sleep(0)
-        # The operation's exit stamps the floor before it releases the lock.
-        push_lock._earliest_update_time = (
-            time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
-        )
-        push_lock._operation_lock.release()
-        await task
+        op = asyncio.create_task(push_lock.lock())
+        await asyncio.sleep(0)  # the operation holds the lock, past write-success
+        cycle = asyncio.create_task(push_lock._execute_deferred_update())
+        await asyncio.sleep(0)  # the cycle's task queues on the operation lock
+        proceed.set()
+        await op
+        await cycle
 
     mock_lock.lock_status.assert_not_awaited()
-    handle = push_lock._cancel_deferred_update
-    assert handle is not None
-    due_in = handle.when() - push_lock.loop.time()
+    (exit_handle,) = exit_handles
+    assert exit_handle is not None
+    assert push_lock._cancel_deferred_update is exit_handle
     assert (
-        LOCK_STALE_STATE_DEBOUNCE_DELAY - 1 < due_in <= LOCK_STALE_STATE_DEBOUNCE_DELAY
+        KEEP_ALIVE_TIME - 1
+        < exit_handle.when() - push_lock.loop.time()
+        <= KEEP_ALIVE_TIME
     )
     assert not push_lock._first_update_future.done()
     push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_queued_cycle_with_no_standing_timer_rearms_for_the_floor() -> None:
+    """A cycle held by the floor with no timer standing re-arms for the remainder.
+
+    Nothing else would poll the lock once the floor lapses, so the cycle arms
+    a timer for the time the floor has left; with the floor lapsed it arms
+    nothing and the caller polls.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:73")
+    now = time.monotonic()
+    push_lock._earliest_update_time = now + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+    assert push_lock._wait_for_the_floor(now) is True
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert (
+        LOCK_STALE_STATE_DEBOUNCE_DELAY - 1
+        < handle.when() - push_lock.loop.time()
+        <= LOCK_STALE_STATE_DEBOUNCE_DELAY
+    )
+    push_lock._cancel_future_update()
+
+    push_lock._earliest_update_time = now - 1.0
+    assert push_lock._wait_for_the_floor(now) is False
+    assert push_lock._cancel_deferred_update is None
 
 
 @pytest.mark.asyncio
@@ -5008,7 +5054,7 @@ async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> Non
     async def force_lock(write_success_callback: Callable[[], None]) -> None:
         write_success_callback()
         # Stands in for a keep-alive falling due while the operation runs.
-        push_lock._schedule_future_update_with_debounce(KEEP_ALIVE_TIME)
+        push_lock._schedule_future_update(0)
         armed_mid_operation.append(push_lock._cancel_deferred_update)
 
     mock_lock.force_lock = force_lock
