@@ -673,13 +673,17 @@ async def test_execute_operation_happy_path() -> None:
     assert order == ["write", "ack"]
 
 
-def _write_delivering(session: Session, frames: list[bytearray]) -> Callable[..., None]:
-    """Build a write that delivers frames before it returns, as the host
-    usually does."""
+def _write_delivering(
+    session: Session, frames: list[bytearray], error: BaseException | None = None
+) -> Callable[..., None]:
+    """Build a write that delivers frames and then returns or fails, the order
+    the host usually produces."""
 
     def _write(*_: object) -> None:
         for frame in frames:
             session._notify(0, bytearray(frame))
+        if error is not None:
+            raise error
 
     return _write
 
@@ -1838,29 +1842,21 @@ async def test_errored_write_still_reports_the_write_as_attempted() -> None:
     assert progress.acknowledged is False
 
 
-def _write_feeding(
-    session: Session, frames: list[bytearray], error: BaseException
-) -> Callable[..., None]:
-    """Build a write that delivers frames before it fails, as the host can."""
-
-    def _write(*_: object) -> None:
-        for frame in frames:
-            session._notify(0, bytearray(frame))
-        raise error
-
-    return _write
-
-
 @pytest.mark.asyncio
-async def test_a_write_error_after_the_acknowledgment_is_operation_incomplete() -> None:
+@pytest.mark.parametrize(
+    "error", [BleakError("write failed"), BleakError("disconnected")]
+)
+async def test_a_write_error_after_the_acknowledgment_is_operation_incomplete(
+    error: BleakError,
+) -> None:
     """A write that errors once its acknowledgment is recorded is not retried."""
     session, client = _make_operation_session()
     progress = OperationProgress()
-    client.write_gatt_char.side_effect = _write_feeding(
-        session, [_with_checksum(_ACK_SECUREMODE)], BleakError("write failed")
+    client.write_gatt_char.side_effect = _write_delivering(
+        session, [_with_checksum(_ACK_SECUREMODE)], error
     )
 
-    with pytest.raises(OperationIncompleteError, match="write failed"):
+    with pytest.raises(OperationIncompleteError, match=str(error)):
         await session.execute_operation(
             session.build_operation_command(Commands.LOCK, 0x04),
             "force_securemode",
@@ -1881,7 +1877,7 @@ async def test_a_write_timeout_after_the_acknowledgment_is_operation_incomplete(
     """A write that stalls once its acknowledgment is recorded is not retried."""
     session, client = _make_operation_session()
     progress = OperationProgress()
-    client.write_gatt_char.side_effect = _write_feeding(
+    client.write_gatt_char.side_effect = _write_delivering(
         session, [_with_checksum(_ACK_SECUREMODE)], TimeoutError()
     )
 
@@ -1899,15 +1895,20 @@ async def test_a_write_timeout_after_the_acknowledgment_is_operation_incomplete(
 
 
 @pytest.mark.asyncio
-async def test_a_write_error_after_the_op_response_returns_the_result() -> None:
+@pytest.mark.parametrize(
+    "error", [BleakError("write failed"), BleakError("disconnected")]
+)
+async def test_a_write_error_after_the_op_response_returns_the_result(
+    error: BleakError,
+) -> None:
     """A write that errors once its op-response is recorded returns that result."""
     session, client = _make_operation_session()
     progress = OperationProgress()
     op_response = _with_checksum(_OP_RESPONSE_OK)
-    client.write_gatt_char.side_effect = _write_feeding(
+    client.write_gatt_char.side_effect = _write_delivering(
         session,
         [_with_checksum(_ACK_SECUREMODE), op_response],
-        BleakError("write failed"),
+        error,
     )
 
     result = await session.execute_operation(
@@ -1932,7 +1933,7 @@ async def test_a_write_error_after_an_unacknowledged_op_response_logs_the_comple
     session, client = _make_operation_session()
     progress = OperationProgress()
     op_response = _with_checksum(_OP_RESPONSE_OK)
-    client.write_gatt_char.side_effect = _write_feeding(
+    client.write_gatt_char.side_effect = _write_delivering(
         session, [op_response], BleakError("write failed")
     )
 
