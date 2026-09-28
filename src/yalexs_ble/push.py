@@ -829,12 +829,13 @@ class PushLock:
     def _init_operation_state(self) -> None:
         """Initialize the per-operation fields.
 
-        The operation lock allows one operation at a time; these two
+        The operation lock allows one operation at a time; these three
         describe it. Each is set again as an operation reaches the point it
         describes, so this only makes them readable before the first one.
         """
         self._operation_outcome = None
         self._operation_window_open = False
+        self._operation_in_flight = False
 
     @operation_lock
     async def _run_lock_operation(
@@ -848,6 +849,7 @@ class PushLock:
         """
         self._cancel_future_update()
         self._operation_outcome = None
+        self._operation_in_flight = True
         try:
             await self._execute_lock_operation(op_attr, pending_state, complete_state)
         except Exception:
@@ -881,11 +883,10 @@ class PushLock:
             self._operation_window_open = True
 
     def _close_operation_window(self) -> None:
-        """Close the operation window and drop everything it recorded.
+        """Close the operation window and drop what the operation recorded.
 
-        Clearing _seen_intervention_status here means the record cannot
-        outlive the window; _finalize_operation reads it first, and the retry
-        path only gets here with it already clear.
+        _finalize_operation reads the record first, and the retry path only
+        gets here with it already clear.
         """
         self._operation_window_open = False
         self._seen_intervention_status = None
@@ -897,10 +898,10 @@ class PushLock:
         window left open would freeze the display on the operation's
         transitional state.
         """
+        self._operation_in_flight = False
         outcome = self._operation_outcome
-        # A jam or setup condition recorded while the window was open is the
-        # lock's own reading and may never be sent again, so it replaces the
-        # outcome.
+        # A jam or setup condition the lock reported while the operation ran
+        # may never be reported again, so it replaces the outcome.
         if (recorded := self._seen_intervention_status) is not None:
             outcome = recorded
             _LOGGER.debug(
@@ -945,8 +946,8 @@ class PushLock:
 
         The hold deadline and its timer survive reconnects (the mechanism
         outlives the link that reported it) but not a stop (see _cancel).
-        _seen_intervention_status holds the status the operation window
-        filtered out, until the operation applies it at its exit.
+        _seen_intervention_status holds a status that arrived while an
+        operation was in flight, until the operation applies it at its exit.
         """
         self._jammed_hold_deadline = NEVER_TIME
         self._jam_hold_timer: asyncio.TimerHandle | None = None
@@ -1005,15 +1006,15 @@ class PushLock:
         either and the secure lock keeps its display. The status on display
         is what the hold below is holding, so it is read here too.
         """
+        if incoming in MANUAL_INTERVENTION_STATUSES and self._operation_in_flight:
+            # Recorded because the lock may never report it again; the
+            # operation applies it at its exit. The last one recorded wins,
+            # and the follow-up status poll asks the lock again.
+            self._seen_intervention_status = incoming
         if self._operation_window_open:
             # No received lock status is accepted between write-success and
             # op-response; the operation applies its own outcome. Door and
             # battery values in the same frame are unaffected.
-            if incoming in MANUAL_INTERVENTION_STATUSES:
-                # Recorded because it may never be sent again; the
-                # operation applies it at its exit. The last one recorded
-                # wins, and the follow-up status poll asks the lock again.
-                self._seen_intervention_status = incoming
             _LOGGER.debug(
                 "%s: Operation in flight, not accepting lock status %s",
                 self.name,
