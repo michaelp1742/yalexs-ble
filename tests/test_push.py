@@ -4,6 +4,7 @@ import logging
 import struct
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -11,6 +12,7 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
 from yalexs_ble.const import (
@@ -61,8 +63,10 @@ from yalexs_ble.session import (
     OperationIncompleteError,
     OperationProgress,
     ResponseError,
+    Session,
     UnlatchError,
 )
+from yalexs_ble.util import _simple_checksum
 
 # Shared battery-supporting lock used across tests. model is NOT in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
@@ -3545,8 +3549,7 @@ async def test_a_raising_stamp_still_opens_the_window():
 
     The session contains an exception from the write-success hook and runs
     the staged wait to its end, so a raise that left the window closed would
-    run the whole operation with every mid-motion status admitted and no
-    intervention status recorded.
+    run the whole operation with every mid-motion status admitted.
     """
     push_lock = _operational_push_lock()
 
@@ -4054,7 +4057,7 @@ async def test_a_jam_recorded_before_the_stop_reaches_no_later_operation():
 
     async def _jam_then_stop_then_fail(write_success_callback):
         write_success_callback()
-        # Filtered by the open window, so the operation carries the record.
+        # Filtered by the open window; the operation carries the record.
         push_lock._update_any_state([LockStatus.JAMMED])
         push_lock._running = False
         raise OperationIncompleteError("no op-response, and we were stopped")
@@ -4276,6 +4279,159 @@ async def test_a_new_operation_writes_through_a_live_jam_hold() -> None:
     assert push_lock._jammed_hold_deadline == NEVER_TIME  # released at write-success
 
 
+# The acknowledgment and op-responses lock() is answered with on the Lock
+# opcode, and a LOCK_ONLY status push carrying a jam.
+_ACK_LOCK = "aa0b00000000000000000000000000000200"
+_OP_RESPONSE_OK = "bb0b00000000000000000000000000000200"
+_OP_RESPONSE_JAMMED = "bb0b000000000000000000000000001f0200"
+_STATUS_PUSH_JAMMED = "bb0200000200000007000000000000000000"
+
+
+def _with_checksum(hex_str: str) -> bytearray:
+    """Build an 18-byte frame with a valid simple checksum in byte[3].
+
+    _validate_response requires the 18-byte simple checksum to sum to zero;
+    byte[3] is the checksum field, so set it to whatever makes that hold.
+    """
+    frame = bytearray.fromhex(hex_str)
+    frame[0x03] = 0
+    frame[0x03] = _simple_checksum(frame)
+    return frame
+
+
+def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMock]:
+    """A connected Lock on a real Session whose frames reach push_lock.
+
+    Only cipher_encrypt is set, so delivered frames pass through
+    Session.decrypt unchanged.
+    """
+    lock = Lock(
+        lambda: BLEDevice(push_lock.address, "lock"),
+        "0800200c9a66",
+        1,
+        push_lock.name,
+        push_lock._state_callback,
+    )
+    client = MagicMock(is_connected=True)
+    session = Session(
+        client, push_lock.name, asyncio.Lock(), set(), lock._internal_state_callback
+    )
+    session.cipher_encrypt = Cipher(
+        algorithms.AES(bytes(16)),
+        modes.CBC(bytes(16)),
+    ).encryptor()
+    lock.client = client
+    lock.session = session
+    lock.secure_session = MagicMock()
+    return lock, session, client
+
+
+def _write_delivering(
+    session: Session, frames: list[bytearray], error: BaseException | None = None
+) -> Callable[..., None]:
+    """Build a write that delivers frames and then returns or fails, the order
+    the host usually produces."""
+
+    def _write(*_: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+        if error is not None:
+            raise error
+
+    return _write
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("report", "raised"),
+    [
+        ([_OP_RESPONSE_JAMMED], OperationFailedError),
+        ([_STATUS_PUSH_JAMMED, _OP_RESPONSE_OK], None),
+    ],
+    ids=["failure-op-response", "status-push"],
+)
+async def test_a_jam_reported_before_the_write_returns_is_put_back_at_the_exit(
+    report: list[str], raised: type[Exception] | None
+) -> None:
+    """A jam the lock reports before the write call returns is put back at the exit.
+
+    The lock's frames can be handled while the write call is still pending,
+    so the jam reaches the display ahead of the write-success stamp, which
+    replaces it. The operation is in flight when the jam arrives, so it is
+    recorded, and the exit applies it in place of the outcome. The lock
+    reports it either as a failure op-response, which the operation raises
+    as OperationFailedError, or as a status push ahead of a successful one.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:70")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, *report)]
+    client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        pytest.raises(raised) if raised is not None else nullcontext(),
+    ):
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert emissions == [LockStatus.JAMMED, LockStatus.LOCKING, LockStatus.JAMMED]
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_jam_reported_before_the_write_returns_ends_the_attempts() -> None:
+    """A jam reported before the write returns ends the attempt ladder.
+
+    The status push arrives with nothing acknowledged, so the write error
+    that follows reaches the operation as a retryable failure. A retry would
+    drive the motor into a mechanism the lock has just reported jammed, so
+    the recorded jam ends the attempts as OperationIncompleteError, with the
+    command written once and the jam on display.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:71")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(
+            session,
+            [_with_checksum(_STATUS_PUSH_JAMMED)],
+            BleakError("write failed"),
+        )
+    )
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+        pytest.raises(OperationIncompleteError),
+    ):
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert push_lock.lock_status is LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_jam_with_no_operation_in_flight_is_not_recorded() -> None:
+    """A jam reported with no operation in flight is displayed and not recorded.
+
+    Only an operation's exit applies the record, so one written with no
+    operation in flight would be left for the next operation, to end its
+    attempts or to replace its outcome.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:72")
+
+    push_lock._update_any_state([LockStatus.JAMMED])
+
+    assert push_lock.lock_status is LockStatus.JAMMED
+    assert push_lock._seen_intervention_status is None
+
+
 @pytest.mark.asyncio
 async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     """A second operation queued on the operation lock stamps nothing.
@@ -4345,6 +4501,8 @@ async def test_window_filter_drops_lock_status_admits_the_door_member() -> None:
     operation's exit, and the door member of the same frame still passes.
     """
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3b")
+    # As _run_lock_operation sets it before the command is issued.
+    push_lock._operation_in_flight = True
 
     # Open the window as write-success would: stamp the pending transitional.
     push_lock._operation_write_success(LockStatus.LOCKING)
