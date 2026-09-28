@@ -704,6 +704,8 @@ class Session:
         acknowledged, which leaves the caller to raise the failure as
         execute() raises it.
         """
+        # The lock has answered; a failure after its answer cannot change the
+        # outcome.
         if (result := progress.result) is not None:
             _LOGGER.debug(
                 "%s: %s failed after its op-response was recorded: %r; "
@@ -780,9 +782,9 @@ class Session:
                 )
         except OperationIncompleteError:
             raise
-        # Every failure, whatever its type: the retry set reaches past
-        # BleakError to AttributeError, EOFError and BrokenPipeError, and none
-        # of them may reach a retry once the lock has acknowledged the command.
+        # Every failure, whatever its type: the retry set is wider than
+        # BleakError, and none of it may reach a retry once the lock has
+        # acknowledged the command.
         except Exception as err:
             if (
                 result := self._outcome_after_failure(progress, command_name, err)
