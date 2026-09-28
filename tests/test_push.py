@@ -4811,6 +4811,53 @@ async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("link_drops", "delay"),
+    [(True, LOCK_STALE_STATE_DEBOUNCE_DELAY), (False, KEEP_ALIVE_TIME)],
+    ids=["link-dropped", "link-up"],
+)
+async def test_the_exit_keeps_the_reconnect_an_always_connected_lock_owes(
+    link_drops: bool, delay: float
+) -> None:
+    """An always-connected lock whose link dropped reconnects at the floor.
+
+    The drop arms the lock's reconnect cycle, and the exit clears the slot
+    before it schedules its own poll, so that poll is the reconnect: it runs
+    at the stale-state debounce rather than the keep-alive a settled position
+    waits, which a lock whose link stayed up still gets.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:74", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    push_lock._ble_device = MagicMock()
+    lock = push_lock._get_lock_instance()
+    lock.client = MagicMock(is_connected=True)
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    push_lock._client = lock
+
+    async def force_lock(
+        write_success_callback: Callable[[], None] | None = None,
+    ) -> None:
+        assert write_success_callback is not None
+        write_success_callback()
+        if link_drops:
+            lock.disconnected()
+
+    lock.force_lock = force_lock  # type: ignore[method-assign]
+
+    await push_lock.lock()
+
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert delay - 1 < handle.when() - push_lock.loop.time() <= delay
+    push_lock._cancel_future_update()
+    push_lock._cancel_keepalive_timer()
+
+
+@pytest.mark.asyncio
 async def test_cancellation_polls_sooner_than_the_keep_alive() -> None:
     """A cancelled operation schedules its own status poll, and sooner.
 

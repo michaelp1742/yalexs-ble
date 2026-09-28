@@ -890,10 +890,13 @@ class PushLock:
         # A settled pair waits the keep-alive; an unsettled one polls at
         # the stale-state debounce, the earliest a poll answers with the
         # motor stopped. The two motion values are the only transitional
-        # readings the projection publishes on the secure channel.
-        if self.lock_status in POSITION_READINGS and self.secure_status not in (
-            LockStatus.LOCKING,
-            LockStatus.UNLOCKING,
+        # readings the projection publishes on the secure channel. An
+        # always-connected lock whose link dropped meanwhile polls at the
+        # debounce too: that cycle is its reconnect.
+        if (
+            self.lock_status in POSITION_READINGS
+            and self.secure_status not in (LockStatus.LOCKING, LockStatus.UNLOCKING)
+            and (self.is_connected or not self._always_connected)
         ):
             delay = KEEP_ALIVE_TIME
         else:
