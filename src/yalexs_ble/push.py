@@ -124,9 +124,8 @@ POST_OPERATION_SYNC_TIME = 10.00
 # time for a user interface to hold the status on display.
 JAMMED_HOLD_TIME = 30.0
 
-# How long to wait and check again while an operation is in flight: an
-# update cycle created then would run the instant the operation ends, while
-# the lock still reports a stale state.
+# How long a cycle falling due while an operation is in flight waits
+# before it checks again.
 DEADLINE_WAKEUP_RETRY_DELAY = 1.0
 
 # How long to wait if we get an update storm from the lock
@@ -1246,12 +1245,10 @@ class PushLock:
     ) -> None:
         """Apply states to the display.
 
-        arm_resync is False for the states an operation applies itself. A
+        arm_resync is False for the states an operation applies itself: a
         status change coming from the lock arms a resync cycle to read the
-        settled value back; a status the operation stamped needs no such read,
-        and arming one from inside an operation displaces the delay
-        _finalize_operation chooses when the operation ends. Those states are
-        read by the operation's own follow-up status poll instead.
+        settled value back, while a status the operation stamped is read by
+        the operation's own follow-up status poll.
         """
         _LOGGER.debug("%s: State changed: %s", self.name, states)
         lock_state = self._get_current_state()
@@ -1943,8 +1940,8 @@ class PushLock:
             # The floor moved after this cycle was armed.
             return
         if self._operation_lock.locked():
-            # The cycle is re-armed rather than created, so it does not sit
-            # on the operation lock and poll the instant the motor stops.
+            # The cycle is re-armed rather than created, so no task sits on the
+            # operation lock waiting for the motor to stop.
             _LOGGER.debug(
                 "%s: Rescheduling update until the operation lock is released",
                 self.name,
