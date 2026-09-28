@@ -247,9 +247,8 @@ class Session:
             level, "%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex
         )
         if self._operation_progress is not None:
-            # Failing a staged wait would re-send a mechanical command whose
-            # result is unknown, so the wait continues; the stage timeout is
-            # the backstop.
+            # Failing a staged wait would end an operation whose answer may still
+            # arrive, so the wait continues; the stage timeout is the backstop.
             _LOGGER.debug(
                 "%s: Invalid frame during an operation wait, still waiting", self.name
             )
@@ -481,9 +480,8 @@ class Session:
                     self.write_characteristic, command, True
                 )
             if write_success_callback is not None:
-                # Contained: an exception escaping here would be retried
-                # upstream and re-send a mechanical command. A raising hook
-                # is a bug in the caller.
+                # Contained: an exception escaping here would end an operation the
+                # lock is already running. A raising hook is a bug in the caller.
                 try:
                     write_success_callback()
                 except Exception:
@@ -684,8 +682,8 @@ class Session:
         Returns the op-response when one was recorded before the failure,
         raises OperationIncompleteError once the command was acknowledged and
         the result is therefore unknown, and returns None while nothing was
-        acknowledged, which leaves the caller to raise the failure as it came
-        in, retryable.
+        acknowledged, which leaves the caller to raise the failure as
+        execute() raises it.
         """
         if (result := progress.result) is not None:
             _LOGGER.debug(
