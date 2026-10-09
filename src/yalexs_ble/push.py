@@ -156,6 +156,16 @@ POSITION_READINGS = frozenset(
     }
 )
 
+# Statuses while the motor runs; SECURING is never reported, securemode() stamps it.
+TRANSITIONAL_READINGS = frozenset(
+    {
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+        LockStatus.SECURING,
+    }
+)
+
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
 RETRY_EXCEPTIONS = (ResponseError, *BLEAK_RETRY_EXCEPTIONS)
@@ -631,6 +641,7 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            op_response_callback=self._op_response_callback,
         )
 
     def _disconnected_callback(self) -> None:
@@ -899,6 +910,10 @@ class PushLock:
         finally:
             self._operation_window_open = True
 
+    def _op_response_callback(self) -> None:
+        """Hold update cycles off the lock when an op-response arrives."""
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+
     def _close_operation_window(self) -> None:
         """Close the operation window and drop the recorded intervention status."""
         self._operation_window_open = False
@@ -920,7 +935,7 @@ class PushLock:
         self._close_operation_window()
         # Set before the stop check so a restarted watcher inherits them.
         self._force_lock_status_poll = True
-        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
         if not self._running:
             # Stopped mid-operation: a cycle armed now would outlive the stop.
             return
@@ -998,8 +1013,12 @@ class PushLock:
         """Decide the displayed lock status for an incoming value.
 
         Every incoming lock status, polled or pushed, must pass through
-        here. None refuses the value, so nothing from it is applied.
+        here. None refuses the value, so nothing from it is applied. A
+        transitional value holds the next poll off before any of that.
         """
+        if incoming in TRANSITIONAL_READINGS:
+            # A lock polled mid-motion answers with the position it is leaving.
+            self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
         if incoming in MANUAL_INTERVENTION_STATUSES and self._operation_in_flight:
             # The lock may never report it again; the operation applies it at exit.
             self._seen_intervention_status = incoming
@@ -1074,8 +1093,9 @@ class PushLock:
                 # that needs attention.
                 raise OperationIncompleteError(
                     f"{self.name}: the lock reported {recorded} while "
-                    f"{op_attr} was in flight; the command was not re-sent "
-                    f"and the result is unknown"
+                    f"{op_attr} was in flight and the attempt ended with "
+                    f"{ex!r}; the command was not re-sent and the result is "
+                    f"unknown"
                 ) from ex
             # Close the window so a retry re-stamps at its write-success.
             self._close_operation_window()
@@ -1133,6 +1153,8 @@ class PushLock:
 
     async def _set_auto_lock_or_warn(self, mode: AutoLockMode, duration: int) -> None:
         """Set auto lock, surfacing a write the lock never confirmed."""
+        if duration not in self.auto_lock_durations:
+            raise ValueError(f"Invalid auto lock duration: {duration}")
         try:
             await self._set_auto_lock(mode, duration)
         except TimeoutError as err:
@@ -1145,6 +1167,10 @@ class PushLock:
             raise TimeoutError(
                 f"{self.name}: Lock did not confirm the auto lock setting write"
             ) from err
+        finally:
+            if self._running:
+                # Carries any poll the attempts cancelled and reads the new value back.
+                self._schedule_future_update_with_debounce(0)
 
     @retry_bluetooth_connection_error(attempts=AUTO_LOCK_WRITE_ATTEMPTS)
     async def _set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -1153,9 +1179,6 @@ class PushLock:
             raise RuntimeError(
                 f"{self.name}: Set auto lock operation not possible because not running"
             )
-        # Duration validation
-        if duration not in self.auto_lock_durations:
-            raise ValueError(f"Invalid auto lock duration: {duration}")
         # Unlike lock/unlock/securemode, this path does not optimistically mutate
         # _lock_state.auto_lock, so there is no prior value to restore on failure.
         # Notify callbacks or the next poll surface the authoritative state.
@@ -1959,6 +1982,12 @@ class PushLock:
             ) from ex
         finally:
             self._first_update_future = None
+
+    def _hold_update(self, seconds: float) -> None:
+        """Hold update cycles off for seconds from now; the floor only moves later."""
+        self._earliest_update_time = max(
+            self._earliest_update_time, time.monotonic() + seconds
+        )
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""

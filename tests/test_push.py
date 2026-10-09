@@ -1972,6 +1972,131 @@ async def test_set_auto_lock_write_resets_read_backoff() -> None:
     assert await push_lock._read_auto_lock_setting(mock_lock) is True
 
 
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_schedules_the_update_that_reads_it_back() -> None:
+    """A confirmed write schedules the update that reads the new value back."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6a")
+    push_lock._seen_this_session.add(AutoLockState)
+    mock_lock = _answering_lock(push_lock)
+    mock_lock.set_auto_lock = AsyncMock()
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._set_auto_lock_or_warn(AutoLockMode.TIMER, 30)
+
+        assert push_lock._cancel_deferred_update is not None
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    mock_lock.auto_lock_status.assert_awaited_once()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_keeps_the_poll_a_failed_operation_owes() -> None:
+    """An auto lock write after a failed operation keeps the status poll it owes."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6b")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    mock_lock = _answering_lock(push_lock)
+    mock_lock.set_auto_lock = AsyncMock()
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+
+    async def force_lock(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()
+        raise OperationIncompleteError("no op-response")
+
+    mock_lock.force_lock = force_lock
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        with pytest.raises(OperationIncompleteError):
+            await push_lock.lock()
+        assert push_lock.lock_status == LockStatus.UNKNOWN
+
+        await push_lock._set_auto_lock_or_warn(AutoLockMode.TIMER, 30)
+
+        handle = push_lock._cancel_deferred_update
+        assert handle is not None
+        assert (
+            0 < handle.when() - push_lock.loop.time() <= LOCK_STALE_STATE_DEBOUNCE_DELAY
+        )
+        mock_lock.lock_status.assert_not_awaited()
+
+        # Let the floor pass, then run the cycle.
+        push_lock._earliest_update_time = NEVER_TIME
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    mock_lock.lock_status.assert_awaited_once()
+    final_state = push_lock._lock_state
+    assert final_state is not None
+    assert final_state.lock == LockStatus.LOCKED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_arms_one_cycle_after_its_attempts() -> None:
+    """No cycle is armed between the write's attempts; one is armed after them."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6c")
+    mock_lock = MagicMock()
+    mock_lock.set_auto_lock = AsyncMock(
+        side_effect=[DisconnectedError("dropped before the write"), None]
+    )
+    slot_at_each_attempt: list[asyncio.TimerHandle | None] = []
+
+    async def ensure_connected() -> MagicMock:
+        slot_at_each_attempt.append(push_lock._cancel_deferred_update)
+        return mock_lock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        patch("yalexs_ble.push.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        await push_lock.set_auto_lock_duration(30)
+
+    assert mock_lock.set_auto_lock.await_count == 2
+    assert slot_at_each_attempt == [None, None]
+    assert push_lock._cancel_deferred_update is not None
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_on_a_stopped_watcher_arms_nothing() -> None:
+    """A write refused because the watcher is stopped arms nothing."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6d")
+    push_lock._running = False
+
+    with pytest.raises(RuntimeError):
+        await push_lock.set_auto_lock_duration(30)
+
+    assert push_lock._cancel_deferred_update is None
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_with_an_invalid_duration_arms_nothing() -> None:
+    """A write refused for its duration connects nothing and arms nothing."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6e")
+    ensure_connected = AsyncMock()
+
+    with (
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        pytest.raises(ValueError, match="Invalid auto lock duration: 45"),
+    ):
+        await push_lock.set_auto_lock_duration(45)
+
+    ensure_connected.assert_not_awaited()
+    assert push_lock._cancel_deferred_update is None
+
+
 # ---------------------------------------------------------------------------
 # Auto lock read: the four settings-command outcomes (see
 # notes/yale/autolock_settings_command_outcome_taxonomy.md), each with and
@@ -3752,6 +3877,19 @@ async def test_retried_unlock_keeps_the_secure_transitional() -> None:
 
 
 @pytest.mark.asyncio
+async def test_securing_stamp_moves_the_poll_floor_at_write_success() -> None:
+    """The SECURING stamp arms the poll floor at write-success."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:68")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    push_lock._earliest_update_time = NEVER_TIME
+
+    before = time.monotonic()
+    push_lock._operation_write_success(LockStatus.SECURING)
+
+    assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
 async def test_nonretryable_securemode_after_write_stamps_unknown() -> None:
     """A securemode that dies after its write settles the pair at UNKNOWN."""
     exc = OperationIncompleteError("no op-response")
@@ -4380,6 +4518,8 @@ async def test_a_stop_mid_operation_keeps_the_owed_poll_and_the_floor():
 
     async def _stop_then_fail(write_success_callback):
         write_success_callback()
+        # Clear the write-success floor so the assertion sees the exit's stamp.
+        push_lock._earliest_update_time = NEVER_TIME
         push_lock._running = False
         raise OperationIncompleteError("no op-response, and we were stopped")
 
@@ -4530,7 +4670,13 @@ async def test_jam_inside_the_window_replaces_the_unknown_of_a_lost_result() -> 
 
 
 @pytest.mark.asyncio
-async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [DisconnectedError("dropped after the jam was reported"), TimeoutError()],
+)
+async def test_jam_inside_the_window_ends_the_attempt_ladder(
+    error: Exception,
+) -> None:
     """A retryable failure after a jam was reported does not re-send."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
@@ -4541,7 +4687,7 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
         attempts += 1
         write_success_callback()
         push_lock._update_any_state([LockStatus.JAMMED])
-        raise DisconnectedError("dropped after the jam was reported")
+        raise error
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
@@ -4549,7 +4695,7 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
-        pytest.raises(OperationIncompleteError),
+        pytest.raises(OperationIncompleteError) as raised,
     ):
         await push_lock.lock()
 
@@ -4557,6 +4703,33 @@ async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
     assert push_lock._seen_intervention_status is None
+    assert repr(error) in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_new_operation_writes_through_a_live_jam_hold() -> None:
+    """A command issued while a jam is on display reaches the lock and releases it."""
+    push_lock = _operational_push_lock()
+    push_lock._lock_state = _known_state(LockStatus.JAMMED)
+    push_lock._arm_jam_hold(time.monotonic())
+    attempts = 0
+
+    async def force_lock(write_success_callback):
+        nonlocal attempts
+        attempts += 1
+        write_success_callback()
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    assert attempts == 1
+    assert push_lock.lock_status == LockStatus.LOCKED
+    assert push_lock._jammed_hold_deadline == NEVER_TIME  # released at write-success
 
 
 # Lock-opcode ack and op-responses, and a LOCK_ONLY status push carrying a jam.
@@ -4680,32 +4853,6 @@ async def test_a_jam_with_no_operation_in_flight_is_not_recorded() -> None:
 
     assert push_lock.lock_status is LockStatus.JAMMED
     assert push_lock._seen_intervention_status is None
-
-
-@pytest.mark.asyncio
-async def test_a_new_operation_writes_through_a_live_jam_hold() -> None:
-    """A command issued while a jam is on display reaches the lock."""
-    push_lock = _operational_push_lock()
-    push_lock._lock_state = _known_state(LockStatus.JAMMED)
-    push_lock._arm_jam_hold(time.monotonic())
-    attempts = 0
-
-    async def force_lock(write_success_callback):
-        nonlocal attempts
-        attempts += 1
-        write_success_callback()
-
-    mock_lock = MagicMock()
-    mock_lock.force_lock = force_lock
-
-    with patch.object(
-        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
-    ):
-        await push_lock.lock()
-
-    assert attempts == 1
-    assert push_lock.lock_status == LockStatus.LOCKED
-    assert push_lock._jammed_hold_deadline == NEVER_TIME  # released at write-success
 
 
 @pytest.mark.asyncio
@@ -5419,6 +5566,57 @@ async def test_a_collapsed_schedule_still_waits_for_the_floor() -> None:
         <= LOCK_STALE_STATE_DEBOUNCE_DELAY
     )
     push_lock._cancel_future_update()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transitional",
+    [
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+    ],
+)
+async def test_a_transitional_the_lock_reports_holds_the_next_read_off(
+    transitional: LockStatus,
+) -> None:
+    """Each transitional the lock reports holds the next read off."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:62")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    assert push_lock._earliest_update_time == NEVER_TIME
+
+    push_lock._update_any_state([transitional])
+
+    assert push_lock.lock_status == transitional
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert (
+        LOCK_STALE_STATE_DEBOUNCE_DELAY - 0.5
+        < handle.when() - push_lock.loop.time()
+        <= LOCK_STALE_STATE_DEBOUNCE_DELAY
+    )
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_transitional_refused_by_the_hold_still_holds_the_next_read_off() -> (
+    None
+):
+    """A transitional refused by a jam hold still holds the next read off."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:63")
+    push_lock._lock_state = _known_state(LockStatus.JAMMED)
+    push_lock._arm_jam_hold(time.monotonic())
+    assert push_lock._earliest_update_time == NEVER_TIME
+    before = time.monotonic()
+
+    push_lock._update_any_state([LockStatus.UNLATCHING])
+
+    assert push_lock.lock_status == LockStatus.JAMMED
+    assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+    push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
 
 
 @pytest.mark.asyncio
@@ -6144,3 +6342,131 @@ async def test_battery_only_cycle_does_not_move_hold_deadline():
     assert push_lock._jammed_hold_deadline == deadline
     assert push_lock._lock_state is not None
     assert push_lock._lock_state.lock == LockStatus.JAMMED
+
+
+# ---------------------------------------------------------------------------
+# The stale-state floor and the moments that set it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_lock_instance_wires_the_op_response_observer():
+    """_get_lock_instance gives the Lock this PushLock's op-response observer."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:59")
+    push_lock._ble_device = MagicMock()
+
+    lock = push_lock._get_lock_instance()
+
+    assert lock._op_response_callback == push_lock._op_response_callback
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_reschedules_to_the_standing_floor():
+    """Within the hold the update reschedules to the floor, which only moves later."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:5a")
+    # A fake clock ahead of NEVER_TIME, which is a day behind the real one.
+    now = NEVER_TIME + 90000.0
+    with patch("yalexs_ble.push.time.monotonic", return_value=now - 4.0):
+        push_lock._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+    first_floor = push_lock._earliest_update_time
+    with patch("yalexs_ble.push.time.monotonic", return_value=now - 2.0):
+        push_lock._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+    standing_floor = push_lock._earliest_update_time
+    assert standing_floor > first_floor
+
+    with (
+        patch("yalexs_ble.push.time.monotonic", return_value=now),
+        patch.object(push_lock, "_schedule_future_update") as mock_reschedule,
+    ):
+        push_lock._hold_update(1.0)
+        assert push_lock._earliest_update_time == standing_floor
+        push_lock._deferred_update()
+
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(
+        LOCK_STALE_STATE_DEBOUNCE_DELAY - 2.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_op_response_alone_defers_poll():
+    """An op-response we issued no command for holds the next poll on its own."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:5b")
+    # A fake clock ahead of NEVER_TIME, so the unstamped floor is in the past.
+    now = NEVER_TIME + 90000.0
+
+    with patch("yalexs_ble.push.time.monotonic", return_value=now):
+        push_lock._op_response_callback()
+        with patch.object(push_lock, "_schedule_future_update") as mock_reschedule:
+            push_lock._deferred_update()
+
+    mock_reschedule.assert_called_once()
+    assert mock_reschedule.call_args.args[0] == pytest.approx(
+        LOCK_STALE_STATE_DEBOUNCE_DELAY
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_hold_proceeds_immediately():
+    """With the floor at NEVER_TIME the update starts without deferring."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:36")
+    assert push_lock._earliest_update_time == NEVER_TIME
+
+    push_lock._execute_deferred_update = AsyncMock()  # type: ignore[method-assign]
+
+    with patch.object(push_lock, "_schedule_future_update") as mock_reschedule:
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    mock_reschedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
+    """A cycle due mid-operation is re-armed, and the operation's exit replaces it."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    gate = asyncio.Event()
+
+    async def force_unlatch(write_success_callback: Callable[[], None]) -> None:
+        write_success_callback()  # opens the window, stamps UNLATCHING
+        # The command's own hold has already run out, mid-motion.
+        push_lock._earliest_update_time = time.monotonic() - 1.0
+        await gate.wait()  # the motor is still running
+        push_lock._op_response_callback()
+
+    mock_lock = _answering_lock(push_lock)
+    mock_lock.force_unlatch = force_unlatch
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        op = asyncio.create_task(push_lock.unlatch())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if push_lock._operation_window_open:
+                break
+        assert push_lock._operation_lock.locked()
+
+        # The keep-alive falls due mid-operation.
+        push_lock._deferred_update()
+        assert push_lock._update_task is None
+        handle = push_lock._cancel_deferred_update
+        assert handle is not None
+        assert handle.when() - push_lock.loop.time() == pytest.approx(
+            OPERATION_IN_PROGRESS_DEFER_SECONDS, abs=0.1
+        )
+
+        gate.set()
+        await op
+
+    assert push_lock.lock_status == LockStatus.UNLATCHED
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert (
+        KEEP_ALIVE_TIME - 1 < handle.when() - push_lock.loop.time() <= KEEP_ALIVE_TIME
+    )
+    mock_lock.lock_status.assert_not_awaited()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
