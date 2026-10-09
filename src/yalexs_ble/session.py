@@ -39,6 +39,10 @@ ACK_TIMEOUT = 8.0
 # Whole-operation budget, command write to op-response.
 OPERATION_RESPONSE_TIMEOUT = 12.0
 
+# The unlatch's op-response budget; the dwell after the latch pull is not
+# part of it.
+UNLATCH_OPERATION_RESPONSE_TIMEOUT = 12.0
+
 
 class YaleXSBLEError(Exception):
     """Base class for YaleXSBLE errors."""
@@ -76,6 +80,14 @@ class BluetoothError(YaleXSBLEError):
 
 class OperationIncompleteError(YaleXSBLEError):
     """The operation ended without its op-response and was not retried."""
+
+
+class UnlatchError(YaleXSBLEError):
+    """An unlatch failed once its write was attempted; not retryable.
+
+    The command may have reached the lock, and a repeated unlatch opens the
+    door again.
+    """
 
 
 @dataclass
@@ -435,10 +447,14 @@ class Session:
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bytes], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
-        """Write a mechanical command, then wait for its acknowledgment
-        (ACK_TIMEOUT) and op-response (response_timeout), both timed from the
-        write.
+        """Write a mechanical command, then wait for its acknowledgment and
+        op-response, both timed from the write.
+
+        ACK_TIMEOUT bounds the write and the acknowledgment, response_timeout
+        the op-response. With wait_for_ack False the acknowledgment wait is
+        skipped; the write keeps its ACK_TIMEOUT bound either way.
         """
         if not self.client.is_connected:
             raise BleakError("disconnected")
@@ -478,32 +494,40 @@ class Session:
                         self.name,
                         command_name,
                     )
-            _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
-            ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
-            done, _ = await asyncio.wait(
-                (ack_future, result_future),
-                timeout=max(ack_remaining, 0),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if result_future in done:
-                # The op-response supersedes the acknowledgment; a stale
-                # same-opcode op-response can land here (_completed logs it).
-                return self._completed(result_future.result(), progress, command_name)
-            if ack_future not in done:
-                raise TimeoutError(
-                    f"{self.name}: No acknowledgment to {command_name} within "
-                    f"{ACK_TIMEOUT}s of the command being issued"
+            if wait_for_ack:
+                _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
+                ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
+                done, _ = await asyncio.wait(
+                    (ack_future, result_future),
+                    timeout=max(ack_remaining, 0),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if result_future in done:
+                    # The op-response supersedes the acknowledgment; a stale
+                    # same-opcode op-response can land here (_completed logs it).
+                    return self._completed(
+                        result_future.result(), progress, command_name
+                    )
+                if ack_future not in done:
+                    raise TimeoutError(
+                        f"{self.name}: No acknowledgment to {command_name} "
+                        f"within {ACK_TIMEOUT}s of the command being issued"
+                    )
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
             result_remaining = response_timeout - (monotonic() - attempt_start)
             # asyncio.wait never cancels the future, so a same-turn arrival
             # still reads as done.
             await asyncio.wait((result_future,), timeout=max(result_remaining, 0))
             if not result_future.done():
+                never_acknowledged = (
+                    ""
+                    if progress.acknowledged
+                    else "; the command was never acknowledged"
+                )
                 raise OperationIncompleteError(
-                    f"{self.name}: {command_name} was acknowledged but no "
-                    f"op-response arrived within {response_timeout}s of the "
-                    "command being issued"
+                    f"{self.name}: No op-response to {command_name} arrived "
+                    f"within {response_timeout}s of the command being issued"
+                    f"{never_acknowledged}"
                 )
             result = result_future.result()
         finally:
@@ -641,16 +665,16 @@ class Session:
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bytes], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
-        """Run a mechanical operation with the staged wait.
+        """Run a mechanical operation with the staged wait and return its op-response.
 
-        A failure after the acknowledgment raises OperationIncompleteError; one
-        before it is raised as execute() would, for the caller to retry.
-        response_timeout must exceed ACK_TIMEOUT.
-
-        write_success_callback runs when the write succeeds; result_callback
-        runs with the op-response as that frame is handled, before the wait
-        resolves.
+        An op-response recorded before a failure is returned; a failure after the
+        acknowledgment, or an op-response wait that runs to response_timeout,
+        raises OperationIncompleteError; any other failure is raised as execute()
+        would, for the caller to retry. response_timeout must exceed ACK_TIMEOUT.
+        result_callback runs with the op-response as that frame is handled,
+        before the wait resolves.
         """
         if progress.write_attempted or progress.acknowledged or progress.result:
             # A reused record would report a previous attempt's frames as this one's.
@@ -668,6 +692,7 @@ class Session:
                     progress,
                     write_success_callback,
                     result_callback,
+                    wait_for_ack,
                 )
         except OperationIncompleteError:
             raise

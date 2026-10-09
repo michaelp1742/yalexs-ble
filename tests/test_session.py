@@ -25,6 +25,7 @@ from yalexs_ble.session import (
     COOLDOWN_TIME,
     OPERATION_RESPONSE_TIMEOUT,
     RESPONSE_FRAME_LEN,
+    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
     KeycodeError,
@@ -32,6 +33,7 @@ from yalexs_ble.session import (
     OperationProgress,
     ResponseError,
     Session,
+    UnlatchError,
 )
 
 # Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
@@ -678,7 +680,10 @@ def _make_operation_session(
 
 # securemode = LOCK opcode (0x0B) with operation byte 0x04.
 _ACK_SECUREMODE = "aa0b00000400000000000000000000000200"
+# unlatch = UNLOCK opcode (0x0A) with operation byte 0x0A.
+_ACK_UNLATCH = "aa0a00000a00000000000000000000000200"
 _OP_RESPONSE_OK = "bb0b00000000000000000000000000000200"
+_OP_RESPONSE_UNLOCK_OK = "bb0a00000000000000000000000000000200"
 _OP_RESPONSE_FAILED = "bb0b000000000000000000000000001f0200"
 _SETTLED_STATUS = "bb0200000200000000000000000000000200"
 _FOREIGN_ACK = "aa0b00000000000000000000000000000200"
@@ -1222,6 +1227,37 @@ async def test_execute_operation_ack_timeout(
     assert progress.acknowledged is False
 
 
+@pytest.mark.asyncio
+async def test_the_no_ack_wait_completes_on_the_op_response_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wait_for_ack=False waits for the op-response alone, for the whole budget."""
+    session, _ = _make_operation_session()
+    op_response = _with_checksum(_OP_RESPONSE_UNLOCK_OK)
+    # A pinned clock makes the recorded op-response wait the whole budget.
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: 1000.0)
+    stage_waits = _spy_stage_waits(monkeypatch)
+
+    async def feed() -> None:
+        await _spin_until(lambda: len(stage_waits) == 1)
+        session._notify(0, bytearray(op_response))
+
+    feeder = asyncio.create_task(feed())
+    result = await session.execute_operation(
+        session.build_operation_command(Commands.UNLOCK, 0x0A),
+        "force_unlatch",
+        ack_matcher=_ack_matcher(0x0A, 0x0A),
+        response_matcher=_operation_response_matcher(0x0A),
+        response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+        progress=OperationProgress(),
+        wait_for_ack=False,
+    )
+    await feeder
+
+    assert result == bytes(op_response)
+    assert stage_waits == [pytest.approx(UNLATCH_OPERATION_RESPONSE_TIMEOUT)]
+
+
 def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
     """Stage 1 must outlast a dead link, so a dead link reads as a disconnect.
 
@@ -1233,49 +1269,78 @@ def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
     assert ACK_TIMEOUT > SLOW_TIMEOUT / 100
 
 
-def test_operation_response_timeout_outlasts_the_acknowledgment_budget() -> None:
-    """Stage 2's budget must exceed stage 1's.
+@pytest.mark.parametrize(
+    "budget",
+    [OPERATION_RESPONSE_TIMEOUT, UNLATCH_OPERATION_RESPONSE_TIMEOUT],
+    ids=["plain", "unlatch"],
+)
+def test_operation_response_timeout_outlasts_the_acknowledgment_budget(
+    budget: float,
+) -> None:
+    """Every op-response budget must exceed the acknowledgment budget.
 
     Both stage deadlines run from the command issue, so everything the
     acknowledgment stage consumes comes out of the op-response budget; a
     budget at or below ACK_TIMEOUT could reach stage 2 with nothing left and
-    fail the operation the moment the acknowledgment lands. The relationship
-    is the invariant; the value itself is sized off the observed op-response
-    arrival distribution and moves with it.
+    fail the operation the moment the acknowledgment lands. ACK_TIMEOUT still
+    bounds the unlatch's GATT write, so the same floor holds there.
     """
-    assert OPERATION_RESPONSE_TIMEOUT > ACK_TIMEOUT
+    assert budget > ACK_TIMEOUT
 
 
-def test_operation_incomplete_error_passes_the_retry_decorator() -> None:
-    """OperationIncompleteError is outside the retry set, so it ends the attempts."""
-    assert not issubclass(OperationIncompleteError, RETRYABLE_EXCEPTIONS)
+@pytest.mark.parametrize(
+    "error_type",
+    [OperationIncompleteError, UnlatchError],
+    ids=["incomplete", "unlatch"],
+)
+def test_non_retryable_errors_pass_the_retry_decorator(
+    error_type: type[Exception],
+) -> None:
+    """Both types are outside the retry set, so they end the attempts."""
+    assert not issubclass(error_type, RETRYABLE_EXCEPTIONS)
 
 
 @pytest.mark.asyncio
-async def test_execute_operation_op_response_timeout() -> None:
-    """Acknowledged but no op-response raises the non-retryable error."""
+@pytest.mark.parametrize(
+    ("wait_for_ack", "ack_delivered"),
+    [(True, True), (False, True), (False, False)],
+    ids=["acknowledged", "unlatch-acknowledged", "unlatch-never-acknowledged"],
+)
+async def test_execute_operation_op_response_timeout(
+    wait_for_ack: bool, ack_delivered: bool
+) -> None:
+    """No op-response raises the non-retryable error; a missing ack is named in it."""
     session, client = _make_operation_session()
     progress = OperationProgress()
-    command = session.build_operation_command(Commands.LOCK, 0x04)
-    ack = _with_checksum(_ACK_SECUREMODE)
+    if wait_for_ack:
+        command = session.build_operation_command(Commands.LOCK, 0x04)
+        command_name, opcode, operation_byte = "force_securemode", 0x0B, 0x04
+        ack = _with_checksum(_ACK_SECUREMODE)
+    else:
+        command = session.build_operation_command(Commands.UNLOCK, 0x0A)
+        command_name, opcode, operation_byte = "force_unlatch", 0x0A, 0x0A
+        ack = _with_checksum(_ACK_UNLATCH)
 
     async def feed() -> None:
         await _spin_until_written(client)
-        session._notify(0, bytearray(ack))
+        if ack_delivered:
+            session._notify(0, bytearray(ack))
 
     feeder = asyncio.create_task(feed())
-    with pytest.raises(OperationIncompleteError):
+    with pytest.raises(OperationIncompleteError) as exc_info:
         await session.execute_operation(
             command,
-            "force_securemode",
-            ack_matcher=_ack_matcher(0x0B, 0x04),
-            response_matcher=_operation_response_matcher(0x0B),
+            command_name,
+            ack_matcher=_ack_matcher(opcode, operation_byte),
+            response_matcher=_operation_response_matcher(opcode),
             response_timeout=0.1,
             progress=progress,
+            wait_for_ack=wait_for_ack,
         )
     await feeder
 
-    assert progress.acknowledged is True
+    assert progress.acknowledged is ack_delivered
+    assert ("never acknowledged" in str(exc_info.value)) is not ack_delivered
 
 
 def _spy_stage_waits(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
@@ -1577,6 +1642,40 @@ async def test_op_response_and_disconnect_in_one_turn_returns_the_result() -> No
 
     assert result == bytes(op_response)
     assert progress.result == bytes(op_response)
+
+
+@pytest.mark.asyncio
+async def test_a_result_recovered_at_a_disconnect_still_logs_a_missing_acknowledgment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The disconnect-race return is a completion, so it logs like the others."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.UNLOCK, 0x0A)
+    op_response = _with_checksum(_OP_RESPONSE_UNLOCK_OK)
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        # Both land in one turn, the drop first, with no acknowledgment.
+        _fire_disconnect(session)
+        session._notify(0, bytearray(op_response))
+
+    feeder = asyncio.create_task(feed())
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        result = await session.execute_operation(
+            command,
+            "force_unlatch",
+            ack_matcher=_ack_matcher(0x0A, 0x0A),
+            response_matcher=_operation_response_matcher(0x0A),
+            response_timeout=5.0,
+            progress=progress,
+            wait_for_ack=False,
+        )
+    await feeder
+
+    assert result == bytes(op_response)
+    assert progress.acknowledged is False
+    assert "completed on its op-response; no acknowledgment was received" in caplog.text
 
 
 @pytest.mark.asyncio
