@@ -289,11 +289,12 @@ class Session:
             self._state_callback(decrypted_data)
         if (
             (progress := self._operation_progress) is not None
+            and (ack_future := self._ack_future) is not None
             and self._ack_matcher is not None
             and self._ack_matcher(decrypted_data)
         ):
-            if (ack_future := self._disarm_ack()) is not None:
-                ack_future.set_result(decrypted_data)
+            self._disarm_ack()
+            ack_future.set_result(decrypted_data)
             # Recorded on arrival; a disconnect may cancel the wait first.
             progress.acknowledged = True
             return
