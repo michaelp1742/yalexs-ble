@@ -82,6 +82,21 @@ class OperationIncompleteError(YaleXSBLEError):
     """The lock took the command but its op-response never arrived; not retryable."""
 
 
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed; not retryable.
+
+    Re-driving a failed mechanism is not a recovery.
+    """
+
+    def __init__(self, message: str, result: int) -> None:
+        super().__init__(message)
+        self.result = result
+
+    def __reduce__(self) -> tuple[type[OperationFailedError], tuple[str, int]]:
+        # self.args holds only the message, so the default rebuild would fail.
+        return (self.__class__, (str(self), self.result))
+
+
 class UnlatchError(YaleXSBLEError):
     """An unlatch failed after its write; a re-send could open the door again."""
 
