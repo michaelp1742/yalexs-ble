@@ -65,7 +65,11 @@ class OperationIncompleteError(YaleXSBLEError):
 
 @dataclass
 class OperationProgress:
-    """How far a mechanical operation got. Recorded on frame arrival; never reset."""
+    """How far a mechanical operation got.
+
+    Recorded on frame arrival and never reset, so pass a fresh instance per
+    operation.
+    """
 
     write_attempted: bool = False
     acknowledged: bool = False
@@ -610,6 +614,11 @@ class Session:
         before it is raised as execute() would, for the caller to retry.
         response_timeout must exceed ACK_TIMEOUT.
         """
+        if progress.write_attempted or progress.acknowledged or progress.result:
+            # A reused record would report a previous attempt's frames as this one's.
+            raise ValueError(
+                f"{self.name}: {command_name} needs a fresh OperationProgress"
+            )
         try:
             async with self._command_scope(command), self._lock:
                 return await self._locked_write_operation(

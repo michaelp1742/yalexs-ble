@@ -1112,13 +1112,7 @@ def test_operation_response_timeout_outlasts_the_acknowledgment_budget() -> None
 
 
 def test_operation_incomplete_error_passes_the_retry_decorator() -> None:
-    """The type's whole purpose is to end the attempt ladder.
-
-    Its docstring says it is deliberately outside the bleak retry set, and
-    the consequence of losing that is a mechanical command re-sent after its
-    result went missing. Reparenting it under ResponseError would do exactly
-    that and leaves every other test in this file green.
-    """
+    """OperationIncompleteError is outside the retry set, so it ends the attempts."""
     assert not issubclass(OperationIncompleteError, RETRYABLE_EXCEPTIONS)
 
 
@@ -1569,6 +1563,34 @@ async def test_execute_operation_key_error_on_write_raises_auth_error() -> None:
             response_timeout=5.0,
             progress=OperationProgress(),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "used",
+    [
+        OperationProgress(write_attempted=True),
+        OperationProgress(acknowledged=True),
+        OperationProgress(result=b"\xbb"),
+    ],
+)
+async def test_execute_operation_rejects_a_used_progress_record(
+    used: OperationProgress,
+) -> None:
+    """A record from a previous attempt is refused before anything is written."""
+    session, client = _make_operation_session()
+    command = session.build_operation_command(Commands.LOCK, 0x04)
+
+    with pytest.raises(ValueError, match="fresh OperationProgress"):
+        await session.execute_operation(
+            command,
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=used,
+        )
+    client.write_gatt_char.assert_not_awaited()
 
 
 @pytest.mark.asyncio
