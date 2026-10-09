@@ -169,6 +169,36 @@ def _poll_response_matcher(
     return matches
 
 
+def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
+    """Match the acknowledgment (0xAA + opcode + operation byte) of a command.
+
+    The operation byte tells a securemode acknowledgment from a plain lock's.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return (
+            len(data) > 0x04
+            and data[0x00] == 0xAA
+            and data[0x01] == opcode
+            and data[0x04] == operation_byte
+        )
+
+    return _matches
+
+
+def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match the op-response (0xBB + opcode) sent when the motor stops.
+
+    The operation byte is 0x00 for every variant, so it is not matched. The
+    floor admits only a frame carrying the result byte at 0x0F.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x0F and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
+
+
 class Lock:
     def __init__(
         self,
