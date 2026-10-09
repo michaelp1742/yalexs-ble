@@ -927,6 +927,10 @@ async def test_lock_info_reads_model_first() -> None:
 BATTERY_FRAME = bytes.fromhex("bb0200a50f00000079140000000000000200")
 LOCK_FRAME = bytes.fromhex("bb02003c0200000003000000000000000200")
 DOOR_FRAME = bytes.fromhex("bb0200122e00000001000000000000000200")
+# Field-captured 0xAA acknowledgments; byte[4] echoes the operation byte.
+LOCK_ACK = bytes.fromhex("aa0b00490000000000000000000000000200")
+UNLOCK_ACK = bytes.fromhex("aa0a004a0000000000000000000000000200")
+SECUREMODE_ACK = bytes.fromhex("aa0b00450400000000000000000000000200")
 
 
 def _with_checksum(hex_str: str) -> bytes:
@@ -1433,12 +1437,9 @@ def test_ack_matcher_matches_only_the_written_operation() -> None:
     """The ack matcher keys on 0xAA + the written opcode + operation byte."""
     matches = _ack_matcher(0x0B, 0x04)
 
-    # Correct ack: 0xAA, opcode 0x0B, operation byte 0x04.
-    assert matches(bytes.fromhex("aa0b00450400000000000000000000000200"))
-    # Same opcode but operation byte 0x00, a plain-lock ack, not securemode.
-    assert not matches(bytes.fromhex("aa0b00490000000000000000000000000200"))
-    # Wrong opcode (0x0A).
-    assert not matches(bytes.fromhex("aa0a004a0000000000000000000000000200"))
+    assert matches(SECUREMODE_ACK)
+    assert not matches(LOCK_ACK)  # same opcode, plain-lock operation byte
+    assert not matches(UNLOCK_ACK)
     # An op-response (0xBB), not an acknowledgment.
     assert not matches(bytes.fromhex("bb0b00450400000000000000000000000200"))
 
@@ -1469,14 +1470,7 @@ async def _spin_until(predicate: Callable[[], bool]) -> None:
 def _make_connected_lock_with_session(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
 ) -> Lock:
-    """Build a connected Lock backed by a real Session over a mock BLE client.
-
-    Mirrors tests/test_session.py: only cipher_encrypt is set, so notify frames
-    pass through Session.decrypt unchanged and can be fed verbatim. The
-    encryptor is a real one and the session encrypts the command buffer in
-    place, so an operation driven through here completes only if its matchers
-    read their expected bytes out of that buffer before the encryption.
-    """
+    """Connected Lock over a real Session: pass-through decrypt, real encryptor."""
     lock = _make_lock(state_callback)
     client = MagicMock()
     client.is_connected = True
@@ -1500,10 +1494,7 @@ def _make_connected_lock_with_session(
 
 
 def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -> bytes:
-    """A 0xBB op-response carrying the operation result in byte[15].
-
-    Built to the layout the matchers key on.
-    """
+    """A 0xBB op-response carrying the operation result in byte[15]."""
     frame = bytearray(0x12)
     frame[0x00] = 0xBB
     frame[0x01] = opcode
@@ -1511,22 +1502,34 @@ def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -
     return _with_checksum(frame.hex())
 
 
-async def _drive_operation(lock: Lock, op_attr: str, opcode: int, ack: bytes) -> None:
+async def _drive_operation(
+    lock: Lock,
+    op_attr: str,
+    opcode: int,
+    ack: bytes,
+    before_ack: bytes | None = None,
+    before_response: bytes | None = None,
+) -> None:
     """Run a force_* method, feeding its ack then op-response through notify.
 
-    The acknowledgement has to be matched before the op-response is fed. A
-    command carrying the wrong operation byte, or a matcher that never
-    matches, would otherwise still complete on the op-response alone and the
-    operation would look correct.
+    A frame fed before the ack must leave the ack stage armed; one fed before
+    the op-response must leave the result wait armed.
     """
     session = lock.session
     assert session is not None
 
     async def feed() -> None:
         await _spin_until(lambda: session._ack_future is not None)
+        if before_ack is not None:
+            session._notify(0, bytearray(before_ack))
+            assert session._ack_future is not None, "taken for the acknowledgment"
+            await asyncio.sleep(0)
         session._notify(0, bytearray(ack))
         assert session._ack_future is None, "the acknowledgement was not matched"
         await asyncio.sleep(0)
+        if before_response is not None:
+            session._notify(0, bytearray(before_response))
+            assert session._notify_future is not None, "taken for the op-response"
         session._notify(0, bytearray(_op_response_frame(opcode)))
 
     feeder = asyncio.create_task(feed())
@@ -1537,22 +1540,12 @@ async def _drive_operation(lock: Lock, op_attr: str, opcode: int, ack: bytes) ->
 def test_parse_operation_ack_reports_no_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Operation acks (0xAA LOCK/UNLOCK) are recognized but carry no state.
-
-    They carry the command's opcode with no result, so a securemode request
-    (acknowledged on the 0x0B Lock opcode) used to display a false LOCKED.
-    State now comes from the op-response; the ack is recognized (empty
-    iterable), emits nothing, and must not surface as an unknown frame.
-    """
+    """Operation acks (0xAA LOCK/UNLOCK) are recognized but carry no state."""
     states: list[list[LockStateValue]] = []
     lock = _make_lock(lambda s: states.append(list(s)))
 
     with caplog.at_level("INFO", logger="yalexs_ble.lock"):
-        for frame_hex in (
-            "aa0b00490000000000000000000000000200",
-            "aa0a004a0000000000000000000000000200",
-        ):
-            frame = bytes.fromhex(frame_hex)
+        for frame in (LOCK_ACK, UNLOCK_ACK):
             result = lock._parse_state(frame)
             assert result is not None
             assert list(result) == []
@@ -1564,159 +1557,82 @@ def test_parse_operation_ack_reports_no_state(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("op_attr", "opcode", "ack_hex"),
+    ("op_attr", "opcode", "ack"),
     [
-        ("force_lock", Commands.LOCK, "aa0b00490000000000000000000000000200"),
-        ("force_unlock", Commands.UNLOCK, "aa0a004a0000000000000000000000000200"),
-        (
-            "force_securemode",
-            Commands.LOCK,
-            "aa0b00450400000000000000000000000200",
-        ),
+        ("force_lock", Commands.LOCK, LOCK_ACK),
+        ("force_unlock", Commands.UNLOCK, UNLOCK_ACK),
+        ("force_securemode", Commands.LOCK, SECUREMODE_ACK),
     ],
     ids=["lock", "unlock", "securemode"],
 )
 async def test_force_operations_complete_on_ack_then_op_response(
-    op_attr: str, opcode: int, ack_hex: str
+    op_attr: str, opcode: int, ack: bytes
 ) -> None:
-    """Each force_* completes only on its own ack, then its 0xBB op-response.
-
-    Drives _execute_operation_command end to end through the real staged
-    session wait, on field-captured acknowledgements. Their byte[4] is the
-    operation byte the command must have carried, so the acknowledgement only
-    matches if the right command went out.
-    """
+    """Each force_* completes only on its own ack, then its 0xBB op-response."""
     lock = _make_connected_lock_with_session()
+    await _drive_operation(lock, op_attr, opcode, ack)
 
-    await _drive_operation(lock, op_attr, opcode, bytes.fromhex(ack_hex))
+
+@pytest.mark.asyncio
+async def test_force_operation_returns_the_reported_result() -> None:
+    """The result byte of the op-response is returned to the caller."""
+    lock = _make_connected_lock_with_session()
+    session = lock.session
+    assert session is not None
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(0, bytearray(LOCK_ACK))
+        await asyncio.sleep(0)
+        frame = _op_response_frame(Commands.LOCK, OperationError.MECH_POSITION)
+        session._notify(0, bytearray(frame))
+
+    feeder = asyncio.create_task(feed())
+    assert await lock.force_lock() == OperationError.MECH_POSITION
+    await feeder
 
 
 @pytest.mark.asyncio
 async def test_an_op_response_for_another_opcode_does_not_complete_the_wait() -> None:
-    """The staged wait completes only on the op-response matching its opcode.
-
-    While a force_lock is in flight, an unsolicited op-response carrying the
-    Unlock opcode lands first, the failure report the lock sends for an
-    operation nothing of ours started. It must leave the wait armed; only the
-    op-response carrying the Lock opcode completes the operation, so the result
-    is read from the right frame.
-    """
+    """Only the op-response carrying the sent opcode completes the wait."""
     lock = _make_connected_lock_with_session()
-    session = lock.session
-    assert session is not None
-
-    async def feed() -> None:
-        await _spin_until(lambda: session._ack_future is not None)
-        session._notify(
-            0, bytearray(bytes.fromhex("aa0b00490000000000000000000000000200"))
-        )
-        assert session._ack_future is None, "the acknowledgment was not matched"
-        await asyncio.sleep(0)
-        session._notify(
-            0,
-            bytearray(
-                _op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION)
-            ),
-        )
-        assert session._notify_future is not None, (
-            "an op-response for another opcode completed the wait"
-        )
-        session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
-
-    feeder = asyncio.create_task(feed())
-    await lock.force_lock()
-    await feeder
+    foreign = _op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION)
+    await _drive_operation(
+        lock, "force_lock", Commands.LOCK, LOCK_ACK, before_response=foreign
+    )
 
 
 @pytest.mark.asyncio
 async def test_a_door_push_does_not_answer_the_acknowledgment_stage() -> None:
-    """A door push landing mid-operation leaves the acknowledgment stage armed.
-
-    A door push can land between the command and the op-response, so it is a
-    frame the acknowledgment matcher has to tell from an acknowledgment. It
-    reaches the state callback like any other frame, which is what shows the
-    stage stayed armed on an admitted frame rather than on a rejected one.
-    Crediting a delivery that never happened costs the caller its retry: a
-    link lost afterwards reports the result unknown instead of retryable.
-    """
+    """A door push mid-operation leaves the acknowledgment stage armed."""
     states: list[list[LockStateValue]] = []
     lock = _make_connected_lock_with_session(lambda s: states.append(list(s)))
-    session = lock.session
-    assert session is not None
-
-    async def feed() -> None:
-        await _spin_until(lambda: session._ack_future is not None)
-        session._notify(0, bytearray(DOOR_FRAME))
-        still_armed = session._ack_future is not None
-        assert still_armed, "a door push was taken for the acknowledgment"
-        await asyncio.sleep(0)
-        session._notify(
-            0, bytearray(bytes.fromhex("aa0b00490000000000000000000000000200"))
-        )
-        assert session._ack_future is None, "the acknowledgment was not matched"
-        await asyncio.sleep(0)
-        session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
-
-    feeder = asyncio.create_task(feed())
-    await lock.force_lock()
-    await feeder
-
+    await _drive_operation(
+        lock, "force_lock", Commands.LOCK, LOCK_ACK, before_ack=DOOR_FRAME
+    )
     assert states == [[DoorStatus.CLOSED]]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("wrapper", "force_attr"),
+    ("wrapper", "force_attr", "target_status"),
     [
-        ("securemode", "force_securemode"),
-        ("lock", "force_lock"),
-        ("unlock", "force_unlock"),
+        ("securemode", "force_securemode", LockStatus.SECUREMODE),
+        ("lock", "force_lock", LockStatus.LOCKED),
+        ("unlock", "force_unlock", LockStatus.UNLOCKED),
     ],
     ids=["securemode", "lock", "unlock"],
 )
+@pytest.mark.parametrize("in_target_state", [False, True])
 async def test_convenience_wrappers_run_the_operation_outside_the_target_state(
-    wrapper: str, force_attr: str
+    wrapper: str, force_attr: str, target_status: LockStatus, in_target_state: bool
 ) -> None:
-    """A wrapper finding the lock outside its target state runs the operation.
-
-    The wrappers are the exported convenience surface, and delegation is
-    their whole contract.
-    """
+    """A wrapper runs its force_* unless the lock is already in the target state."""
     lock = _make_lock()
-
+    current = target_status if in_target_state else LockStatus.UNKNOWN
     with (
-        patch.object(lock, "lock_status", AsyncMock(return_value=LockStatus.UNKNOWN)),
+        patch.object(lock, "lock_status", AsyncMock(return_value=current)),
         patch.object(lock, force_attr, AsyncMock()) as mock_force,
     ):
         await getattr(lock, wrapper)()
-
-    mock_force.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("wrapper", "target_status", "force_attr"),
-    [
-        ("securemode", LockStatus.SECUREMODE, "force_securemode"),
-        ("lock", LockStatus.LOCKED, "force_lock"),
-        ("unlock", LockStatus.UNLOCKED, "force_unlock"),
-    ],
-    ids=["securemode", "lock", "unlock"],
-)
-async def test_convenience_wrappers_skip_the_operation_in_the_target_state(
-    wrapper: str, target_status: LockStatus, force_attr: str
-) -> None:
-    """A wrapper finding the lock already in its target state issues nothing.
-
-    No operation is issued, so nothing could have failed and the caller's
-    goal state holds.
-    """
-    lock = _make_lock()
-
-    with (
-        patch.object(lock, "lock_status", AsyncMock(return_value=target_status)),
-        patch.object(lock, force_attr, AsyncMock()) as mock_force,
-    ):
-        await getattr(lock, wrapper)()
-
-    mock_force.assert_not_awaited()
+    assert mock_force.await_count == (0 if in_target_state else 1)
