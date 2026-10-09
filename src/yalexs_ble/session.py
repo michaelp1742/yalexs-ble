@@ -78,6 +78,13 @@ class OperationIncompleteError(YaleXSBLEError):
     """The operation ended without its op-response and was not retried."""
 
 
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed; not retryable.
+
+    Re-driving a failed mechanism is not a recovery.
+    """
+
+
 @dataclass
 class OperationProgress:
     """How far a mechanical operation got.

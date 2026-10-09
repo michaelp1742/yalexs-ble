@@ -47,6 +47,7 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     YaleXSBLEError,
@@ -887,22 +888,23 @@ class PushLock:
             return self._client
 
     async def securemode(self) -> None:
-        """Set the lock into securemode."""
+        """Set securemode; raises OperationFailedError on a reported failure."""
         await self._run_lock_operation(_SECUREMODE_OPERATION)
 
     async def lock(self) -> None:
-        """Lock the lock."""
+        """Lock the lock; raises OperationFailedError on a reported failure."""
         await self._run_lock_operation(_LOCK_OPERATION)
 
     async def unlock(self) -> None:
-        """Unlock the lock."""
+        """Unlock the lock; raises OperationFailedError on a reported failure."""
         await self._run_lock_operation(_UNLOCK_OPERATION)
 
     async def unlatch(self) -> None:
         """Unlatch (momentarily open) the lock.
 
         Completes as UNLATCHED; the state the lock settles to after the dwell
-        arrives as a later status update.
+        arrives as a later status update. Raises OperationFailedError on a
+        reported failure.
         """
         await self._run_lock_operation(_UNLATCH_OPERATION)
 
@@ -1076,6 +1078,12 @@ class PushLock:
                 ),
                 result_callback=functools.partial(self._operation_result, operation),
             )
+        except OperationFailedError:
+            # The failure op-response has already put JAMMED on the display.
+            _LOGGER.debug("%s: %s reported failure", self.name, op_attr)
+            # The lock answered, so the exit moves the timers as a success does.
+            self._complete_operation(time.monotonic())
+            raise
         except Exception as ex:
             self._operation_failure = ex
             # Closed so a status the lock reports before the retry is admitted.

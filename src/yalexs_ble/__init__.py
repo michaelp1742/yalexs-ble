@@ -20,6 +20,7 @@ from .session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    OperationFailedError,
     OperationIncompleteError,
     YaleXSBLEError,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "LockOperationSource",
     "LockState",
     "LockStatus",
+    "OperationFailedError",
     "OperationIncompleteError",
     "PushLock",
     "ValidatedLockConfig",
