@@ -147,6 +147,15 @@ POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
     LockStatus.SECUREMODE,
 }
 
+# Statuses the lock reports while the motor runs.
+TRANSITIONAL_READINGS = frozenset(
+    {
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+    }
+)
+
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
 RETRY_EXCEPTIONS = (ResponseError, *BLEAK_RETRY_EXCEPTIONS)
@@ -691,6 +700,7 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            op_response_callback=self._hold_update,
         )
 
     def _disconnected_callback(self) -> None:
@@ -1018,7 +1028,7 @@ class PushLock:
         self._close_operation_window()
         # Set before the stop check so a restarted watcher inherits them.
         self._force_lock_status_poll = True
-        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        self._hold_update()
         if not self._running:
             # Stopped mid-operation: a cycle armed now would outlive the stop.
             # A restarted watcher polls the lock afresh, so a report from before
@@ -1090,8 +1100,12 @@ class PushLock:
     def _admit_lock_status(self, incoming: LockStatus) -> LockStatus | None:
         """Decide the displayed lock status for a value the lock reported.
 
-        None refuses the value, so nothing from it is applied.
+        None refuses the value, so nothing from it is applied; a transitional
+        value holds the next poll off before any of that.
         """
+        if incoming in TRANSITIONAL_READINGS:
+            # A lock polled mid-motion answers with the position it is leaving.
+            self._hold_update()
         if incoming in MANUAL_INTERVENTION_STATUSES:
             now = time.monotonic()
             self._last_jam_event_time = now
@@ -2039,6 +2053,10 @@ class PushLock:
             ) from ex
         finally:
             self._first_update_future = None
+
+    def _hold_update(self) -> None:
+        """Hold update cycles off for the stale-state debounce from now."""
+        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""

@@ -437,6 +437,8 @@ def test_jammed_maps_to_the_settled_static_position_value() -> None:
 
 def _make_lock(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
+    *,
+    op_response_callback: Callable[[], None] | None = None,
 ) -> Lock:
     return Lock(
         lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
@@ -444,6 +446,7 @@ def _make_lock(
         1,
         "mylock",
         state_callback,
+        op_response_callback=op_response_callback,
     )
 
 
@@ -1553,9 +1556,14 @@ async def _spin_until(predicate: Callable[[], bool]) -> None:
 
 def _make_connected_lock_with_session(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
+    *,
+    op_response_callback: Callable[[], None] | None = None,
 ) -> Lock:
     """Connected Lock over a real Session: pass-through decrypt, real encryptor."""
-    lock = _make_lock(state_callback)
+    lock = _make_lock(
+        state_callback,
+        op_response_callback=op_response_callback,
+    )
     client = MagicMock()
     client.is_connected = True
     client.write_gatt_char = AsyncMock()
@@ -1880,3 +1888,39 @@ async def test_a_failure_after_an_op_response_during_the_write_logs_at_warning(
     with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
         await lock.force_lock(write_success_callback=_on_write_success)
     assert _failure_log_levels(caplog) == ["WARNING"]
+
+
+def test_op_response_callback_fires_on_op_responses_not_acks() -> None:
+    """op_response_callback fires for success and failure op-responses, not acks."""
+    op_calls: list[int] = []
+    lock = _make_lock(op_response_callback=lambda: op_calls.append(1))
+
+    lock._parse_state(LOCK_ACK)
+    lock._parse_state(UNLOCK_ACK)
+
+    assert op_calls == []
+
+    lock._parse_state(_op_response_frame(Commands.UNLOCK))
+    lock._parse_state(_op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION))
+
+    assert op_calls == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_op_response_callback_does_not_abort_the_operation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hook that raises is logged and the operation still completes."""
+    calls: list[str] = []
+
+    def _boom() -> None:
+        calls.append("op_response_callback")
+        raise RuntimeError("hook bug")
+
+    lock = _make_connected_lock_with_session(op_response_callback=_boom)
+    with caplog.at_level("ERROR", logger="yalexs_ble.lock"):
+        await _drive_operation(lock, "force_lock", Commands.LOCK, LOCK_ACK)
+
+    assert calls == ["op_response_callback"]
+    assert "op_response_callback raised, continuing to parse the frame" in caplog.text
+    assert "hook bug" in caplog.text

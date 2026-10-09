@@ -4690,6 +4690,7 @@ async def test_a_retryable_failure_under_precedence_ends_the_attempts(
     assert attempts == 1
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
+    assert repr(error) in str(excinfo.value)
 
 
 @pytest.mark.asyncio
@@ -6729,6 +6730,62 @@ async def test_a_collapsed_schedule_still_waits_for_the_floor() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transitional",
+    [
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+    ],
+)
+async def test_a_transitional_the_lock_reports_holds_the_next_read_off(
+    transitional: LockStatus,
+) -> None:
+    """Each transitional the lock reports holds the next read off."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:62")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    assert push_lock._earliest_update_time == NEVER_TIME
+    before = time.monotonic()
+
+    push_lock._update_any_state([transitional])
+
+    assert push_lock.lock_status == transitional
+    assert push_lock._cancel_deferred_update is None
+    assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
+async def test_a_transitional_refused_by_the_hold_still_holds_the_next_read_off() -> (
+    None
+):
+    """A transitional refused by a jam hold still holds the next read off."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:63")
+    push_lock._lock_state = _known_state(LockStatus.JAMMED)
+    push_lock._jammed_hold_deadline = time.monotonic() + JAMMED_HOLD_TIME
+    assert push_lock._earliest_update_time == NEVER_TIME
+    before = time.monotonic()
+
+    push_lock._update_any_state([LockStatus.UNLATCHING])
+
+    assert push_lock.lock_status == LockStatus.JAMMED
+    assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_motion_report_moves_the_floor_on() -> None:
+    """A later motion report holds the next read off from its own arrival."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    with _patched_clock() as clock:
+        push_lock._update_any_state([LockStatus.LOCKING])
+        clock[0] += 5.0
+        push_lock._update_any_state([LockStatus.LOCKING])
+        assert push_lock._earliest_update_time == (
+            clock[0] + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        )
+
+
+@pytest.mark.asyncio
 async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> None:
     """The operation's exit clears a cycle armed while it ran and schedules its own."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:69")
@@ -7364,3 +7421,14 @@ async def test_battery_only_cycle_does_not_move_hold_deadline():
     assert push_lock._jammed_hold_deadline == deadline
     assert push_lock._lock_state is not None
     assert push_lock._lock_state.lock == LockStatus.JAMMED
+
+
+@pytest.mark.asyncio
+async def test_get_lock_instance_wires_the_op_response_hook_to_the_hold():
+    """_get_lock_instance wires the Lock's op-response hook to this PushLock's hold."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:59")
+    push_lock._ble_device = MagicMock()
+
+    lock = push_lock._get_lock_instance()
+
+    assert lock._op_response_callback == push_lock._hold_update
