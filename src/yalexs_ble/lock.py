@@ -170,18 +170,13 @@ def _poll_response_matcher(
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
-    """Match the acknowledgment of the written command.
+    """Match the acknowledgment (0xAA + opcode + operation byte) of a command.
 
-    The acknowledgment carries the operation byte the command was sent
-    with, which is what tells a securemode acknowledgment from a plain
-    lock's on the shared Lock opcode. The op-response is matched on the
-    opcode alone, by _operation_response_matcher.
+    The operation byte tells a securemode acknowledgment from a plain lock's.
     """
 
     def _matches(data: bytes) -> bool:
         return (
-            # The floor covers the highest byte the match reads, the
-            # operation byte at 0x04.
             len(data) > 0x04
             and data[0x00] == 0xAA
             and data[0x01] == opcode
@@ -192,17 +187,13 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 
 
 def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
-    """Match the op-response (0xBB + the sent opcode), emitted when the
-    motor stops.
+    """Match the op-response (0xBB + opcode) sent when the motor stops.
 
-    The operation byte is not matched: a securemode op-response carries
-    0x00 there, the same as a plain lock's.
+    The operation byte is 0x00 for every variant, so it is not matched. The
+    floor admits only a frame carrying the result byte at 0x0F.
     """
 
     def _matches(data: bytes) -> bool:
-        # The match reads only the identity bytes, but the wait it completes
-        # reads the result at byte 0x0F, so the floor admits only a frame
-        # that carries it.
         return len(data) > 0x0F and data[0x00] == 0xBB and data[0x01] == opcode
 
     return _matches

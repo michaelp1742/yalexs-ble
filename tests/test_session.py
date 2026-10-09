@@ -1149,18 +1149,24 @@ async def test_execute_operation_op_response_timeout() -> None:
     assert progress.acknowledged is True
 
 
+def _spy_stage_waits(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
+    """Record the timeout of each asyncio.wait the staged wait issues."""
+    timeouts: list[float | None] = []
+    real_wait = asyncio.wait
+
+    async def spying_wait(fs: object, **kwargs: object) -> object:
+        timeouts.append(kwargs.get("timeout"))  # type: ignore[arg-type]
+        return await real_wait(fs, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("yalexs_ble.session.asyncio.wait", spying_wait)
+    return timeouts
+
+
 @pytest.mark.asyncio
 async def test_stage_deadlines_run_from_the_command_issue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both stage timeouts subtract the time already spent in the attempt.
-
-    The acknowledgment wait asks for ACK_TIMEOUT minus the time the
-    write consumed, and the op-response wait asks for response_timeout minus
-    everything spent up to the acknowledgment, so the whole operation is
-    bounded from the moment the command is issued, exactly as
-    OperationIncompleteError's message states.
-    """
+    """Both stage timeouts subtract the time already spent in the attempt."""
     session, client = _make_operation_session()
     progress = OperationProgress()
     command = session.build_operation_command(Commands.LOCK, 0x04)
@@ -1174,21 +1180,13 @@ async def test_stage_deadlines_run_from_the_command_issue(
         clock["now"] += 0.5
 
     client.write_gatt_char = AsyncMock(side_effect=write_taking_half_a_second)
+    stage_waits = _spy_stage_waits(monkeypatch)
 
-    ack_wait_timeouts: list[float | None] = []
-    real_wait = asyncio.wait
-
-    async def spying_wait(fs: object, **kwargs: object) -> object:
-        ack_wait_timeouts.append(kwargs.get("timeout"))  # type: ignore[arg-type]
-        return await real_wait(fs, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr("yalexs_ble.session.asyncio.wait", spying_wait)
-
-    op_wait_timeouts: list[float] = []
+    write_timeouts: list[float] = []
     real_asyncio_timeout = util.asyncio_timeout
 
     def spying_asyncio_timeout(delay: float) -> object:
-        op_wait_timeouts.append(delay)
+        write_timeouts.append(delay)
         return real_asyncio_timeout(delay)
 
     monkeypatch.setattr(
@@ -1199,10 +1197,8 @@ async def test_stage_deadlines_run_from_the_command_issue(
         await _spin_until_written(client)
         clock["now"] += 2.5  # the acknowledgment lands 3.0 s into the attempt
         session._notify(0, bytearray(ack))
-        # The op-response must land in the op-response stage, so wait for that
-        # stage to arm its own bound rather than for progress.acknowledged,
-        # which is set as the frame is received and so is already true here.
-        await _spin_until(lambda: len(op_wait_timeouts) == 2)
+        # Land the op-response in its own stage, not the acknowledgment's.
+        await _spin_until(lambda: len(stage_waits) == 2)
         session._notify(0, bytearray(op_response))
 
     feeder = asyncio.create_task(feed())
@@ -1217,16 +1213,9 @@ async def test_stage_deadlines_run_from_the_command_issue(
     await feeder
 
     assert result == bytes(op_response)
-    # The write consumed 0.5 s of the attempt, so the acknowledgment stage
-    # asked for the remainder of ACK_TIMEOUT, not the full budget again.
-    assert ack_wait_timeouts == [pytest.approx(ACK_TIMEOUT - 0.5)]
-    # The first bound is the write stage's own, ACK_TIMEOUT. The
-    # acknowledgment then spent 3.0 s of the 12.0 s response budget, so the
-    # op-response stage asked for the 9.0 s remainder.
-    assert op_wait_timeouts == [
-        pytest.approx(ACK_TIMEOUT),
-        pytest.approx(9.0),
-    ]
+    assert write_timeouts == [pytest.approx(ACK_TIMEOUT)]
+    # 0.5 s of write, then 3.0 s to the acknowledgment out of the 12.0 s budget.
+    assert stage_waits == [pytest.approx(ACK_TIMEOUT - 0.5), pytest.approx(9.0)]
 
 
 @pytest.mark.asyncio
@@ -1465,50 +1454,23 @@ async def test_op_response_and_disconnect_in_one_turn_returns_the_result() -> No
 async def test_op_response_and_stage_two_timeout_in_one_turn_returns_the_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Op-response and stage-2 timeout in ONE event-loop turn -> the result stands.
-
-    The third twin, with the timer in the disconnect's role: the notify
-    delivering the op-response and the stage-2 timeout handle can become due
-    in the same event-loop iteration, and the timeout then cancels the wait
-    before it can resume with the result the future already holds. Recorded
-    where the frame arrives, the result is in hand and is returned instead of
-    raising OperationIncompleteError.
-    """
+    """Op-response and stage-2 timeout due in one event-loop turn: the result stands."""
     session, client = _make_operation_session()
     progress = OperationProgress()
     command = session.build_operation_command(Commands.LOCK, 0x04)
     ack = _with_checksum(_ACK_SECUREMODE)
     op_response = _with_checksum(_OP_RESPONSE_OK)
-
-    op_wait_timeouts: list[float] = []
-    real_asyncio_timeout = util.asyncio_timeout
-
-    def spying_asyncio_timeout(delay: float) -> object:
-        op_wait_timeouts.append(delay)
-        return real_asyncio_timeout(delay)
-
-    monkeypatch.setattr(
-        "yalexs_ble.session.util.asyncio_timeout", spying_asyncio_timeout
-    )
+    stage_waits = _spy_stage_waits(monkeypatch)
 
     async def feed() -> None:
         await _spin_until_written(client)
         session._notify(0, bytearray(ack))
-        # Wait for the op-response stage to arm its own timer, so the blocking
-        # sleep below expires that timer and not the acknowledgment stage's.
-        await _spin_until(lambda: len(op_wait_timeouts) == 2)
-        # Key the schedule to the armed stage-2 budget, so the ordering
-        # holds however long the run spent getting here.
-        armed = op_wait_timeouts[1]
-        # armed == 0 would put the notify and the timeout on one deadline,
-        # decided by scheduling order; a stalled run must fail as stalled.
-        assert armed > 0, "the fixture stalled past the stage-2 budget"
+        await _spin_until(lambda: len(stage_waits) == 2)
+        armed = stage_waits[1]
+        assert armed, "the fixture stalled past the stage-2 budget"
         loop = asyncio.get_running_loop()
         loop.call_later(armed / 4, session._notify, 0, bytearray(op_response))
-        # Block the loop past both deadlines: when it wakes, the notify handle
-        # (the earlier deadline) and the stage-2 timeout handle run in the
-        # same iteration, notify first, reproducing the race. The blocking
-        # sleep is the point, so the async lint rule is suppressed.
+        # Block past both deadlines so notify and timeout run in one turn.
         time.sleep(armed + 0.1)  # noqa: ASYNC251
 
     feeder = asyncio.create_task(feed())
@@ -1530,49 +1492,23 @@ async def test_op_response_and_stage_two_timeout_in_one_turn_returns_the_result(
 async def test_an_op_response_behind_the_stage_two_timeout_returns_the_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The op-response due after the stage-2 deadline still stands.
-
-    The twin of the ordering above: the two handles become due in one
-    event-loop iteration with the deadline the earlier of them, so the wait is
-    cancelled first and the frame lands on a wait that has not yet resumed.
-    Recorded where the frame arrives, the result is in hand either way round.
-    """
+    """The same race with the timeout due first: the result still stands."""
     session, client = _make_operation_session()
     progress = OperationProgress()
     command = session.build_operation_command(Commands.LOCK, 0x04)
     ack = _with_checksum(_ACK_SECUREMODE)
     op_response = _with_checksum(_OP_RESPONSE_OK)
-
-    op_wait_timeouts: list[float] = []
-    real_asyncio_timeout = util.asyncio_timeout
-
-    def spying_asyncio_timeout(delay: float) -> object:
-        op_wait_timeouts.append(delay)
-        return real_asyncio_timeout(delay)
-
-    monkeypatch.setattr(
-        "yalexs_ble.session.util.asyncio_timeout", spying_asyncio_timeout
-    )
+    stage_waits = _spy_stage_waits(monkeypatch)
 
     async def feed() -> None:
         await _spin_until_written(client)
         session._notify(0, bytearray(ack))
-        # Wait for the op-response stage to arm its own timer, so the blocking
-        # sleep below expires that timer and not the acknowledgment stage's.
-        await _spin_until(lambda: len(op_wait_timeouts) == 2)
-        # Key the schedule to the armed stage-2 budget, so the ordering
-        # holds however long the run spent getting here.
-        armed = op_wait_timeouts[1]
-        # armed == 0 would put the notify and the timeout on one deadline,
-        # decided by scheduling order; a stalled run must fail as stalled.
-        assert armed > 0, "the fixture stalled past the stage-2 budget"
+        await _spin_until(lambda: len(stage_waits) == 2)
+        armed = stage_waits[1]
+        assert armed, "the fixture stalled past the stage-2 budget"
         loop = asyncio.get_running_loop()
         loop.call_later(armed + 0.05, session._notify, 0, bytearray(op_response))
-        # Block the loop past both deadlines: when it wakes, the stage-2
-        # timeout handle (the earlier deadline) and the notify handle run in
-        # the same iteration, the timeout first, which is the ordering this
-        # test pins. The blocking sleep is the point, so the async lint rule
-        # is suppressed.
+        # Block past both deadlines so timeout and notify run in one turn.
         time.sleep(armed + 0.15)  # noqa: ASYNC251
 
     feeder = asyncio.create_task(feed())
