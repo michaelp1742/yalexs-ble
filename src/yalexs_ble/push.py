@@ -333,6 +333,36 @@ def retry_bluetooth_connection_error(
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+def _project_lock_status(
+    reported: LockStatus,
+    main: LockStatus,
+    secure: LockStatus,
+) -> tuple[LockStatus, LockStatus]:
+    """Project the reported status onto the (main, secure) lock pair.
+
+    Only a reported SECUREMODE marks the secure lock secured.
+    """
+    if reported is LockStatus.SECURING:
+        # An already-locked main lock stays put while securing.
+        if main in (LockStatus.LOCKED, LockStatus.SECUREMODE):
+            return main, LockStatus.LOCKING
+        return LockStatus.LOCKING, LockStatus.LOCKING
+    if reported is LockStatus.SECUREMODE:
+        return LockStatus.SECUREMODE, LockStatus.LOCKED
+    if reported is LockStatus.LOCKING:
+        # A plain lock(): the main lock is moving, the secure lock is not.
+        return reported, LockStatus.UNLOCKED
+    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING):
+        # Already UNLOCKING covers a retried unlock's second stamp.
+        if secure in (LockStatus.LOCKED, LockStatus.UNLOCKING):
+            return reported, LockStatus.UNLOCKING
+        return reported, LockStatus.UNLOCKED
+    if reported in (LockStatus.LOCKED, LockStatus.UNLOCKED, LockStatus.UNLATCHED):
+        return reported, LockStatus.UNLOCKED
+    # Faults of the whole lock apply to both channels.
+    return reported, reported
+
+
 class PushLock:
     """A lock with push updates."""
 
@@ -467,6 +497,11 @@ class PushLock:
     def lock_status(self) -> LockStatus:
         """Return the current lock status."""
         return self._lock_state.lock if self._lock_state else LockStatus.UNKNOWN
+
+    @property
+    def secure_status(self) -> LockStatus:
+        """Return the current status of the secure lock."""
+        return self._lock_state.secure if self._lock_state else LockStatus.UNKNOWN
 
     @property
     def battery(self) -> BatteryState | None:
@@ -786,7 +821,7 @@ class PushLock:
     async def securemode(self) -> None:
         """Set the lock into securemode."""
         await self._run_lock_operation(
-            "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
+            "force_securemode", LockStatus.SECURING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
@@ -866,21 +901,21 @@ class PushLock:
         self._cancel_future_update()
         # Unsettled, or always-connected with the link down (this cycle is its
         # reconnect): poll once the motor has stopped, not at the keep-alive.
-        if self.lock_status in POSITION_READINGS and (
-            self.is_connected or not self._always_connected
+        if (
+            self.lock_status in POSITION_READINGS
+            and self.secure_status not in (LockStatus.LOCKING, LockStatus.UNLOCKING)
+            and (self.is_connected or not self._always_connected)
         ):
             delay = KEEP_ALIVE_TIME
         else:
             delay = LOCK_STALE_STATE_DEBOUNCE_DELAY
         self._schedule_future_update_with_debounce(delay)
 
-    def _admit_lock_status(
-        self, incoming: LockStatus, current: LockStatus
-    ) -> LockStatus:
+    def _admit_lock_status(self, incoming: LockStatus) -> LockStatus | None:
         """Decide the displayed lock status for an incoming value.
 
         Every incoming lock status, polled or pushed, must pass through
-        here.
+        here. None refuses the value, so nothing from it is applied.
         """
         if incoming in MANUAL_INTERVENTION_STATUSES and self._operation_in_flight:
             # The lock may never report it again; the operation applies it at exit.
@@ -889,11 +924,11 @@ class PushLock:
             # The operation applies its own outcome; door and battery values in
             # the same frame still apply.
             _LOGGER.debug(
-                "%s: Operation in flight, not accepting lock status %s",
+                "%s: Operation window open, not accepting lock status %s",
                 self.name,
                 incoming,
             )
-            return current
+            return None
         return incoming
 
     # Only called from _run_lock_operation, which holds the operation lock.
@@ -1100,9 +1135,10 @@ class PushLock:
             self.auth,
             self.auto_lock,
             self.auto_lock_prev,
+            self.secure_status,
         )
 
-    def _update_any_state(
+    def _update_any_state(  # noqa: PLR0915
         self,
         states: Iterable[LockStateValue | AuthState],
         arm_resync: bool = True,
@@ -1138,20 +1174,29 @@ class PushLock:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
                 # Every lock status, repeats included, passes the admission filter.
-                admitted = self._admit_lock_status(state, lock_state.lock)
+                admitted = self._admit_lock_status(state)
                 if admitted not in POSITION_READINGS:
                     # An unsettled display must not suppress the follow-up poll.
                     self._seen_this_session.discard(type(state))
-                if lock_state.lock != admitted:
-                    if admitted in SETUP_CONDITION_STATUSES:
+                if admitted is None:
+                    continue
+                # Project every admitted status: securing a locked lock
+                # leaves lock unchanged but still moves secure.
+                main, secure = _project_lock_status(
+                    admitted, lock_state.lock, lock_state.secure
+                )
+                if lock_state.lock != main:
+                    if main in SETUP_CONDITION_STATUSES:
                         _LOGGER.warning(
                             "%s: Lock reports %s, a setup condition that ends "
                             "at the lock by hand",
                             self.name,
-                            admitted,
+                            main,
                         )
-                    changes["lock"] = admitted
+                    changes["lock"] = main
                     self._activity_drain_pending = True
+                if lock_state.secure != secure:
+                    changes["secure"] = secure
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
