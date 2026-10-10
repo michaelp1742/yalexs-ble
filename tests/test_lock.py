@@ -302,23 +302,6 @@ def test_parse_unknown_error_code_is_jammed_and_logs_unknown(
     assert "unknown" in caplog.text
 
 
-def test_last_op_error_is_retained() -> None:
-    """The op-response result byte[15] is retained on the lock instance."""
-    # Collected and compared once: asserting on the attribute per step narrows
-    # it (mypy keeps the narrowing across the _parse_state call) and the later
-    # steps are then flagged unreachable.
-    lock = _make_lock()
-    seen: list[int | None] = [lock._last_op_error]
-
-    lock._parse_state(bytes.fromhex("bb0b001b00000000000000000000001f0000"))
-    seen.append(lock._last_op_error)
-
-    lock._parse_state(bytes.fromhex("bb0b003a0000000000000000000000000000"))
-    seen.append(lock._last_op_error)
-
-    assert seen == [None, 0x1F, 0x00]
-
-
 def test_parse_bogus_frame_is_none_and_logs_unknown(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

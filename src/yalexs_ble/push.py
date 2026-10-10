@@ -815,10 +815,12 @@ class PushLock:
                 ex,
             )
             raise
-        # A failure op-response already published JAMMED; don't overwrite it.
         if result == OperationError.COMM_SUCCESS:
             self._update_any_state([complete_state])
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        else:
+            # The failure op-response already published JAMMED; it stays on display.
+            _LOGGER.debug("%s: %s reported failure 0x%02X", self.name, op_attr, result)
         now = time.monotonic()
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)

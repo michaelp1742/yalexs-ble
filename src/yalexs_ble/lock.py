@@ -284,7 +284,6 @@ class Lock:
         # OperationError enum value (MECH_* = jam). None until the first op.
         # Retained so a follow-up can expose the failure reason as a
         # diagnostic.
-        self._last_op_error: int | None = None
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -384,7 +383,6 @@ class Lock:
                 and len(state) > RESULT_BYTE
             ):
                 result = state[RESULT_BYTE]
-                self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
                     error = VALUE_TO_OPERATION_ERROR.get(result)
                     _LOGGER.warning(
@@ -576,7 +574,7 @@ class Lock:
             progress=OperationProgress(),
         )
         _LOGGER.debug("%s: Finished %s", self.name, command_name)
-        return response[0x0F]
+        return response[RESULT_BYTE]
 
     @raise_if_not_connected
     async def force_securemode(self) -> int:

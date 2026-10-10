@@ -3428,8 +3428,10 @@ async def test_execute_lock_operation_success_stamps_complete_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_reported_operation_failure_leaves_jammed_on_display() -> None:
-    """A failure op-response's JAMMED is not overwritten by the commanded state."""
+async def test_a_reported_operation_failure_leaves_jammed_on_display(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure op-response's JAMMED stays on display and is logged as a failure."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
 
     async def _force_lock_jams() -> int:
@@ -3437,8 +3439,11 @@ async def test_a_reported_operation_failure_leaves_jammed_on_display() -> None:
         push_lock._state_callback([LockStatus.JAMMED])
         return OperationError.MECH_POSITION
 
-    await _run_lock(push_lock, AsyncMock(side_effect=_force_lock_jams))
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        await _run_lock(push_lock, AsyncMock(side_effect=_force_lock_jams))
     assert push_lock.lock_status == LockStatus.JAMMED
+    assert "force_lock reported failure 0x1F" in caplog.text
+    assert "Finished" not in caplog.text
 
 
 @pytest.mark.asyncio
