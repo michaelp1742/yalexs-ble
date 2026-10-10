@@ -74,6 +74,11 @@ RESYNC_DELAY = 0.01
 
 KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
 
+# Reconnect delay while updates keep failing; doubles per failure up to the
+# cap. A state-changing advertisement still pulls an update earlier.
+RECONNECT_BACKOFF_TIME = 2.0
+MAX_RECONNECT_BACKOFF_TIME = 60.0
+
 # Number of seconds to wait after the first connection
 # to disconnect to free up the bluetooth adapter.
 FIRST_CONNECTION_DISCONNECT_TIME = 2.1
@@ -248,11 +253,13 @@ def retry_bluetooth_connection_error(
     ) -> Any:
         _LOGGER.debug("%s: Starting retry loop", self.name)
         max_attempts = attempts - 1
+        auth_error: AuthError | None = None
 
         for attempt in range(attempts):
             try:
                 return await func(self, *args, **kwargs)
-            except AuthError:
+            except AuthError as err:
+                auth_error = err
                 _AUTH_FAILURE_HISTORY.auth_failed(self.address)
                 if _AUTH_FAILURE_HISTORY.should_raise(self.address):
                     # If the bluetooth connection drops in the middle of authentication
@@ -304,7 +311,9 @@ def retry_bluetooth_connection_error(
                 )
                 if backoff:
                     await asyncio.sleep(backoff)
-        return None
+        # Below the re-auth latch an auth failure is read as a link dropped
+        # mid-authentication, so the exhausted attempts fail as a disconnect.
+        raise DisconnectedError(str(auth_error)) from auth_error
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
@@ -312,7 +321,7 @@ def retry_bluetooth_connection_error(
 class PushLock:
     """A lock with push updates."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         local_name: str | None = None,
         address: str | None = None,
@@ -373,6 +382,7 @@ class PushLock:
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
+        self._reconnect_backoff = 0.0
         self._always_connected = always_connected
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
@@ -552,21 +562,38 @@ class PushLock:
     def _disconnected_callback(self) -> None:
         """Handle a disconnect from the lock."""
         _LOGGER.debug("%s: Disconnected from lock callback", self.name)
-        if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
-            self.address
+        if self._update_in_flight():
+            # The running update re-arms the reconnect when it ends.
+            return
+        self._schedule_reconnect()
+
+    def _update_in_flight(self) -> bool:
+        return self._update_task is not None and not self._update_task.done()
+
+    def _schedule_reconnect(self) -> None:
+        """Reconnect an always-connected lock, paced by the backoff."""
+        if (
+            self._running
+            and self._always_connected
+            and not _AUTH_FAILURE_HISTORY.should_raise(self.address)
         ):
-            _LOGGER.debug(
-                "%s: Scheduling reconnect from disconnected callback", self.name
-            )
-            self._keep_alive()
+            _LOGGER.debug("%s: Scheduling reconnect", self.name)
+            self._schedule_future_update_with_debounce(self._reconnect_backoff)
 
     def _keep_alive(self) -> None:
         """Keep the lock connection alive."""
         if not self._always_connected:
             return
         _LOGGER.debug("%s: Executing keep alive", self.name)
-        self._schedule_future_update(0)
+        if not self._update_in_flight():
+            # Debounced so a backoff longer than KEEP_ALIVE_TIME is not pushed
+            # out on every tick; a running update re-arms on its own exit.
+            self._schedule_future_update_with_debounce(self._reconnect_backoff)
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
+
+    def _clear_reconnect_backoff(self) -> None:
+        """A completed update or operation proves the link; drop the backoff."""
+        self._reconnect_backoff = 0.0
 
     def _time_since_last_operation(self) -> float:
         """Return the time since the last operation."""
@@ -923,6 +950,7 @@ class PushLock:
     def _complete_operation(self, now: float) -> None:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
+        self._clear_reconnect_backoff()
         if self._activity_callbacks and not self._activity_primed:
             # The operation cancelled any pending update, the priming one included.
             self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
@@ -1040,6 +1068,7 @@ class PushLock:
         """Validate lock credentials."""
         _LOGGER.debug("%s: Starting validate", self.name)
         await self._update()
+        self._clear_reconnect_backoff()
         _LOGGER.debug("%s: Finished validate", self.name)
 
     async def _poll_battery(self, lock: Lock) -> bool:
@@ -1572,6 +1601,7 @@ class PushLock:
         if self._running:
             raise RuntimeError("Already running")
         self._running = True
+        self._clear_reconnect_backoff()
         self._first_update_future = asyncio.get_running_loop().create_future()
         if device := await get_device(self.address):
             self.set_ble_device(device)
@@ -1695,8 +1725,11 @@ class PushLock:
             _LOGGER.debug("%s: Deferred updated ignored because not running", self.name)
             return
         _LOGGER.debug("%s: Starting deferred update", self.name)
+        failed = True
+        cancelled = False
         try:
             await self._update()
+            failed = False
             self._set_update_state(None)
         except AuthError as ex:
             self._set_update_state(ex)
@@ -1705,6 +1738,7 @@ class PushLock:
                 self.name,
             )
         except asyncio.CancelledError:
+            cancelled = True  # this library giving up, not the lock failing
             self._set_update_state(RuntimeError("Update was canceled"))
             _LOGGER.debug("%s: In-progress update canceled", self.name)
             raise
@@ -1731,6 +1765,22 @@ class PushLock:
             wrapped_exc.__cause__ = ex
             self._set_update_state(wrapped_exc)
             _LOGGER.exception("%s: Unknown error updating", self.name)
+        finally:
+            if not cancelled:
+                self._record_update_outcome(failed)
+            if not self.is_connected:
+                # The disconnect callback stood down while this update ran.
+                self._schedule_reconnect()
+
+    def _record_update_outcome(self, failed: bool) -> None:
+        """Double the reconnect backoff on a failed update; clear it on success."""
+        if not failed:
+            self._clear_reconnect_backoff()
+            return
+        self._reconnect_backoff = min(
+            MAX_RECONNECT_BACKOFF_TIME,
+            self._reconnect_backoff * 2 or RECONNECT_BACKOFF_TIME,
+        )
 
 
 # The HomeKit state record inside the advertisement payload: acid, the global

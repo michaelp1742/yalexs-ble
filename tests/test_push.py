@@ -11,6 +11,7 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
+from bleak_retry_connector import BleakNotFoundError
 
 from yalexs_ble.const import (
     AuthState,
@@ -44,6 +45,7 @@ from yalexs_ble.push import (
     HAP_FIRST_BYTE,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
+    RECONNECT_BACKOFF_TIME,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
@@ -53,7 +55,12 @@ from yalexs_ble.push import (
     operation_lock,
     retry_bluetooth_connection_error,
 )
-from yalexs_ble.session import DisconnectedError, KeycodeError, ResponseError
+from yalexs_ble.session import (
+    AuthError,
+    DisconnectedError,
+    KeycodeError,
+    ResponseError,
+)
 
 # Shared battery-supporting lock used across tests. model is NOT in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
@@ -1175,12 +1182,13 @@ async def test_disconnected_callback_schedules_reconnect_when_always_connected()
         always_connected=True,
     )
     push_lock._name = "Test Lock"
+    push_lock._running = True
     _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
 
-    with patch.object(push_lock, "_keep_alive") as mock_keep_alive:
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
         push_lock._disconnected_callback()
 
-    mock_keep_alive.assert_called_once()
+    schedule.assert_called_once_with(0.0)
 
 
 @pytest.mark.asyncio
@@ -1197,9 +1205,11 @@ async def test_disconnected_callback_skips_reconnect_after_auth_failures() -> No
         _AUTH_FAILURE_HISTORY.auth_failed(push_lock.address)
 
     try:
-        with patch.object(push_lock, "_keep_alive") as mock_keep_alive:
+        with patch.object(
+            push_lock, "_schedule_future_update_with_debounce"
+        ) as schedule:
             push_lock._disconnected_callback()
-        mock_keep_alive.assert_not_called()
+        schedule.assert_not_called()
     finally:
         _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
 
@@ -1215,10 +1225,10 @@ async def test_disconnected_callback_noop_when_not_always_connected() -> None:
     )
     push_lock._name = "Test Lock"
 
-    with patch.object(push_lock, "_keep_alive") as mock_keep_alive:
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
         push_lock._disconnected_callback()
 
-    mock_keep_alive.assert_not_called()
+    schedule.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2734,6 +2744,257 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
 
     assert push_lock.auth == AuthState(successful=True)
     assert _AUTH_FAILURE_HISTORY.should_raise(address) is False
+
+
+def _backoff_lock(address: str, *, always_connected: bool = True) -> PushLock:
+    """A running lock for the backoff tests."""
+    push_lock = _named_push_lock(address, always_connected=always_connected)
+    push_lock._running = True
+    return push_lock
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_doubles_per_failure_and_caps() -> None:
+    """Each failed update doubles the delay from the base up to the cap."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:41")
+    seen = []
+    with patch.object(push_lock, "_update", side_effect=BleakError("boom")):
+        for _ in range(7):
+            await push_lock._execute_deferred_update()
+            seen.append(push_lock._reconnect_backoff)
+    assert seen == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_keeps_a_pending_backoff_and_stands_down_mid_update() -> None:
+    """A long backoff survives the tick, and a tick during an update arms nothing."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:48")
+    push_lock._reconnect_backoff = 32.0
+    try:
+        push_lock._keep_alive()
+        pending = push_lock._cancel_deferred_update
+        assert pending is not None
+        assert pending.when() - push_lock.loop.time() == pytest.approx(32.0, abs=0.5)
+        push_lock._keep_alive()
+        assert push_lock._cancel_deferred_update is pending
+        push_lock._cancel_future_update()
+        push_lock._update_task = asyncio.create_task(asyncio.sleep(100))
+        push_lock._keep_alive()
+        assert push_lock._cancel_deferred_update is None
+    finally:
+        push_lock._cancel_future_update()
+        push_lock._cancel_keepalive_timer()
+        if push_lock._update_task is not None:
+            push_lock._update_task.cancel()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        AuthError("bad key"),
+        TimeoutError("timed out"),
+        BleakNotFoundError("not found"),
+        BleakError("bleak error"),
+        DisconnectedError("disconnected"),
+        ValueError("unexpected"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_update_failure_counts_and_paces_the_reconnect(
+    exc: Exception,
+) -> None:
+    """Each failed update counts once and schedules the next try at the backoff."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:47")
+    with (
+        patch.object(push_lock, "_update", side_effect=exc),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        await push_lock._execute_deferred_update()
+        await push_lock._execute_deferred_update()
+    assert push_lock._reconnect_backoff == RECONNECT_BACKOFF_TIME * 2
+    assert [c.args for c in schedule.call_args_list] == [
+        (RECONNECT_BACKOFF_TIME,),
+        (RECONNECT_BACKOFF_TIME * 2,),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auth_failures_below_the_latch_still_count_as_failed_updates() -> None:
+    """Exhausted auth retries below the re-auth latch fail the update and pace it."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:52")
+    _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+    try:
+        with (
+            patch.object(
+                push_lock, "_ensure_connected", AsyncMock(side_effect=AuthError("x"))
+            ),
+            patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+            patch.object(
+                push_lock, "_schedule_future_update_with_debounce"
+            ) as schedule,
+        ):
+            await push_lock._execute_deferred_update()
+        assert push_lock._reconnect_backoff == RECONNECT_BACKOFF_TIME
+        schedule.assert_called_once_with(RECONNECT_BACKOFF_TIME)
+        assert not _AUTH_FAILURE_HISTORY.should_raise(push_lock.address)
+        assert push_lock.auth != AuthState(successful=False)
+    finally:
+        _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_lock_never_rearms_a_reconnect() -> None:
+    """The reconnect helper stands down once the lock is stopped."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:53")
+    push_lock._running = False
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock._schedule_reconnect()
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_auth_retries_fail_an_operation_too() -> None:
+    """lock() raises after its auth retries run out instead of returning None."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:54", always_connected=False)
+    _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+    try:
+        with (
+            patch.object(
+                push_lock, "_ensure_connected", AsyncMock(side_effect=AuthError("x"))
+            ),
+            patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+            pytest.raises(DisconnectedError) as excinfo,
+        ):
+            await push_lock.lock()
+        assert isinstance(excinfo.value.__cause__, AuthError)
+        assert not _AUTH_FAILURE_HISTORY.should_raise(push_lock.address)
+    finally:
+        _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+        push_lock._cancel_future_update()
+        push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_update_does_not_reconnect_when_not_always_connected() -> None:
+    """Only an always-connected lock reconnects on its own after a failure."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4f", always_connected=False)
+    with (
+        patch.object(push_lock, "_update", side_effect=BleakError("boom")),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        await push_lock._execute_deferred_update()
+    assert push_lock._reconnect_backoff == RECONNECT_BACKOFF_TIME
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_an_update_leaves_the_reconnect_to_it() -> None:
+    """The disconnect callback schedules nothing while an update is in flight."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:50")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _update() -> None:
+        started.set()
+        await release.wait()
+        raise BleakError("link dropped")
+
+    with (
+        patch.object(push_lock, "_update", side_effect=_update),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        push_lock._update_task = asyncio.create_task(
+            push_lock._execute_deferred_update()
+        )
+        await started.wait()
+        push_lock._disconnected_callback()
+        schedule.assert_not_called()
+        release.set()
+        await push_lock._update_task
+    schedule.assert_called_once_with(RECONNECT_BACKOFF_TIME)
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_is_ignored_when_not_running() -> None:
+    """A stopped lock neither updates nor counts a failure."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:51", always_connected=True)
+    with patch.object(push_lock, "_update") as update:
+        await push_lock._execute_deferred_update()
+    update.assert_not_called()
+    assert push_lock._reconnect_backoff == 0.0
+
+
+@pytest.mark.parametrize(("connected", "scheduled"), [(True, []), (False, [call(0.0)])])
+@pytest.mark.asyncio
+async def test_deferred_update_success_clears_backoff(
+    connected: bool, scheduled: list[Any]
+) -> None:
+    """A completed update clears the backoff, and reconnects now if the link dropped."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:44")
+    push_lock._reconnect_backoff = 16.0
+    push_lock._client = MagicMock(is_connected=connected)
+    with (
+        patch.object(push_lock, "_update", return_value=None),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        await push_lock._execute_deferred_update()
+    assert push_lock._reconnect_backoff == 0.0
+    assert schedule.call_args_list == scheduled
+
+
+@pytest.mark.parametrize("connected", [True, False])
+@pytest.mark.asyncio
+async def test_deferred_update_cancel_is_not_a_failure(connected: bool) -> None:
+    """A cancel does not count, but a link lost under it still gets its reconnect."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:45")
+    push_lock._reconnect_backoff = 4.0
+    push_lock._client = MagicMock(is_connected=connected)
+    with (
+        patch.object(push_lock, "_update", side_effect=asyncio.CancelledError),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await push_lock._execute_deferred_update()
+    assert push_lock._reconnect_backoff == 4.0
+    assert schedule.call_args_list == ([] if connected else [call(4.0)])
+
+
+@pytest.mark.asyncio
+async def test_complete_operation_clears_backoff() -> None:
+    """A completed operation proves the connection works."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:46")
+    push_lock._reconnect_backoff = 8.0
+    with (
+        patch.object(push_lock, "_reset_disconnect_timer"),
+        patch.object(push_lock, "_reschedule_next_keep_alive"),
+    ):
+        push_lock._complete_operation(time.monotonic())
+    assert push_lock._reconnect_backoff == 0.0
+
+
+@pytest.mark.asyncio
+async def test_validate_clears_the_backoff() -> None:
+    """A completed validate proves the connection works."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4c")
+    push_lock._reconnect_backoff = 8.0
+    with patch.object(push_lock, "_update", return_value=None):
+        await push_lock.validate()
+    assert push_lock._reconnect_backoff == 0.0
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_inherit_a_backoff() -> None:
+    """A restarted lock ramps from the base delay again."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:4e", always_connected=True)
+    push_lock._reconnect_backoff = 60.0
+    with (
+        patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)),
+        patch.object(push_lock, "_schedule_future_update_with_debounce"),
+    ):
+        await push_lock.start()
+    assert push_lock._reconnect_backoff == 0.0
+    push_lock._cancel()
+    await asyncio.sleep(0)
 
 
 def _keycode_push_lock() -> tuple[PushLock, MagicMock]:
