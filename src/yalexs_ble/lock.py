@@ -280,10 +280,6 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
-        # byte[15] of the most recent op-response: 0x00 success, non-zero =
-        # OperationError enum value (MECH_* = jam). None until the first op.
-        # Retained so a follow-up can expose the failure reason as a
-        # diagnostic.
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -573,8 +569,11 @@ class Lock:
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
             progress=OperationProgress(),
         )
-        _LOGGER.debug("%s: Finished %s", self.name, command_name)
-        return response[RESULT_BYTE]
+        result = response[RESULT_BYTE]
+        _LOGGER.debug(
+            "%s: Finished %s (result 0x%02X)", self.name, command_name, result
+        )
+        return result
 
     @raise_if_not_connected
     async def force_securemode(self) -> int:
