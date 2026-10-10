@@ -1512,8 +1512,7 @@ async def _drive_operation(
 ) -> None:
     """Run a force_* method, feeding its ack then op-response through notify.
 
-    A frame fed before the ack must leave the ack stage armed; one fed before
-    the op-response must leave the result wait armed.
+    Optional before_* frames must leave the stage they precede armed.
     """
     session = lock.session
     assert session is not None

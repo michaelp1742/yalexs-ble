@@ -63,10 +63,6 @@ LOCK_INFO_ATTEMPTS = 2
 # Upper bound on the records read in one drain of the activity log
 MAX_ACTIVITY_RECORDS = 32
 
-
-# byte[4] of a Lock command: 0x04 turns the plain lock into securemode.
-
-
 # Operation byte (byte[4]) that makes a Lock command securemode.
 SECUREMODE_OPERATION_BYTE = 0x04
 
