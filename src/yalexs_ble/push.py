@@ -27,7 +27,7 @@ from .const import (
     HAP_FIRST_BYTE,
     MANUAL_INTERVENTION_STATUSES,
     SETUP_CONDITION_STATUSES,
-    YALE_MFR_ID,
+    YALE_MFR_IDS,
     AuthState,
     AutoLockMode,
     AutoLockState,
@@ -1723,7 +1723,8 @@ class PushLock:
                 next_update = HK_UPDATE_COALESCE_SECONDS
         elif APPLE_MFR_ID in mfr_data:
             _LOGGER.debug("%s: Empty HomeKit advertisement payload; skipped", self.name)
-        # Yale YALE_MFR_ID advertisements come in two formats:
+        # YALE_MFR_ID advertisements come in two formats, and a payload under
+        # ASSA_ABLOY_MFR_ID is read the same way:
         # - 1-byte: lock state toggle (0/1), used for change detection
         # - 18-byte: 2 header bytes + the lock's 16-byte cloud ID (the
         #   identifier used by the Yale/ASSA ABLOY cloud API), e.g.
@@ -1733,10 +1734,11 @@ class PushLock:
         # static 0x00 header of the 18-byte format causes repeated
         # connections if it differs from the 1-byte value.
         is_first_advertisement = self._last_adv_value == -1
+        yale_data = next(
+            (mfr_data[mfr_id] for mfr_id in YALE_MFR_IDS if mfr_id in mfr_data), None
+        )
         # As above, an empty payload is skipped rather than indexed.
-        if (yale_data := mfr_data.get(YALE_MFR_ID)) and (
-            len(yale_data) == 1 or is_first_advertisement
-        ):
+        if yale_data and (len(yale_data) == 1 or is_first_advertisement):
             current_value = yale_data[0]
             if not next_update:
                 if is_first_advertisement:
@@ -1748,7 +1750,7 @@ class PushLock:
                 ):
                     next_update = ADV_UPDATE_COALESCE_SECONDS
             self._last_adv_value = current_value
-        elif YALE_MFR_ID in mfr_data and not mfr_data[YALE_MFR_ID]:
+        elif yale_data is not None and not yale_data:
             _LOGGER.debug("%s: Empty Yale advertisement payload; skipped", self.name)
         if adv_debug_enabled:
             scheduled_update = None

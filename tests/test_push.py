@@ -18,6 +18,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
 from yalexs_ble.const import (
+    ASSA_ABLOY_MFR_ID,
+    YALE_MFR_ID,
     AuthState,
     AutoLockMode,
     AutoLockState,
@@ -58,7 +60,6 @@ from yalexs_ble.push import (
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
     SLOW_TIMEOUT,
-    YALE_MFR_ID,
     PushLock,
     operation_lock,
     retry_bluetooth_connection_error,
@@ -2573,9 +2574,10 @@ def _advertisement(manufacturer_data: dict[int, bytes]) -> AdvertisementData:
         # One byte short of the state record, which is the boundary the guard
         # turns on: at 14 bytes the unpack still runs off the end.
         {APPLE_MFR_ID: bytes([HAP_FIRST_BYTE]) + b"\x00" * 13},
-        # An empty payload under either identifier.
+        # An empty payload under each identifier.
         {APPLE_MFR_ID: b""},
         {YALE_MFR_ID: b""},
+        {ASSA_ABLOY_MFR_ID: b""},
     ],
 )
 @pytest.mark.asyncio
@@ -2595,6 +2597,97 @@ async def test_a_short_advertisement_payload_is_skipped_not_parsed(
 
     assert push_lock._cancel_deferred_update is None
     assert push_lock._last_hk_state == -1
+
+
+def _update_scheduled(push_lock: PushLock) -> bool:
+    """Whether an update is scheduled."""
+    return push_lock._cancel_deferred_update is not None
+
+
+@pytest.mark.parametrize("mfr_id", [YALE_MFR_ID, ASSA_ABLOY_MFR_ID])
+@pytest.mark.asyncio
+async def test_a_one_byte_advertisement_schedules_an_update_on_change(
+    mfr_id: int,
+) -> None:
+    """Each company ID's 1-byte value schedules an update when it changes."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1a", always_connected=False)
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+
+    push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b"\x00"}))
+    assert push_lock._last_adv_value == 0
+    assert _update_scheduled(push_lock)
+    push_lock._cancel_future_update()
+
+    push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b"\x00"}))
+    assert not _update_scheduled(push_lock)
+
+    push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b"\x01"}))
+    assert push_lock._last_adv_value == 1
+    assert _update_scheduled(push_lock)
+    push_lock._cancel_future_update()
+
+
+@pytest.mark.parametrize("mfr_id", [YALE_MFR_ID, ASSA_ABLOY_MFR_ID])
+@pytest.mark.asyncio
+async def test_a_lock_the_host_stack_does_not_know_starts_from_its_advertisement(
+    mfr_id: int,
+) -> None:
+    """The first advertisement starts the first update when start() does not.
+
+    start() schedules the first update only for a device the host's own
+    Bluetooth stack knows, and a lock heard through a proxy is not one.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1b", always_connected=False)
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+
+    with (
+        patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)),
+        patch.object(push_lock, "_locked_update", AsyncMock(return_value=None)),
+    ):
+        cancel = await push_lock.start()
+        assert not _update_scheduled(push_lock)
+        push_lock.update_advertisement(
+            ble_device, _advertisement({mfr_id: b"\x00\x00" + bytes(range(16))})
+        )
+        await push_lock.wait_for_first_update(1)
+    cancel()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("mfr_id", [YALE_MFR_ID, ASSA_ABLOY_MFR_ID])
+@pytest.mark.asyncio
+async def test_only_an_empty_payload_is_logged_as_empty(
+    mfr_id: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only an empty payload is logged as empty; a later 18-byte payload is not."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1c", always_connected=False)
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+    push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b"\x00"}))
+    push_lock._cancel_future_update()
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        push_lock.update_advertisement(
+            ble_device, _advertisement({mfr_id: b"\x00\x00" + bytes(16)})
+        )
+        push_lock.update_advertisement(ble_device, _advertisement({}))
+        assert "Empty Yale advertisement payload" not in caplog.text
+        push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b""}))
+        assert "Empty Yale advertisement payload" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_yale_company_id_is_read_before_assa_abloy() -> None:
+    """An advertisement carrying both company IDs is read from 465."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1d", always_connected=False)
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+
+    push_lock.update_advertisement(
+        ble_device,
+        _advertisement({ASSA_ABLOY_MFR_ID: b"\x00", YALE_MFR_ID: b"\x01"}),
+    )
+
+    assert push_lock._last_adv_value == 1
+    push_lock._cancel_future_update()
 
 
 def _hap_payload(state_num: int) -> bytes:
