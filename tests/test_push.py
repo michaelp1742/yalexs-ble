@@ -2672,7 +2672,55 @@ async def test_only_an_empty_payload_is_logged_as_empty(
         push_lock.update_advertisement(ble_device, _advertisement({}))
         assert "Empty Yale advertisement payload" not in caplog.text
         push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b""}))
-        assert "Empty Yale advertisement payload" in caplog.text
+        assert (
+            f"Empty Yale advertisement payload under company ID {mfr_id}" in caplog.text
+        )
+
+
+@pytest.mark.parametrize(
+    ("cached_id", "toggle_id"),
+    [(YALE_MFR_ID, ASSA_ABLOY_MFR_ID), (ASSA_ABLOY_MFR_ID, YALE_MFR_ID)],
+)
+@pytest.mark.asyncio
+async def test_a_one_byte_value_is_read_ahead_of_a_cached_longer_payload(
+    cached_id: int, toggle_id: int
+) -> None:
+    """A 1-byte value under one ID is read when the other holds an 18-byte payload."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1e", always_connected=False)
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+    id_payload = b"\x00\x00" + bytes(range(16))
+    push_lock.update_advertisement(ble_device, _advertisement({cached_id: id_payload}))
+    push_lock._cancel_future_update()
+
+    push_lock.update_advertisement(
+        ble_device, _advertisement({cached_id: id_payload, toggle_id: b"\x01"})
+    )
+
+    assert push_lock._last_adv_value == 1
+    assert _update_scheduled(push_lock)
+    push_lock._cancel_future_update()
+
+
+@pytest.mark.parametrize(
+    ("other_payload", "expected_value"),
+    [(b"\x01", 1), (b"\x05\x00" + bytes(16), 5)],
+)
+@pytest.mark.asyncio
+async def test_an_empty_payload_does_not_hide_the_other_id(
+    other_payload: bytes, expected_value: int
+) -> None:
+    """An empty 465 payload does not hide a 1-byte or first 18-byte 302 payload."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1f", always_connected=False)
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+
+    push_lock.update_advertisement(
+        ble_device,
+        _advertisement({YALE_MFR_ID: b"", ASSA_ABLOY_MFR_ID: other_payload}),
+    )
+
+    assert push_lock._last_adv_value == expected_value
+    assert _update_scheduled(push_lock)
+    push_lock._cancel_future_update()
 
 
 @pytest.mark.asyncio

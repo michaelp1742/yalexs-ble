@@ -6,7 +6,7 @@ import functools
 import logging
 import struct
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import replace
 from typing import Any, TypeVar, cast
 
@@ -209,6 +209,24 @@ NO_BATTERY_SUPPORT_MODELS = {
 }
 
 AUTO_LOCK_DEFAULT_DURATION = 90
+
+
+def _select_yale_payload(
+    mfr_data: Mapping[int, bytes],
+) -> tuple[int | None, bytes | None]:
+    """Choose the payload to read, and its company ID, from the Yale IDs present.
+
+    A 1-byte payload first, then any non-empty one, 465 first on a tie. Both
+    None when no Yale ID is present.
+    """
+    present = [
+        (mfr_id, mfr_data[mfr_id]) for mfr_id in YALE_MFR_IDS if mfr_id in mfr_data
+    ]
+    if not present:
+        return None, None
+    # The scanner merges manufacturer data per company ID, so the payload under
+    # one ID may be a cached frame while the current value arrives under the other.
+    return min(present, key=lambda item: (len(item[1]) != 1, not item[1]))
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -1734,9 +1752,7 @@ class PushLock:
         # static 0x00 header of the 18-byte format causes repeated
         # connections if it differs from the 1-byte value.
         is_first_advertisement = self._last_adv_value == -1
-        yale_data = next(
-            (mfr_data[mfr_id] for mfr_id in YALE_MFR_IDS if mfr_id in mfr_data), None
-        )
+        yale_mfr_id, yale_data = _select_yale_payload(mfr_data)
         # As above, an empty payload is skipped rather than indexed.
         if yale_data and (len(yale_data) == 1 or is_first_advertisement):
             current_value = yale_data[0]
@@ -1751,7 +1767,11 @@ class PushLock:
                     next_update = ADV_UPDATE_COALESCE_SECONDS
             self._last_adv_value = current_value
         elif yale_data is not None and not yale_data:
-            _LOGGER.debug("%s: Empty Yale advertisement payload; skipped", self.name)
+            _LOGGER.debug(
+                "%s: Empty Yale advertisement payload under company ID %s; skipped",
+                self.name,
+                yale_mfr_id,
+            )
         if adv_debug_enabled:
             scheduled_update = None
             if self._cancel_deferred_update:
