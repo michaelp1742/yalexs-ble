@@ -367,6 +367,7 @@ class PushLock:
 
     # Declared so mypy does not infer None from _init_operation_state.
     _operation_outcome: LockStatus | None
+    _operation_failure: Exception | None
 
     def __init__(  # noqa: PLR0915
         self,
@@ -835,6 +836,7 @@ class PushLock:
         self._operation_in_flight = False
         self._operation_issued_at = NEVER_TIME
         self._operation_answered = False
+        self._operation_failure = None
 
     @operation_lock
     async def _run_lock_operation(
@@ -844,6 +846,7 @@ class PushLock:
         self._cancel_future_update()
         self._operation_outcome = None
         self._operation_answered = False
+        self._operation_failure = None
         self._operation_in_flight = True
         # Taken under the operation lock, so a command queued behind another
         # counts from when it runs.
@@ -866,6 +869,20 @@ class PushLock:
             self._last_jam_event_time
             >= self._operation_issued_at - JAMMED_PRECEDENCE_TIME
         )
+
+    def _end_a_retry_under_precedence(self) -> None:
+        """End a retry before its write while a jam or setup condition takes precedence.
+
+        A first attempt is never ended here, so a command issued within the
+        precedence time still gets its first attempt.
+        """
+        failure = self._operation_failure
+        if failure is not None and self._jam_takes_precedence():
+            raise OperationIncompleteError(
+                f"{self.name}: a jam or setup condition the lock reported "
+                "takes precedence over the command, whose attempt ended with "
+                f"{failure!r}; the retry was not sent"
+            ) from failure
 
     def _attention_holds_display(self, state: LockStatus) -> bool:
         """Whether a jam or setup condition that takes precedence is still on display.
@@ -973,6 +990,7 @@ class PushLock:
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
         try:
             lock = await self._ensure_connected()
+            self._end_a_retry_under_precedence()
             self._cancel_future_update()
             # Opened before the write: a status handled while the write is
             # awaited cannot be placed before or after the lock took the command.
@@ -986,6 +1004,7 @@ class PushLock:
                 ),
             )
         except Exception as ex:
+            self._operation_failure = ex
             # Closed so a status the lock reports before the retry is admitted.
             self._close_operation_window()
             _LOGGER.debug(

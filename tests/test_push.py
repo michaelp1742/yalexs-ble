@@ -4517,6 +4517,132 @@ async def test_a_jam_reported_during_the_teardown_ends_the_attempts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_jam_reported_while_a_retry_connects_ends_the_attempts() -> None:
+    """A jam reported while the retry reconnects ends the attempts before its write."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:b8")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    attempts = 0
+    connects = 0
+    error = DisconnectedError("dropped before any jam was reported")
+
+    async def force_lock(write_success_callback, result_callback):
+        nonlocal attempts
+        attempts += 1
+        write_success_callback()
+        raise error
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    async def connect() -> MagicMock:
+        nonlocal connects
+        connects += 1
+        if connects == 2:
+            push_lock._update_any_state([LockStatus.JAMMED])
+        return mock_lock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(side_effect=connect)),
+        patch.object(push_lock, "_async_handle_disconnected", AsyncMock()),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+        pytest.raises(OperationIncompleteError) as excinfo,
+    ):
+        await push_lock.lock()
+
+    assert excinfo.value.__cause__ is error
+    assert connects == 2
+    assert attempts == 1
+    assert push_lock._operation_outcome == LockStatus.UNKNOWN
+    assert push_lock.lock_status == LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_jam_reported_during_the_backoff_ends_the_attempts() -> None:
+    """A jam reported during the backoff ends the attempts before the retry's write."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:b9")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+    attempts = 0
+    error = AuthError("the attempt failed")
+
+    async def force_lock(write_success_callback, result_callback):
+        nonlocal attempts
+        attempts += 1
+        write_success_callback()
+        # AuthError is the one retried failure whose backoff keeps the link.
+        raise error
+
+    async def backoff_delivering_a_jam(_delay: float) -> None:
+        push_lock._update_any_state([LockStatus.JAMMED])
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    sleep = AsyncMock(side_effect=backoff_delivering_a_jam)
+    connect = AsyncMock(return_value=mock_lock)
+
+    try:
+        with (
+            patch.object(push_lock, "_ensure_connected", connect),
+            patch("yalexs_ble.push.asyncio.sleep", sleep),
+            pytest.raises(OperationIncompleteError) as excinfo,
+        ):
+            await push_lock.lock()
+    finally:
+        _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+
+    assert excinfo.value.__cause__ is error
+    sleep.assert_awaited_once_with(0.25)
+    assert connect.await_count == 2
+    assert attempts == 1
+    assert push_lock._operation_outcome == LockStatus.UNKNOWN
+    assert push_lock.lock_status == LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_command_within_the_precedence_time_gets_its_first_attempt() -> None:
+    """The first attempt of a command issued 3 s after a jam connects and writes."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:b6")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    calls = 0
+    writes = 0
+
+    async def force_operation(write_success_callback, result_callback):
+        nonlocal calls, writes
+        calls += 1
+        if calls == 1:
+            raise DisconnectedError("dropped before the write")
+        writes += 1
+        write_success_callback()
+        result_callback(True)
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_operation
+    mock_lock.force_unlock = force_operation
+
+    with (
+        _patched_clock() as clock,
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_async_handle_disconnected", AsyncMock()),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+    ):
+        start = clock[0]
+        await push_lock.lock()
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 3.0
+        await push_lock.unlock()
+
+    assert calls == 3
+    assert writes == 2
+    assert push_lock.lock_status == LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_a_failure_under_precedence_tears_the_link_down_before_the_exit() -> None:
     """An always-connected lock's link is torn down before the exit's debounce poll."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:b7")
