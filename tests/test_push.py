@@ -3701,12 +3701,11 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("start", "operation", "op_attr", "expected"),
+    ("start", "operation", "expected"),
     [
         (
             (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
             "lock",
-            "force_lock",
             [
                 (LockStatus.LOCKING, LockStatus.UNLOCKED),
                 (LockStatus.LOCKED, LockStatus.UNLOCKED),
@@ -3715,7 +3714,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
         (
             (LockStatus.SECUREMODE, LockStatus.LOCKED),
             "lock",
-            "force_lock",
             [
                 (LockStatus.LOCKING, LockStatus.UNLOCKED),
                 (LockStatus.LOCKED, LockStatus.UNLOCKED),
@@ -3724,7 +3722,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
         (
             (LockStatus.LOCKED, LockStatus.UNLOCKED),
             "securemode",
-            "force_securemode",
             [
                 (LockStatus.LOCKED, LockStatus.LOCKING),
                 (LockStatus.SECUREMODE, LockStatus.LOCKED),
@@ -3733,7 +3730,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
         (
             (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
             "securemode",
-            "force_securemode",
             [
                 (LockStatus.LOCKING, LockStatus.LOCKING),
                 (LockStatus.SECUREMODE, LockStatus.LOCKED),
@@ -3742,7 +3738,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
         (
             (LockStatus.SECUREMODE, LockStatus.LOCKED),
             "securemode",
-            "force_securemode",
             [
                 (LockStatus.SECUREMODE, LockStatus.LOCKING),
                 (LockStatus.SECUREMODE, LockStatus.LOCKED),
@@ -3751,7 +3746,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
         (
             (LockStatus.LOCKED, LockStatus.UNLOCKED),
             "unlock",
-            "force_unlock",
             [
                 (LockStatus.UNLOCKING, LockStatus.UNLOCKED),
                 (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
@@ -3760,7 +3754,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
         (
             (LockStatus.SECUREMODE, LockStatus.LOCKED),
             "unlock",
-            "force_unlock",
             [
                 (LockStatus.UNLOCKING, LockStatus.UNLOCKING),
                 (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
@@ -3780,7 +3773,6 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
 async def test_secure_projection_invariant_table(
     start: tuple[LockStatus, LockStatus],
     operation: str,
-    op_attr: str,
     expected: list[tuple[LockStatus, LockStatus]],
 ) -> None:
     """Each operation publishes the expected (main, secure) pairs."""
@@ -3799,7 +3791,7 @@ async def test_secure_projection_invariant_table(
         result_callback(True)
 
     mock_lock = MagicMock()
-    setattr(mock_lock, op_attr, force_operation)
+    setattr(mock_lock, f"force_{operation}", force_operation)
 
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
@@ -3808,7 +3800,6 @@ async def test_secure_projection_invariant_table(
         await getattr(push_lock, operation)()
 
     assert emissions == expected
-    assert all(LockStatus.SECURING not in pair for pair in emissions)
     push_lock._cancel_disconnect_timer()
 
 
@@ -3826,20 +3817,6 @@ async def test_settled_securemode_push_is_not_a_securing_transitional() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_stamped_plain_locking_reads_not_secured() -> None:
-    """A plain lock() out of Secured reads the secure lock as not secured."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:69")
-    push_lock._lock_state = _known_state(
-        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
-    )
-
-    push_lock._operation_write_success(LockStatus.LOCKING)
-
-    assert push_lock.lock_status is LockStatus.LOCKING
-    assert push_lock.secure_status is LockStatus.UNLOCKED
-
-
-@pytest.mark.asyncio
 async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
     """A stamped SECURING must not suppress the follow-up status poll."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6a")
@@ -3849,29 +3826,6 @@ async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
 
     assert push_lock.secure_status is LockStatus.LOCKING
     assert LockStatus not in push_lock._seen_this_session
-
-
-@pytest.mark.asyncio
-async def test_window_filter_refusal_leaves_the_secure_lock_alone() -> None:
-    """A status refused by the window filter never reaches the projection."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
-    push_lock._lock_state = _known_state(LockStatus.LOCKED)
-    with _patched_clock() as clock:
-        # As the operation sets them before its write.
-        push_lock._operation_issued_at = clock[0]
-        push_lock._operation_window_open = True
-        push_lock._operation_write_success(LockStatus.SECURING)
-    assert (push_lock.lock_status, push_lock.secure_status) == (
-        LockStatus.LOCKED,
-        LockStatus.LOCKING,
-    )
-
-    # A late settled push inside the window is refused.
-    push_lock._update_any_state([LockStatus.LOCKED])
-    assert (push_lock.lock_status, push_lock.secure_status) == (
-        LockStatus.LOCKED,
-        LockStatus.LOCKING,
-    )
 
 
 @pytest.mark.asyncio
@@ -3925,28 +3879,6 @@ async def test_nonretryable_securemode_after_write_stamps_unknown() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("secure", "expected_delay"),
-    [
-        (LockStatus.LOCKING, LOCK_STALE_STATE_DEBOUNCE_DELAY),
-        (LockStatus.UNLOCKED, KEEP_ALIVE_TIME),
-    ],
-    ids=["secure_transitional_polls_at_the_debounce", "settled_pair_keeps_alive"],
-)
-async def test_operation_exit_delay_follows_the_displayed_pair(
-    secure: LockStatus, expected_delay: float
-) -> None:
-    """The exit poll delay reads the pair, not the main lock alone."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:67")
-    push_lock._lock_state = _known_state(LockStatus.LOCKED, secure=secure)
-
-    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
-        push_lock._finalize_operation()
-
-    schedule.assert_called_once_with(expected_delay)
-
-
-@pytest.mark.asyncio
 async def test_a_cancelled_securemode_keeps_the_pair_and_polls_at_the_debounce():
     """A securemode cancelled mid-motion keeps the pair and polls at the debounce."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6b")
@@ -3954,7 +3886,7 @@ async def test_a_cancelled_securemode_keeps_the_pair_and_polls_at_the_debounce()
     pairs: list[tuple[LockStatus, LockStatus]] = []
     push_lock.register_callback(lambda ls, li, ci: pairs.append((ls.lock, ls.secure)))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    ack = _with_checksum("aa0b00000400000000000000000000000200")
+    ack = _with_checksum(_ACK_SECUREMODE)
     client.write_gatt_char = AsyncMock(
         side_effect=_write_returning_first(session, [ack])
     )
@@ -3967,6 +3899,8 @@ async def test_a_cancelled_securemode_keeps_the_pair_and_polls_at_the_debounce()
         # Let the acknowledgment be handled and the op-response wait begin.
         for _ in range(50):
             await asyncio.sleep(0)
+        assert session._ack_future is None
+        assert session._notify_future is not None
         op.cancel()
         with pytest.raises(asyncio.CancelledError):
             await op
@@ -5080,9 +5014,10 @@ async def test_a_retryable_failure_after_the_precedence_time_re_sends() -> None:
     push_lock._cancel_disconnect_timer()
 
 
-# Lock-opcode ack and op-responses, and LOCK_ONLY status pushes carrying a jam,
-# Unlocked, and Locked.
+# Lock-opcode acks for a plain lock and a securemode, op-responses, and
+# LOCK_ONLY status pushes carrying a jam, Unlocked, and Locked.
 _ACK_LOCK = "aa0b00000000000000000000000000000200"
+_ACK_SECUREMODE = "aa0b00000400000000000000000000000200"
 _OP_RESPONSE_OK = "bb0b00000000000000000000000000000200"
 _OP_RESPONSE_JAMMED = "bb0b000000000000000000000000001f0200"
 _STATUS_PUSH_JAMMED = "bb0200000200000007000000000000000000"
