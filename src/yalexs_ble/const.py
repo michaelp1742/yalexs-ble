@@ -13,6 +13,9 @@ SECURE_READ_CHARACTERISTIC = "bd4ac614-0b45-11e3-8ffd-0800200c9a66"
 
 APPLE_MFR_ID = 76
 YALE_MFR_ID = 465
+ASSA_ABLOY_MFR_ID = 302
+# Company IDs a lock's manufacturer data is advertised under, read in this order.
+YALE_MFR_IDS = (YALE_MFR_ID, ASSA_ABLOY_MFR_ID)
 HAP_FIRST_BYTE = 0x06
 HAP_ENCRYPTED_FIRST_BYTE = 0x11
 
