@@ -266,7 +266,10 @@ _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 
 
 def retry_bluetooth_connection_error(
-    func: WrapFuncType | None = None, *, attempts: int = DEFAULT_ATTEMPTS
+    func: WrapFuncType | None = None,
+    *,
+    attempts: int = DEFAULT_ATTEMPTS,
+    lock_operation: bool = False,
 ) -> Any:
     """
     Define a wrapper to retry on bleak error.
@@ -275,22 +278,29 @@ def retry_bluetooth_connection_error(
     we need to retry the operation. Use bare as
     ``@retry_bluetooth_connection_error`` for the default attempt count, or
     ``@retry_bluetooth_connection_error(attempts=N)`` to override it.
+    With ``lock_operation=True`` a failure that would be retried ends the
+    attempts as ``OperationIncompleteError`` instead while a jam or setup
+    condition the lock reported takes precedence.
     """
     if func is None:
-        return functools.partial(retry_bluetooth_connection_error, attempts=attempts)
+        return functools.partial(
+            retry_bluetooth_connection_error,
+            attempts=attempts,
+            lock_operation=lock_operation,
+        )
 
     async def _async_wrap_retry_bluetooth_connection_error(
         self: PushLock, *args: Any, **kwargs: Any
     ) -> Any:
         _LOGGER.debug("%s: Starting retry loop", self.name)
         max_attempts = attempts - 1
-        auth_error: AuthError | None = None
+        last_error: Exception | None = None
 
         for attempt in range(attempts):
             try:
                 return await func(self, *args, **kwargs)
             except AuthError as err:
-                auth_error = err
+                last_error = err
                 _AUTH_FAILURE_HISTORY.auth_failed(self.address)
                 if _AUTH_FAILURE_HISTORY.should_raise(self.address):
                     # If the bluetooth connection drops in the middle of authentication
@@ -299,20 +309,13 @@ def retry_bluetooth_connection_error(
                     # changed and we should re-authenticate.
                     self._update_any_state([AuthState(successful=False)])
                     raise
-                _LOGGER.debug(
-                    "%s: Auth error calling %s, retrying (%s/%s)...",
-                    self.name,
-                    func,
-                    attempt,
-                    max_attempts,
-                    exc_info=True,
-                )
-                await asyncio.sleep(0.25)
+                backoff = 0.25
             except BleakNotFoundError:
                 # The lock cannot be found so there is no
                 # point in retrying.
                 raise
             except RETRYABLE_EXCEPTIONS as err:
+                last_error = err
                 await self._async_handle_disconnected(err)
                 if attempt >= max_attempts:
                     _LOGGER.debug(
@@ -330,21 +333,31 @@ def retry_bluetooth_connection_error(
                 # Backoff-class errors (BleakDBusError, DisconnectedError) get
                 # a brief pause so the BLE stack can settle before reconnecting.
                 backoff = 0.25 if isinstance(err, RETRY_BACKOFF_EXCEPTIONS) else 0
+            if attempt < max_attempts:
+                # No further attempt sends the command into a mechanism the lock
+                # reported as needing attention, whatever position it has
+                # reported since.
+                if lock_operation and self._jam_takes_precedence():
+                    raise OperationIncompleteError(
+                        f"{self.name}: a jam or setup condition the lock reported "
+                        f"takes precedence over the command, whose attempt ended "
+                        f"with {last_error!r}; it was not retried"
+                    ) from last_error
                 _LOGGER.debug(
                     "%s: %s error calling %s, retrying in %ss (%s/%s)...",
                     self.name,
-                    type(err),
+                    type(last_error),
                     func,
                     backoff,
                     attempt,
                     max_attempts,
-                    exc_info=True,
+                    exc_info=last_error,
                 )
                 if backoff:
                     await asyncio.sleep(backoff)
         # Below the re-auth latch an auth failure is read as a link dropped
         # mid-authentication, so the exhausted attempts fail as a disconnect.
-        raise DisconnectedError(str(auth_error)) from auth_error
+        raise DisconnectedError(str(last_error)) from last_error
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
@@ -948,7 +961,7 @@ class PushLock:
         return incoming
 
     # Only called from _run_lock_operation, which holds the operation lock.
-    @retry_bluetooth_connection_error
+    @retry_bluetooth_connection_error(lock_operation=True)
     async def _execute_lock_operation(
         self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
     ) -> None:
@@ -972,26 +985,7 @@ class PushLock:
                     self._operation_result, complete_state
                 ),
             )
-        except OperationIncompleteError:
-            # Re-raised as is; the arm below would wrap it while a jam takes
-            # precedence.
-            _LOGGER.debug(
-                "%s: %s did not complete; the result never arrived",
-                self.name,
-                op_attr,
-            )
-            raise
         except Exception as ex:
-            # A retry would drive the motor into a mechanism the lock reported as
-            # needing attention, so the attempts end with a type outside the
-            # retry set. The display is not consulted: a position the lock
-            # answers right after a jam does not make a re-send safe.
-            if self._jam_takes_precedence():
-                raise OperationIncompleteError(
-                    f"{self.name}: a jam or setup condition the lock reported takes "
-                    f"precedence over {op_attr}, whose attempt ended with {ex!r}; the "
-                    f"command was not retried"
-                ) from ex
             # Closed so a status the lock reports before the retry is admitted.
             self._close_operation_window()
             _LOGGER.debug(
