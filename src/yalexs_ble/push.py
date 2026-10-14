@@ -134,8 +134,7 @@ UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 # Statuses that report a position the lock is holding; the attention statuses
 # qualify because they end only by hand, and UNLATCHED because the lock holds
 # it for the dwell. Any other status must stay out of _seen_this_session so the
-# follow-up lock_status() poll runs, and _finalize_operation reads the set
-# again to pick that poll's delay.
+# follow-up lock_status() poll runs.
 POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
     LockStatus.LOCKED,
     LockStatus.UNLOCKED,

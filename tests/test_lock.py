@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import inspect
 import logging
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -11,7 +10,6 @@ from bleak.exc import BleakError
 from bleak_retry_connector import BLEDevice
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-import yalexs_ble
 from yalexs_ble import util
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
@@ -48,14 +46,11 @@ from yalexs_ble.lock import (
     convert_voltage_to_percentage,
 )
 from yalexs_ble.session import (
-    OPERATION_RESPONSE_TIMEOUT,
     DisconnectedError,
     KeycodeError,
     OperationIncompleteError,
-    OperationProgress,
     ResponseError,
     Session,
-    UnlatchError,
 )
 from yalexs_ble.util import _simple_checksum
 
@@ -1536,6 +1531,9 @@ def _ack_frame(opcode: int, operation_byte: int) -> bytes:
     return _with_checksum(frame.hex())
 
 
+UNLATCH_ACK = _ack_frame(Commands.UNLOCK, UNLATCH_OPERATION_BYTE)
+
+
 def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -> bytes:
     """A 0xBB op-response carrying the operation result in byte[15]."""
     frame = bytearray(0x12)
@@ -1549,7 +1547,7 @@ async def _drive_operation(
     lock: Lock,
     op_attr: str,
     opcode: int,
-    ack: bytes,
+    ack: bytes | None,
     before_ack: bytes | None = None,
     before_response: bytes | None = None,
     result: int = OperationError.COMM_SUCCESS,
@@ -1570,10 +1568,11 @@ async def _drive_operation(
             session._notify(0, bytearray(before_ack))
             assert session._ack_future is not None, "taken for the acknowledgment"
             await asyncio.sleep(0)
-        session._notify(0, bytearray(ack))
-        assert session._ack_future is None, "the acknowledgment was not matched"
-        events.append("ack")
-        await asyncio.sleep(0)
+        if ack is not None:
+            session._notify(0, bytearray(ack))
+            assert session._ack_future is None, "the acknowledgment was not matched"
+            events.append("ack")
+            await asyncio.sleep(0)
         if before_response is not None:
             session._notify(0, bytearray(before_response))
             assert session._notify_future is not None, "taken for the op-response"
@@ -1614,11 +1613,7 @@ def test_parse_operation_ack_reports_no_state(
         ("force_lock", Commands.LOCK, LOCK_ACK),
         ("force_unlock", Commands.UNLOCK, UNLOCK_ACK),
         ("force_securemode", Commands.LOCK, SECUREMODE_ACK),
-        (
-            "force_unlatch",
-            Commands.UNLOCK,
-            _ack_frame(Commands.UNLOCK, UNLATCH_OPERATION_BYTE),
-        ),
+        ("force_unlatch", Commands.UNLOCK, UNLATCH_ACK),
     ],
     ids=["lock", "unlock", "securemode", "unlatch"],
 )
@@ -1726,151 +1721,25 @@ async def test_public_unlatch_wrapper_runs_force_unlatch() -> None:
     mock_status.assert_not_awaited()
 
 
-def _lock_with_operation(
-    side_effect: Callable[..., Any] | BaseException | None = None,
-) -> tuple[Lock, AsyncMock]:
-    """A connected Lock and the AsyncMock that replaces its _execute_operation."""
-    lock = _lock_with_session(MagicMock())
-    execute = AsyncMock(
-        return_value=OperationError.COMM_SUCCESS, side_effect=side_effect
-    )
-    lock._execute_operation = execute  # type: ignore[method-assign]
-    return lock, execute
-
-
-def _raise_after_write(error: BaseException) -> Callable[..., None]:
-    """An _execute_operation side effect that marks the write attempted and raises."""
-
-    def _fail(*args: Any, progress: OperationProgress, **kwargs: Any) -> None:
-        progress.write_attempted = True
-        raise error
-
-    return _fail
-
-
-@pytest.mark.asyncio
-async def test_every_operation_runs_with_its_op_response_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Each force_* hands _execute_operation its encoding, budget, and wait_for_ack."""
-    monkeypatch.setattr("yalexs_ble.lock.UNLATCH_OPERATION_RESPONSE_TIMEOUT", 21.5)
-    lock, execute = _lock_with_operation()
-    signature = inspect.signature(Lock._execute_operation)
-    sent: dict[str, tuple[int, int, float, bool]] = {}
-
-    for force in (
-        lock.force_lock,
-        lock.force_unlock,
-        lock.force_securemode,
-        lock.force_unlatch,
-    ):
-        await force()
-        call = signature.bind(lock, *execute.call_args.args, **execute.call_args.kwargs)
-        call.apply_defaults()
-        sent[call.arguments["command_name"]] = (
-            call.arguments["opcode"],
-            call.arguments["operation_byte"],
-            call.arguments["response_timeout"],
-            call.arguments["wait_for_ack"],
-        )
-
-    assert sent == {
-        "force_lock": (0x0B, 0x00, OPERATION_RESPONSE_TIMEOUT, True),
-        "force_unlock": (0x0A, 0x00, OPERATION_RESPONSE_TIMEOUT, True),
-        "force_securemode": (0x0B, 0x04, OPERATION_RESPONSE_TIMEOUT, True),
-        "force_unlatch": (0x0A, 0x0A, 21.5, False),
-    }
-
-
 @pytest.mark.asyncio
 async def test_an_unlatch_completes_without_an_acknowledgment(
     caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unlatch with no acknowledgment completes on its op-response and logs it."""
-    monkeypatch.setattr("yalexs_ble.lock.UNLATCH_OPERATION_RESPONSE_TIMEOUT", 21.5)
     lock = _make_connected_lock_with_session()
-    session = lock.session
-    assert session is not None
-
-    async def feed() -> None:
-        await _spin_until(lambda: session._ack_future is not None)
-        session._notify(0, bytearray(_op_response_frame(Commands.UNLOCK)))
-
-    feeder = asyncio.create_task(feed())
-    with (
-        patch.object(
-            session, "execute_operation", wraps=session.execute_operation
-        ) as spy,
-        caplog.at_level("INFO", logger="yalexs_ble.session"),
-    ):
-        await lock.force_unlatch()
-    await feeder
-
-    assert spy.call_args.kwargs["wait_for_ack"] is False
-    assert spy.call_args.kwargs["response_timeout"] == 21.5
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        events = await _drive_operation(lock, "force_unlatch", Commands.UNLOCK, None)
+    assert events == ["write_success", "result True", "op_response"]
     assert "completed on its op-response; no acknowledgment was received" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_force_unlatch_failure_before_write_stays_retryable() -> None:
-    """A failure before the command write propagates unchanged and stays retryable."""
-    lock, _ = _lock_with_operation(DisconnectedError("dropped before the write"))
-    with pytest.raises(DisconnectedError):
-        await lock.force_unlatch()
-
-
-@pytest.mark.asyncio
-async def test_force_unlatch_converts_a_raising_write_through_the_session() -> None:
-    """A raising GATT write reaches the caller as UnlatchError, session included."""
+async def test_force_unlatch_does_not_retry_a_raising_write() -> None:
+    """A raising GATT write ends an unlatch as OperationIncompleteError."""
     lock = _make_connected_lock_with_session()
     assert lock.client is not None
     lock.client.write_gatt_char = AsyncMock(side_effect=BleakError("write failed"))
 
-    with pytest.raises(UnlatchError) as excinfo:
+    with pytest.raises(OperationIncompleteError) as excinfo:
         await lock.force_unlatch()
     assert isinstance(excinfo.value.__cause__, BleakError)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error",
-    [
-        TimeoutError("no op-response after the write"),
-        BleakError("link dropped during the write"),
-        EOFError("dbus socket closed"),
-        BrokenPipeError("dbus socket closed"),
-        AttributeError("backend went away mid-write"),
-        ValueError("an error from nowhere near the retry set"),
-        TimeoutError(),
-        EOFError(),
-    ],
-)
-async def test_force_unlatch_converts_every_post_write_failure(
-    error: Exception,
-) -> None:
-    """Failures inside and outside the retry set convert alike after the write.
-
-    The message ends with the failure's repr, so one without a message is named.
-    """
-    lock, _ = _lock_with_operation(_raise_after_write(error))
-    with pytest.raises(UnlatchError) as excinfo:
-        await lock.force_unlatch()
-    assert excinfo.value.__cause__ is error
-    assert str(excinfo.value).endswith(repr(error))
-
-
-@pytest.mark.asyncio
-async def test_force_unlatch_operation_incomplete_is_not_converted() -> None:
-    """OperationIncompleteError after the write propagates as itself, unwrapped."""
-    error = OperationIncompleteError("acked but no op-response")
-    lock, _ = _lock_with_operation(_raise_after_write(error))
-    with pytest.raises(type(error)) as excinfo:
-        await lock.force_unlatch()
-    assert excinfo.value is error
-
-
-def test_unlatch_error_is_reachable_from_the_package_root() -> None:
-    """UnlatchError is exported from the package root."""
-    assert yalexs_ble.UnlatchError is UnlatchError
-    assert "UnlatchError" in yalexs_ble.__all__

@@ -74,7 +74,6 @@ from yalexs_ble.session import (
     OperationIncompleteError,
     ResponseError,
     Session,
-    UnlatchError,
 )
 from yalexs_ble.util import _simple_checksum
 
@@ -4107,7 +4106,7 @@ async def test_window_admits_the_door_member():
     ("exc", "op_attr", "operation"),
     [
         (DisconnectedError("dropped before write"), "force_lock", "lock"),
-        (UnlatchError("errored write"), "force_unlatch", "unlatch"),
+        (OperationIncompleteError("errored write"), "force_unlatch", "unlatch"),
     ],
 )
 async def test_failure_before_write_success_closes_window_displays_unknown(
@@ -4136,7 +4135,7 @@ async def test_failure_before_write_success_closes_window_displays_unknown(
     ("exc", "op_attr", "operation"),
     [
         (OperationIncompleteError("no op-response"), "force_lock", "lock"),
-        (UnlatchError("after write"), "force_unlatch", "unlatch"),
+        (OperationIncompleteError("after write"), "force_unlatch", "unlatch"),
         (OperationIncompleteError("no op-response"), "force_securemode", "securemode"),
     ],
 )
@@ -5996,11 +5995,9 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         opcode: int,
         operation_byte: int,
         command_name: str,
-        response_timeout: float = 0.0,
-        progress: object | None = None,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
-        wait_for_ack: bool = True,
+        retry_after_write: bool = True,
     ) -> int:
         handed.append(write_success_callback)
         if write_success_callback is not None:

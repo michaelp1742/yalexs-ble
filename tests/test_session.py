@@ -25,7 +25,6 @@ from yalexs_ble.session import (
     COOLDOWN_TIME,
     OPERATION_RESPONSE_TIMEOUT,
     RESPONSE_FRAME_LEN,
-    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
     KeycodeError,
@@ -33,7 +32,6 @@ from yalexs_ble.session import (
     OperationProgress,
     ResponseError,
     Session,
-    UnlatchError,
 )
 
 # Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
@@ -1231,7 +1229,7 @@ async def test_execute_operation_ack_timeout(
 async def test_the_no_ack_wait_completes_on_the_op_response_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """wait_for_ack=False waits for the op-response alone, for the whole budget."""
+    """A command not retried after its write waits on the op-response alone."""
     session, _ = _make_operation_session()
     op_response = _with_checksum(_OP_RESPONSE_UNLOCK_OK)
     # A pinned clock makes the recorded op-response wait the whole budget.
@@ -1248,14 +1246,49 @@ async def test_the_no_ack_wait_completes_on_the_op_response_alone(
         "force_unlatch",
         ack_matcher=_ack_matcher(0x0A, 0x0A),
         response_matcher=_operation_response_matcher(0x0A),
-        response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+        response_timeout=OPERATION_RESPONSE_TIMEOUT,
         progress=OperationProgress(),
-        wait_for_ack=False,
+        retry_after_write=False,
     )
     await feeder
 
     assert result == bytes(op_response)
-    assert stage_waits == [pytest.approx(UNLATCH_OPERATION_RESPONSE_TIMEOUT)]
+    assert stage_waits == [pytest.approx(OPERATION_RESPONSE_TIMEOUT)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "retry_after_write", [True, False], ids=["retried", "not-retried"]
+)
+async def test_a_failure_after_the_write_is_final_only_when_not_retried(
+    retry_after_write: bool,
+) -> None:
+    """A disconnect after the write is final only for a command not retried."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        _fire_disconnect(session)
+
+    feeder = asyncio.create_task(feed())
+    expected = DisconnectedError if retry_after_write else OperationIncompleteError
+    with pytest.raises(expected) as exc_info:
+        await session.execute_operation(
+            session.build_operation_command(Commands.UNLOCK, 0x0A),
+            "force_unlatch",
+            ack_matcher=_ack_matcher(0x0A, 0x0A),
+            response_matcher=_operation_response_matcher(0x0A),
+            response_timeout=5.0,
+            progress=progress,
+            retry_after_write=retry_after_write,
+        )
+    await feeder
+
+    assert progress.write_attempted and not progress.acknowledged
+    if not retry_after_write:
+        assert isinstance(exc_info.value.__cause__, DisconnectedError)
+        assert "its write was attempted" in str(exc_info.value)
 
 
 def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
@@ -1269,50 +1302,33 @@ def test_ack_timeout_outlasts_the_link_supervision_timeout() -> None:
     assert ACK_TIMEOUT > SLOW_TIMEOUT / 100
 
 
-@pytest.mark.parametrize(
-    "budget",
-    [OPERATION_RESPONSE_TIMEOUT, UNLATCH_OPERATION_RESPONSE_TIMEOUT],
-    ids=["plain", "unlatch"],
-)
-def test_operation_response_timeout_outlasts_the_acknowledgment_budget(
-    budget: float,
-) -> None:
-    """Every op-response budget must exceed the acknowledgment budget.
+def test_operation_response_timeout_outlasts_the_acknowledgment_budget() -> None:
+    """The op-response budget must exceed the acknowledgment budget.
 
-    Both stage deadlines run from the command issue, so everything the
-    acknowledgment stage consumes comes out of the op-response budget; a
-    budget at or below ACK_TIMEOUT could reach stage 2 with nothing left and
-    fail the operation the moment the acknowledgment lands. ACK_TIMEOUT still
-    bounds the unlatch's GATT write, so the same floor holds there.
+    Both deadlines run from the command issue, so a budget at or below
+    ACK_TIMEOUT could reach the op-response wait with nothing left.
     """
-    assert budget > ACK_TIMEOUT
+    assert OPERATION_RESPONSE_TIMEOUT > ACK_TIMEOUT
 
 
-@pytest.mark.parametrize(
-    "error_type",
-    [OperationIncompleteError, UnlatchError],
-    ids=["incomplete", "unlatch"],
-)
-def test_non_retryable_errors_pass_the_retry_decorator(
-    error_type: type[Exception],
-) -> None:
-    """Both types are outside the retry set, so they end the attempts."""
-    assert not issubclass(error_type, RETRYABLE_EXCEPTIONS)
+def test_operation_incomplete_error_passes_the_retry_decorator() -> None:
+    """OperationIncompleteError is outside the retry set, so it ends the attempts."""
+    assert not issubclass(OperationIncompleteError, RETRYABLE_EXCEPTIONS)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("wait_for_ack", "ack_delivered"),
+    ("retry_after_write", "ack_delivered"),
     [(True, True), (False, True), (False, False)],
-    ids=["acknowledged", "unlatch-acknowledged", "unlatch-never-acknowledged"],
+    ids=["acknowledged", "no-retry-acknowledged", "no-retry-never-acknowledged"],
 )
 async def test_execute_operation_op_response_timeout(
-    wait_for_ack: bool, ack_delivered: bool
+    retry_after_write: bool, ack_delivered: bool
 ) -> None:
     """No op-response raises the non-retryable error; a missing ack is named in it."""
     session, client = _make_operation_session()
     progress = OperationProgress()
-    if wait_for_ack:
+    if retry_after_write:
         command = session.build_operation_command(Commands.LOCK, 0x04)
         command_name, opcode, operation_byte = "force_securemode", 0x0B, 0x04
         ack = _with_checksum(_ACK_SECUREMODE)
@@ -1335,7 +1351,7 @@ async def test_execute_operation_op_response_timeout(
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=0.1,
             progress=progress,
-            wait_for_ack=wait_for_ack,
+            retry_after_write=retry_after_write,
         )
     await feeder
 
@@ -1669,7 +1685,7 @@ async def test_a_result_recovered_at_a_disconnect_still_logs_a_missing_acknowled
             response_matcher=_operation_response_matcher(0x0A),
             response_timeout=5.0,
             progress=progress,
-            wait_for_ack=False,
+            retry_after_write=False,
         )
     await feeder
 
