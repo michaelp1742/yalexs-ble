@@ -74,7 +74,9 @@ DISCONNECT_DELAY = 5.1
 # How long to wait to disconnect after an operation if there is a pending update
 DISCONNECT_DELAY_PENDING_UPDATE = 12.5
 
-KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
+# The lock drops an idle link after this long.
+IDLE_DISCONNECT_TIME = 30.0
+KEEP_ALIVE_TIME = 25.0
 
 # Reconnect delay while updates keep failing; doubles per failure up to the
 # cap. A state-changing advertisement still pulls an update earlier.
@@ -146,6 +148,11 @@ POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
     LockStatus.UNLATCHED,
     LockStatus.SECUREMODE,
 }
+
+# Statuses the lock reports while the motor runs.
+TRANSITIONAL_READINGS = frozenset(
+    {LockStatus.LOCKING, LockStatus.UNLOCKING, LockStatus.UNLATCHING}
+)
 
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
@@ -691,6 +698,7 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            op_response_callback=self._hold_update,
         )
 
     def _disconnected_callback(self) -> None:
@@ -720,10 +728,50 @@ class PushLock:
             return
         _LOGGER.debug("%s: Executing keep alive", self.name)
         if not self._update_in_flight():
+            if self.is_connected and self._floor_outlasts_the_link():
+                # A read that returns no position keeps the link up when the
+                # floor's end would come after the lock's idle cutoff.
+                self.background_task(self._keep_link_alive())
             # Debounced so a backoff longer than KEEP_ALIVE_TIME is not pushed
             # out on every tick; a running update re-arms on its own exit.
             self._schedule_future_update_with_debounce(self._reconnect_backoff)
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
+
+    async def _keep_link_alive(self) -> None:
+        """Send a read that returns no position: the battery, or else the door."""
+        async with self._operation_lock:
+            if (
+                not self._running
+                or not self.is_connected
+                or not self._floor_outlasts_the_link()
+            ):
+                return
+            # Connected, so this hands back the link without a connect.
+            lock = await self._ensure_connected()
+            info = self._lock_info
+            if info is None:
+                return
+            try:
+                asked = await self._poll_battery(lock, force=True)
+                if not asked and info.door_sense:
+                    await lock.door_status()
+                    asked = True
+            except (TimeoutError, *RETRYABLE_EXCEPTIONS) as ex:
+                # The cycle at the floor's end retries and reports the link.
+                _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+                return
+            if asked:
+                # A request, so the floor check and the keep-alive count from it.
+                self._last_operation_complete_time = time.monotonic()
+                self._reschedule_next_keep_alive()
+
+    def _floor_outlasts_the_link(self) -> bool:
+        """Whether the cycle at the floor's end would come after the idle cutoff."""
+        # A second of margin for the request to reach the lock.
+        return (
+            self._earliest_update_time - self._last_operation_complete_time
+            > IDLE_DISCONNECT_TIME - 1.0
+        )
 
     def _clear_reconnect_backoff(self) -> None:
         """A completed update or operation proves the link; drop the backoff."""
@@ -1018,7 +1066,7 @@ class PushLock:
         self._close_operation_window()
         # Set before the stop check so a restarted watcher inherits them.
         self._force_lock_status_poll = True
-        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        self._hold_update()
         if not self._running:
             # Stopped mid-operation: a cycle armed now would outlive the stop.
             # A restarted watcher polls the lock afresh, so a report from before
@@ -1092,6 +1140,9 @@ class PushLock:
 
         None refuses the value, so nothing from it is applied.
         """
+        if incoming in TRANSITIONAL_READINGS:
+            # A lock polled mid-motion answers with the position it is leaving.
+            self._hold_update()
         if incoming in MANUAL_INTERVENTION_STATUSES:
             now = time.monotonic()
             self._last_jam_event_time = now
@@ -1444,12 +1495,13 @@ class PushLock:
         self._clear_reconnect_backoff()
         _LOGGER.debug("%s: Finished validate", self.name)
 
-    async def _poll_battery(self, lock: Lock) -> bool:
+    async def _poll_battery(self, lock: Lock, *, force: bool = False) -> bool:
         """Poll battery if needed: periodic refresh, cooldown, errors.
 
         Battery state requires a poll of the lock to update. In always_connected mode
         _seen_this_session never clears, so once the refresh deadline passes
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
+        force asks even when the reading is current.
 
         Returns True if the lock was asked, whether or not it answered.
         """
@@ -1480,7 +1532,7 @@ class PushLock:
             and now > self._next_battery_refresh_time
         ):
             self._seen_this_session.discard(BatteryState)
-        if BatteryState in self._seen_this_session:
+        if not force and BatteryState in self._seen_this_session:
             return False
 
         try:
@@ -2039,6 +2091,10 @@ class PushLock:
             ) from ex
         finally:
             self._first_update_future = None
+
+    def _hold_update(self) -> None:
+        """Hold update cycles off for the stale-state debounce from now."""
+        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""

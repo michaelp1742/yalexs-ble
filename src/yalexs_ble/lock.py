@@ -274,6 +274,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        op_response_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -286,6 +287,8 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # Called on every LOCK/UNLOCK op-response, ours or not.
+        self._op_response_callback = op_response_callback
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -385,6 +388,8 @@ class Lock:
                 and len(state) > RESULT_BYTE
             ):
                 result = state[RESULT_BYTE]
+                if self._op_response_callback is not None:
+                    self._op_response_callback()
                 if result != OperationError.COMM_SUCCESS:
                     solicited = self.session is not None and (
                         self.session.awaits_op_response(state)
