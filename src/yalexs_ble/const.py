@@ -196,7 +196,8 @@ class LockState:
     # Hold the previous auto lock state so that it can be restored if auto lock
     # is enabled
     auto_lock_prev: AutoLockState | None
-    # The secure lock, projected from the same status; never SECUREMODE.
+    # Status of the secure lock: LOCKED when the lock is in securemode, so
+    # SECUREMODE itself never appears here.
     secure: LockStatus = LockStatus.UNKNOWN
 
 
