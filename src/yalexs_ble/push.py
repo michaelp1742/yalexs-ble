@@ -1249,7 +1249,9 @@ class PushLock:
     def _display(self, display: _Display) -> None:
         """Put an operation's display up; it is not a report, so no admission."""
         _LOGGER.debug("%s: Displaying %s", self.name, display)
-        if not {display.lock, display.secure} <= POSITION_READINGS:
+        if {display.lock, display.secure} <= POSITION_READINGS:
+            self._seen_this_session.add(LockStatus)
+        else:
             # An unsettled display must not suppress the follow-up poll.
             self._seen_this_session.discard(LockStatus)
         lock_state = self._get_current_state()
