@@ -74,7 +74,9 @@ DISCONNECT_DELAY = 5.1
 # How long to wait to disconnect after an operation if there is a pending update
 DISCONNECT_DELAY_PENDING_UPDATE = 12.5
 
-KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
+# The lock drops an idle link after this long.
+IDLE_DISCONNECT_TIME = 30.0
+KEEP_ALIVE_TIME = 25.0
 
 # Reconnect delay while updates keep failing; doubles per failure up to the
 # cap. A state-changing advertisement still pulls an update earlier.
@@ -726,9 +728,9 @@ class PushLock:
             return
         _LOGGER.debug("%s: Executing keep alive", self.name)
         if not self._update_in_flight():
-            if self.is_connected and self._floor_holds():
-                # The floor delays the cycle past the lock's idle cutoff; a read
-                # the floor allows keeps the link up until the cycle runs.
+            if self.is_connected and self._floor_outlasts_the_link():
+                # A read that returns no position keeps the link up when the
+                # floor's end would come after the lock's idle cutoff.
                 self.background_task(self._keep_link_alive())
             # Debounced so a backoff longer than KEEP_ALIVE_TIME is not pushed
             # out on every tick; a running update re-arms on its own exit.
@@ -736,31 +738,33 @@ class PushLock:
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
 
     async def _keep_link_alive(self) -> None:
-        """Read the battery, or the door where the battery is off limits.
-
-        Neither answers with a position. The battery cooldown applies here too,
-        so a lock that times out battery reads does not hold the operation lock
-        through the timeout; the door stands in, on a lock that senses it.
-        """
+        """Send a read that returns no position: the battery, or else the door."""
         async with self._operation_lock:
-            if not self._running or not self.is_connected:
+            if (
+                not self._running
+                or not self.is_connected
+                or not self._floor_outlasts_the_link()
+            ):
                 return
+            # Connected, so this hands back the link without a connect.
+            lock = await self._ensure_connected()
             info = self._lock_info
-            now = time.monotonic()
-            battery_allowed = (
-                info is None or info.model not in NO_BATTERY_SUPPORT_MODELS
-            ) and now >= self._earliest_battery_attempt_time
-            if not battery_allowed and (info is None or not info.door_sense):
+            if info is None:
                 return
             try:
-                lock = await self._ensure_connected()
-                if battery_allowed:
-                    await self._read_battery(lock, now)
-                else:
+                if not await self._poll_battery(lock, force=True) and info.door_sense:
                     await lock.door_status()
             except Exception as ex:
                 # The cycle at the floor's end retries and reports the link.
                 _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+
+    def _floor_outlasts_the_link(self) -> bool:
+        """Whether the cycle at the floor's end would come after the idle cutoff."""
+        # A second of margin for the request to reach the lock.
+        return (
+            self._earliest_update_time - self._last_operation_complete_time
+            > IDLE_DISCONNECT_TIME - 1.0
+        )
 
     def _clear_reconnect_backoff(self) -> None:
         """A completed update or operation proves the link; drop the backoff."""
@@ -1484,12 +1488,13 @@ class PushLock:
         self._clear_reconnect_backoff()
         _LOGGER.debug("%s: Finished validate", self.name)
 
-    async def _poll_battery(self, lock: Lock) -> bool:
+    async def _poll_battery(self, lock: Lock, *, force: bool = False) -> bool:
         """Poll battery if needed: periodic refresh, cooldown, errors.
 
         Battery state requires a poll of the lock to update. In always_connected mode
         _seen_this_session never clears, so once the refresh deadline passes
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
+        force asks even when the reading is current.
 
         Returns True if the lock was asked, whether or not it answered.
         """
@@ -1520,14 +1525,9 @@ class PushLock:
             and now > self._next_battery_refresh_time
         ):
             self._seen_this_session.discard(BatteryState)
-        if BatteryState in self._seen_this_session:
+        if not force and BatteryState in self._seen_this_session:
             return False
 
-        await self._read_battery(lock, now)
-        return True
-
-    async def _read_battery(self, lock: Lock, now: float) -> None:
-        """Read the battery; a timeout starts the cooldown, a link error is logged."""
         try:
             await lock.battery()
             self._record_auth_success()
@@ -1548,6 +1548,8 @@ class PushLock:
                 self.name,
                 err,
             )
+
+        return True
 
     async def _probe_lock_info(self, lock: Lock) -> LockInfo:
         """Probe the lock for info, falling back to defaults on failure."""
@@ -2086,10 +2088,6 @@ class PushLock:
     def _hold_update(self) -> None:
         """Hold update cycles off for the stale-state debounce from now."""
         self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
-
-    def _floor_holds(self) -> bool:
-        """Whether the update floor still holds cycles off."""
-        return time.monotonic() < self._earliest_update_time
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""
