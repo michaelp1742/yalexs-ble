@@ -726,10 +726,30 @@ class PushLock:
             return
         _LOGGER.debug("%s: Executing keep alive", self.name)
         if not self._update_in_flight():
+            if self.is_connected and self._floor_holds():
+                # The floor delays the cycle past the lock's idle cutoff; a read
+                # the floor allows keeps the link up until the cycle runs.
+                self.background_task(self._keep_link_alive())
             # Debounced so a backoff longer than KEEP_ALIVE_TIME is not pushed
             # out on every tick; a running update re-arms on its own exit.
             self._schedule_future_update_with_debounce(self._reconnect_backoff)
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
+
+    async def _keep_link_alive(self) -> None:
+        """Read the battery, or the door on a model without; neither is a position."""
+        async with self._operation_lock:
+            if not self._running or not self.is_connected:
+                return
+            lock = await self._ensure_connected()
+            info = self._lock_info
+            try:
+                if info is not None and info.model in NO_BATTERY_SUPPORT_MODELS:
+                    await lock.door_status()
+                else:
+                    await lock.battery()
+            except Exception as ex:
+                # The cycle at the floor's end retries and reports the link.
+                _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
 
     def _clear_reconnect_backoff(self) -> None:
         """A completed update or operation proves the link; drop the backoff."""
@@ -2052,6 +2072,10 @@ class PushLock:
     def _hold_update(self) -> None:
         """Hold update cycles off for the stale-state debounce from now."""
         self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+    def _floor_holds(self) -> bool:
+        """Whether the update floor still holds cycles off."""
+        return time.monotonic() < self._earliest_update_time
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""

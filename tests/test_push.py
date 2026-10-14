@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1309,6 +1309,85 @@ async def test_keep_alive_schedules_update_and_next_when_always_connected() -> N
 
     mock_schedule_update.assert_called_once_with(0)
     mock_next_keep_alive.assert_called_once()
+
+
+def _connected_always_on_lock(address: str, model: str = "ASL-03") -> PushLock:
+    """A running, connected always-connected lock with lock info for model."""
+    push_lock = _named_push_lock(address, always_connected=True)
+    push_lock._running = True
+    push_lock._lock_info = LockInfo("August", model, "12345", "1.0")
+    push_lock._client = MagicMock(is_connected=True)
+    return push_lock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "read"),
+    [("ASL-03", "battery"), ("SL-103", "door_status")],
+    ids=["battery", "door-on-a-model-without-a-battery-read"],
+)
+async def test_keep_alive_under_the_floor_sends_a_read_the_floor_allows(
+    model: str, read: str
+) -> None:
+    """Under a live floor the keep-alive reads the battery or door, not the status."""
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:07", model)
+    mock_lock = MagicMock(
+        battery=AsyncMock(), door_status=AsyncMock(), lock_status=AsyncMock()
+    )
+    push_lock._hold_update()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        push_lock._keep_alive()
+        await asyncio.gather(*push_lock._background_tasks)
+
+    getattr(mock_lock, read).assert_awaited_once()
+    mock_lock.lock_status.assert_not_awaited()
+    # The status poll itself waits for the floor.
+    handle = push_lock._cancel_deferred_update
+    assert handle is not None
+    assert handle.when() - push_lock.loop.time() == pytest.approx(
+        LOCK_STALE_STATE_DEBOUNCE_DELAY, abs=0.5
+    )
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_without_a_floor_sends_no_extra_read() -> None:
+    """With no floor the keep-alive leaves every read to the cycle it schedules."""
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:08")
+    with patch.object(push_lock, "_ensure_connected", AsyncMock()) as ensure:
+        push_lock._keep_alive()
+        await asyncio.gather(*push_lock._background_tasks)
+    ensure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_read_yields_to_a_disconnect_and_contains_a_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The read is skipped once the link dropped and a failing read only logs."""
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:09")
+    client = cast(MagicMock, push_lock._client)
+    mock_lock = MagicMock(battery=AsyncMock(side_effect=BleakError("gone")))
+    push_lock._hold_update()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        async with push_lock._operation_lock:
+            push_lock._keep_alive()
+            client.is_connected = False
+        await asyncio.gather(*push_lock._background_tasks)
+        mock_lock.battery.assert_not_awaited()
+
+        client.is_connected = True
+        with caplog.at_level("DEBUG", logger="yalexs_ble.push"):
+            push_lock._keep_alive()
+            await asyncio.gather(*push_lock._background_tasks)
+
+    mock_lock.battery.assert_awaited_once()
+    assert "Keep-alive read failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -5098,14 +5177,12 @@ def _patched_clock() -> Iterator[list[float]]:
 
 
 def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMock]:
-    """A connected Lock on a real Session whose frames reach push_lock unencrypted."""
-    lock = Lock(
-        lambda: BLEDevice(push_lock.address, "lock"),
-        "0800200c9a66",
-        1,
-        push_lock.name,
-        push_lock._state_callback,
-    )
+    """A connected Lock on a real Session whose frames reach push_lock unencrypted.
+
+    Built as the push lock builds it, so every hook it wires is live.
+    """
+    push_lock._ble_device = MagicMock()
+    lock = push_lock._get_lock_instance()
     client = MagicMock(is_connected=True)
     session = Session(
         client, push_lock.name, asyncio.Lock(), set(), lock._internal_state_callback
