@@ -278,9 +278,8 @@ def retry_bluetooth_connection_error(
     we need to retry the operation. Use bare as
     ``@retry_bluetooth_connection_error`` for the default attempt count, or
     ``@retry_bluetooth_connection_error(attempts=N)`` to override it.
-    With ``lock_operation=True`` a failure that would be retried ends the
-    attempts as ``OperationIncompleteError`` instead while a jam or setup
-    condition the lock reported takes precedence.
+    ``lock_operation=True`` ends the attempts as ``OperationIncompleteError``
+    instead of retrying while a reported jam or setup condition takes precedence.
     """
     if func is None:
         return functools.partial(
@@ -334,15 +333,10 @@ def retry_bluetooth_connection_error(
                 # a brief pause so the BLE stack can settle before reconnecting.
                 backoff = 0.25 if isinstance(err, RETRY_BACKOFF_EXCEPTIONS) else 0
             if attempt < max_attempts:
-                # No further attempt sends the command into a mechanism the lock
-                # reported as needing attention, whatever position it has
-                # reported since.
-                if lock_operation and self._jam_takes_precedence():
-                    raise OperationIncompleteError(
-                        f"{self.name}: a jam or setup condition the lock reported "
-                        f"takes precedence over the command, whose attempt ended "
-                        f"with {last_error!r}; it was not retried"
-                    ) from last_error
+                # Never re-send into a mechanism the lock reported as needing
+                # attention, whatever position it has reported since.
+                if lock_operation:
+                    self._end_a_retry_under_precedence(last_error)
                 _LOGGER.debug(
                     "%s: %s error calling %s, retrying in %ss (%s/%s)...",
                     self.name,
@@ -362,6 +356,20 @@ def retry_bluetooth_connection_error(
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+# Plain positions and transitionals leave the secure lock unlocked; the wire
+# has no securing value, so only SECURING or SECUREMODE moves it.
+_SECURE_UNLOCKED_STATUSES = frozenset(
+    {
+        LockStatus.LOCKING,
+        LockStatus.UNLOCKING,
+        LockStatus.UNLATCHING,
+        LockStatus.LOCKED,
+        LockStatus.UNLOCKED,
+        LockStatus.UNLATCHED,
+    }
+)
+
+
 def _project_lock_status(
     reported: LockStatus,
     main: LockStatus,
@@ -369,8 +377,7 @@ def _project_lock_status(
 ) -> tuple[LockStatus, LockStatus]:
     """Project the reported status onto the (main, secure) lock pair.
 
-    For compatibility the main lock keeps SECUREMODE as its settled secured
-    position, and only a reported SECUREMODE marks the secure lock secured.
+    The main lock keeps SECUREMODE for compatibility.
     """
     if reported is LockStatus.SECURING:
         if main in (LockStatus.LOCKED, LockStatus.SECUREMODE):
@@ -378,16 +385,13 @@ def _project_lock_status(
         return LockStatus.LOCKING, LockStatus.LOCKING
     if reported is LockStatus.SECUREMODE:
         return LockStatus.SECUREMODE, LockStatus.LOCKED
-    if reported is LockStatus.LOCKING:
-        # A reported LOCKING never animates the secure lock; the wire has no
-        # securing value, so only a reported SECUREMODE secures it.
-        return reported, LockStatus.UNLOCKED
-    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING):
+    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING) and secure in (
+        LockStatus.LOCKED,
+        LockStatus.UNLOCKING,
+    ):
         # Already UNLOCKING covers a retried unlock's second stamp.
-        if secure in (LockStatus.LOCKED, LockStatus.UNLOCKING):
-            return reported, LockStatus.UNLOCKING
-        return reported, LockStatus.UNLOCKED
-    if reported in (LockStatus.LOCKED, LockStatus.UNLOCKED, LockStatus.UNLATCHED):
+        return reported, LockStatus.UNLOCKING
+    if reported in _SECURE_UNLOCKED_STATUSES:
         return reported, LockStatus.UNLOCKED
     # A jam, a setup condition, or an unknown position applies to both channels.
     return reported, reported
@@ -906,18 +910,16 @@ class PushLock:
             >= self._operation_issued_at - JAMMED_PRECEDENCE_TIME
         )
 
-    def _end_a_retry_under_precedence(self) -> None:
-        """End a retry before its write while a jam or setup condition takes precedence.
+    def _end_a_retry_under_precedence(self, failure: Exception | None) -> None:
+        """Refuse to retry a failed attempt while a reported jam takes precedence.
 
-        A first attempt is never ended here, so a command issued within the
-        precedence time still gets its first attempt.
+        A first attempt has no failure, so it always runs.
         """
-        failure = self._operation_failure
         if failure is not None and self._jam_takes_precedence():
             raise OperationIncompleteError(
                 f"{self.name}: a jam or setup condition the lock reported "
                 "takes precedence over the command, whose attempt ended with "
-                f"{failure!r}; the retry was not sent"
+                f"{failure!r}; it was not retried"
             ) from failure
 
     def _attention_holds_display(self, state: LockStatus) -> bool:
@@ -987,10 +989,8 @@ class PushLock:
         self._cancel_future_update()
         # Unsettled, or always-connected with the link down (this cycle is its
         # reconnect): poll once the motor has stopped, not at the keep-alive.
-        if (
-            self.lock_status in POSITION_READINGS
-            and self.secure_status not in (LockStatus.LOCKING, LockStatus.UNLOCKING)
-            and (self.is_connected or not self._always_connected)
+        if {self.lock_status, self.secure_status} <= POSITION_READINGS and (
+            self.is_connected or not self._always_connected
         ):
             delay = KEEP_ALIVE_TIME
         else:
@@ -1029,7 +1029,7 @@ class PushLock:
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
         try:
             lock = await self._ensure_connected()
-            self._end_a_retry_under_precedence()
+            self._end_a_retry_under_precedence(self._operation_failure)
             self._cancel_future_update()
             # Opened before the write: a status handled while the write is
             # awaited cannot be placed before or after the lock took the command.
@@ -1256,8 +1256,7 @@ class PushLock:
                     self._seen_this_session.discard(type(state))
                 if admitted is None:
                     continue
-                # Project every admitted status: securing a locked lock
-                # leaves lock unchanged but still moves secure.
+                # Securing a locked lock moves only secure, so project every status.
                 main, secure = _project_lock_status(
                     admitted, lock_state.lock, lock_state.secure
                 )

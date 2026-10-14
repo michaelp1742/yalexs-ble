@@ -134,9 +134,8 @@ class LockStatus(Enum):
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
     SECUREMODE = 0x0C
-    # Library-synthesized securing transitional, consumed by
-    # _project_lock_status so it never reaches a published LockState; wider
-    # than a byte so no frame decodes to it.
+    # Library-synthesized and never published; wider than a byte so no frame
+    # decodes to it.
     SECURING = 0x100
 
 

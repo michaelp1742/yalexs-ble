@@ -1557,8 +1557,7 @@ async def test_an_update_under_a_recent_jam_uses_every_attempt() -> None:
 @pytest.mark.asyncio
 async def test_an_auto_lock_write_under_a_recent_jam_is_retried() -> None:
     """An auto-lock write under a jam the lock just reported is retried."""
-    push_lock = _named_push_lock("aa:bb:cc:dd:ee:b5", always_connected=False)
-    push_lock._running = True
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:b5", always_connected=False)
     push_lock._update_any_state([LockStatus.JAMMED])
     mock_lock = MagicMock()
     mock_lock.set_auto_lock = AsyncMock(
