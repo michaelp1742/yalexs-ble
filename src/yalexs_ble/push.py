@@ -1061,11 +1061,6 @@ class PushLock:
         """Whether a reported jam or setup condition is within its display hold."""
         return time.monotonic() < self._jammed_hold_deadline
 
-    def _arm_jam_hold(self, now: float) -> None:
-        """Set the hold deadline and arm the timer that ends the hold."""
-        self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
-        self._schedule_jam_hold_timer(JAMMED_HOLD_TIME)
-
     def _schedule_jam_hold_timer(self, delay: float) -> None:
         self._cancel_jam_hold_timer()
         self._jam_hold_timer = self.loop.call_later(delay, self._jam_hold_ended)
@@ -1112,7 +1107,8 @@ class PushLock:
                     incoming,
                     JAMMED_HOLD_TIME,
                 )
-                self._arm_jam_hold(now)
+                self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
+                self._schedule_jam_hold_timer(JAMMED_HOLD_TIME)
             return incoming
         if self._operation_window_open:
             # The operation applies its own outcome, so a reading inside its
