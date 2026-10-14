@@ -196,6 +196,9 @@ class LockState:
     # Hold the previous auto lock state so that it can be restored if auto lock
     # is enabled
     auto_lock_prev: AutoLockState | None
+    # Status of the secure lock: LOCKED when the lock is in securemode, so
+    # SECUREMODE itself never appears here.
+    secure: LockStatus = LockStatus.UNKNOWN
 
 
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
