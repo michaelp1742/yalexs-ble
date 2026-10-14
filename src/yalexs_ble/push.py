@@ -356,52 +356,42 @@ def retry_bluetooth_connection_error(
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
-# Plain positions and transitionals leave the secure lock unlocked; the wire
-# has no securing value, so only a reported SECUREMODE secures it.
-_SECURE_UNLOCKED_STATUSES = frozenset(
-    {
-        LockStatus.LOCKING,
-        LockStatus.UNLOCKING,
-        LockStatus.UNLATCHING,
-        LockStatus.LOCKED,
-        LockStatus.UNLOCKED,
-        LockStatus.UNLATCHED,
-    }
-)
-
-
-def _project_lock_status(
-    reported: LockStatus, secure: LockStatus
-) -> tuple[LockStatus, LockStatus]:
-    """Project a reported status onto the (main, secure) lock pair.
-
-    The main lock keeps SECUREMODE for compatibility.
-    """
-    if reported is LockStatus.SECUREMODE:
-        return LockStatus.SECUREMODE, LockStatus.LOCKED
-    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING) and secure in (
-        LockStatus.LOCKED,
-        LockStatus.UNLOCKING,
-    ):
-        # Already UNLOCKING covers a retried unlock's second stamp.
-        return reported, LockStatus.UNLOCKING
-    if reported in _SECURE_UNLOCKED_STATUSES:
-        return reported, LockStatus.UNLOCKED
-    # A jam, a setup condition, or an unknown position applies to both channels.
-    return reported, reported
+# The secure lock a reported status settles to; a status absent here applies
+# to both locks.
+_SECURE_FOR_STATUS = {
+    LockStatus.SECUREMODE: LockStatus.LOCKED,
+    LockStatus.LOCKING: LockStatus.UNLOCKED,
+    LockStatus.LOCKED: LockStatus.UNLOCKED,
+    LockStatus.UNLOCKED: LockStatus.UNLOCKED,
+    LockStatus.UNLATCHED: LockStatus.UNLOCKED,
+}
 
 
 @dataclass(frozen=True)
 class _Display:
-    """The statuses an operation puts on the main and secure locks."""
+    """The statuses shown on the main and secure locks."""
 
     lock: LockStatus
     secure: LockStatus
 
-    @classmethod
-    def projected(cls, status: LockStatus, state: LockState) -> _Display:
-        """The display a reported status would give from state."""
-        return cls(*_project_lock_status(status, state.secure))
+    @property
+    def settled(self) -> bool:
+        """Whether both locks show a position the lock holds."""
+        return {self.lock, self.secure} <= POSITION_READINGS
+
+
+def _project_lock_status(reported: LockStatus, state: LockState) -> _Display:
+    """Project a reported status onto the display.
+
+    The main lock keeps SECUREMODE for compatibility.
+    """
+    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING):
+        # A secured lock's secure channel moves too; a retry's second stamp
+        # keeps it moving.
+        moving = state.secure in (LockStatus.LOCKED, LockStatus.UNLOCKING)
+        secure = LockStatus.UNLOCKING if moving else LockStatus.UNLOCKED
+        return _Display(reported, secure)
+    return _Display(reported, _SECURE_FOR_STATUS.get(reported, reported))
 
 
 def _securing_display(state: LockState) -> _Display:
@@ -413,27 +403,25 @@ def _securing_display(state: LockState) -> _Display:
 
 @dataclass(frozen=True)
 class _LockOperation:
-    """A mechanical command with its transitional and settled displays."""
+    """A mechanical command with its transitional display and settled status."""
 
     op_attr: str
     pending: Callable[[LockState], _Display]
-    complete: _Display
+    complete: LockStatus
 
 
 _LOCK_OPERATION = _LockOperation(
     "force_lock",
-    functools.partial(_Display.projected, LockStatus.LOCKING),
-    _Display(LockStatus.LOCKED, LockStatus.UNLOCKED),
+    functools.partial(_project_lock_status, LockStatus.LOCKING),
+    LockStatus.LOCKED,
 )
 _UNLOCK_OPERATION = _LockOperation(
     "force_unlock",
-    functools.partial(_Display.projected, LockStatus.UNLOCKING),
-    _Display(LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+    functools.partial(_project_lock_status, LockStatus.UNLOCKING),
+    LockStatus.UNLOCKED,
 )
 _SECUREMODE_OPERATION = _LockOperation(
-    "force_securemode",
-    _securing_display,
-    _Display(LockStatus.SECUREMODE, LockStatus.LOCKED),
+    "force_securemode", _securing_display, LockStatus.SECUREMODE
 )
 
 
@@ -943,10 +931,7 @@ class PushLock:
         )
 
     def _end_a_retry_under_precedence(self, failure: Exception | None) -> None:
-        """Refuse to retry a failed attempt while a reported jam takes precedence.
-
-        A first attempt has no failure, so it always runs.
-        """
+        """Refuse to retry a failed attempt while a reported jam takes precedence."""
         if failure is not None and self._jam_takes_precedence():
             raise OperationIncompleteError(
                 f"{self.name}: a jam or setup condition the lock reported "
@@ -982,9 +967,11 @@ class PushLock:
         self._close_operation_window()
         if not self._running or not succeeded:
             return
-        if self._attention_holds_display(operation.complete.lock):
+        if self._attention_holds_display(operation.complete):
             return
-        self._display(operation.complete)
+        self._display(
+            _project_lock_status(operation.complete, self._get_current_state())
+        )
 
     def _operation_write_success(self, operation: _LockOperation) -> None:
         """Display the operation's transitional state.
@@ -1019,12 +1006,12 @@ class PushLock:
             self._last_jam_event_time = NEVER_TIME
             return
         if outcome is not None and not self._attention_holds_display(outcome):
-            self._display(_Display(outcome, outcome))
+            self._display(_project_lock_status(outcome, self._get_current_state()))
         # The exit owns the next poll; drop any cycle armed during the operation.
         self._cancel_future_update()
         # Unsettled, or always-connected with the link down (this cycle is its
         # reconnect): poll once the motor has stopped, not at the keep-alive.
-        if {self.lock_status, self.secure_status} <= POSITION_READINGS and (
+        if _Display(self.lock_status, self.secure_status).settled and (
             self.is_connected or not self._always_connected
         ):
             delay = KEEP_ALIVE_TIME
@@ -1246,21 +1233,27 @@ class PushLock:
             self.secure_status,
         )
 
-    def _display(self, display: _Display) -> None:
-        """Put an operation's display up; it is not a report, so no admission."""
-        _LOGGER.debug("%s: Displaying %s", self.name, display)
-        if {display.lock, display.secure} <= POSITION_READINGS:
+    def _stage_display(
+        self, lock_state: LockState, display: _Display, changes: dict[str, Any]
+    ) -> None:
+        """Stage the lock pair of display into changes and record whether it settled."""
+        if display.settled:
             self._seen_this_session.add(LockStatus)
         else:
             # An unsettled display must not suppress the follow-up poll.
             self._seen_this_session.discard(LockStatus)
-        lock_state = self._get_current_state()
-        changes: dict[str, Any] = {}
         if lock_state.lock != display.lock:
             changes["lock"] = display.lock
             self._activity_drain_pending = True
         if lock_state.secure != display.secure:
             changes["secure"] = display.secure
+
+    def _display(self, display: _Display) -> None:
+        """Put an operation's display up; it is not a report, so no admission."""
+        _LOGGER.debug("%s: Displaying %s", self.name, display)
+        lock_state = self._get_current_state()
+        changes: dict[str, Any] = {}
+        self._stage_display(lock_state, display, changes)
         self._apply_changes(lock_state, changes)
 
     def _update_any_state(self, states: Iterable[LockStateValue | AuthState]) -> None:
@@ -1291,25 +1284,20 @@ class PushLock:
             elif isinstance(state, LockStatus):
                 # Every reported lock status, repeats included, is admitted here.
                 admitted = self._admit_lock_status(state)
-                if admitted not in POSITION_READINGS:
-                    # A refused reading, or one that is not a position, must not
-                    # suppress the follow-up poll.
-                    self._seen_this_session.discard(type(state))
                 if admitted is None:
+                    # A refused reading must not suppress the follow-up poll.
+                    self._seen_this_session.discard(LockStatus)
                     continue
-                main, secure = _project_lock_status(admitted, lock_state.secure)
-                if lock_state.lock != main:
-                    if main in SETUP_CONDITION_STATUSES:
-                        _LOGGER.warning(
-                            "%s: Lock reports %s, a setup condition that ends "
-                            "at the lock by hand",
-                            self.name,
-                            main,
-                        )
-                    changes["lock"] = main
-                    self._activity_drain_pending = True
-                if lock_state.secure != secure:
-                    changes["secure"] = secure
+                if admitted in SETUP_CONDITION_STATUSES and lock_state.lock != admitted:
+                    _LOGGER.warning(
+                        "%s: Lock reports %s, a setup condition that ends "
+                        "at the lock by hand",
+                        self.name,
+                        admitted,
+                    )
+                self._stage_display(
+                    lock_state, _project_lock_status(admitted, lock_state), changes
+                )
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
