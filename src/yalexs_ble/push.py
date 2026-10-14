@@ -149,11 +149,7 @@ POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
 
 # Statuses the lock reports while the motor runs.
 TRANSITIONAL_READINGS = frozenset(
-    {
-        LockStatus.LOCKING,
-        LockStatus.UNLOCKING,
-        LockStatus.UNLATCHING,
-    }
+    {LockStatus.LOCKING, LockStatus.UNLOCKING, LockStatus.UNLATCHING}
 )
 
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
@@ -1100,8 +1096,7 @@ class PushLock:
     def _admit_lock_status(self, incoming: LockStatus) -> LockStatus | None:
         """Decide the displayed lock status for a value the lock reported.
 
-        None refuses the value, so nothing from it is applied; a transitional
-        value holds the next poll off before any of that.
+        None refuses the value, so nothing from it is applied.
         """
         if incoming in TRANSITIONAL_READINGS:
             # A lock polled mid-motion answers with the position it is leaving.

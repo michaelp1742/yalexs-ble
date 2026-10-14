@@ -287,8 +287,7 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
-        # Fires per LOCK/UNLOCK op-response; external operations send one only on
-        # failure.
+        # Called on every LOCK/UNLOCK op-response, ours or not.
         self._op_response_callback = op_response_callback
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
@@ -390,14 +389,7 @@ class Lock:
             ):
                 result = state[RESULT_BYTE]
                 if self._op_response_callback is not None:
-                    try:
-                        self._op_response_callback()
-                    except Exception:
-                        _LOGGER.exception(
-                            "%s: op_response_callback raised, continuing to parse"
-                            " the frame",
-                            self.name,
-                        )
+                    self._op_response_callback()
                 if result != OperationError.COMM_SUCCESS:
                     solicited = self.session is not None and (
                         self.session.awaits_op_response(state)

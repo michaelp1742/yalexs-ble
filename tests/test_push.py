@@ -7424,11 +7424,14 @@ async def test_battery_only_cycle_does_not_move_hold_deadline():
 
 
 @pytest.mark.asyncio
-async def test_get_lock_instance_wires_the_op_response_hook_to_the_hold():
-    """_get_lock_instance wires the Lock's op-response hook to this PushLock's hold."""
+async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
+    """An op-response parsed by this PushLock's Lock holds the next read off."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:59")
     push_lock._ble_device = MagicMock()
-
     lock = push_lock._get_lock_instance()
+    assert push_lock._earliest_update_time == NEVER_TIME
+    before = time.monotonic()
 
-    assert lock._op_response_callback == push_lock._hold_update
+    lock._parse_state(bytes.fromhex("bb0b00000000000000000000000000000000"))
+
+    assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
