@@ -1359,6 +1359,9 @@ async def test_keep_alive_under_the_floor_sends_a_read_the_floor_allows(
         mock_lock.door_status.await_count,
         mock_lock.lock_status.await_count,
     ) == reads
+    # A read sent counts as the last request; none sent leaves it where it was.
+    since_last_request = time.monotonic() - push_lock._last_operation_complete_time
+    assert (since_last_request < 1.0) is any(reads)
     # The status poll itself waits for the floor.
     handle = push_lock._cancel_deferred_update
     assert handle is not None
@@ -1383,6 +1386,23 @@ async def test_keep_alive_sends_no_extra_read_when_the_cycle_makes_the_cutoff(
         push_lock._keep_alive()
         await asyncio.gather(*push_lock._background_tasks)
     ensure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_bug_in_the_keep_alive_read_is_not_hidden(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only link and protocol failures are contained; a bug reaches the task handler."""
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:0c")
+    push_lock._hold_update()
+    mock_lock = MagicMock(battery=AsyncMock(side_effect=TypeError("bug")))
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        caplog.at_level("ERROR", logger="yalexs_ble.push"),
+    ):
+        push_lock._keep_alive()
+        await asyncio.gather(*push_lock._background_tasks, return_exceptions=True)
+    assert "Background task failed" in caplog.text
 
 
 @pytest.mark.asyncio

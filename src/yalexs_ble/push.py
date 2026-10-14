@@ -752,11 +752,18 @@ class PushLock:
             if info is None:
                 return
             try:
-                if not await self._poll_battery(lock, force=True) and info.door_sense:
+                asked = await self._poll_battery(lock, force=True)
+                if not asked and info.door_sense:
                     await lock.door_status()
-            except Exception as ex:
+                    asked = True
+            except (TimeoutError, *RETRYABLE_EXCEPTIONS) as ex:
                 # The cycle at the floor's end retries and reports the link.
                 _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+                return
+            if asked:
+                # A request, so the floor check and the keep-alive count from it.
+                self._last_operation_complete_time = time.monotonic()
+                self._reschedule_next_keep_alive()
 
     def _floor_outlasts_the_link(self) -> bool:
         """Whether the cycle at the floor's end would come after the idle cutoff."""
