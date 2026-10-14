@@ -19,6 +19,7 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_DOOR_STATUS,
@@ -49,6 +50,7 @@ from .session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    OperationFailedError,
     OperationProgress,
     ResponseError,
     Session,
@@ -384,13 +386,25 @@ class Lock:
             ):
                 result = state[RESULT_BYTE]
                 if result != OperationError.COMM_SUCCESS:
+                    solicited = self.session is not None and (
+                        self.session.awaits_op_response(state)
+                    )
+                    if solicited and result in MECHANICAL_OPERATION_ERRORS:
+                        # The caller learns of this failure from
+                        # OperationFailedError; debug is enough here.
+                        level = logging.DEBUG
+                    else:
+                        level = logging.WARNING
                     error = VALUE_TO_OPERATION_ERROR.get(result)
-                    _LOGGER.warning(
+                    _LOGGER.log(
+                        level,
                         "%s: Operation failed with result 0x%02X (%s)",
                         self.name,
                         result,
                         error.name if error else "unknown",
                     )
+                    # Every failure needs a person at the lock, so all
+                    # display as JAMMED.
                     return [LockStatus.JAMMED]
                 return ()  # success: recognized, no state update
             if state[1] == Commands.GETSTATUS.value:
@@ -567,11 +581,11 @@ class Lock:
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
         retry_after_write: bool = True,
-    ) -> int:
-        """Run a mechanical operation; return the result code the lock reported.
+    ) -> None:
+        """Run a mechanical operation.
 
-        result_callback is told whether the op-response reported success, as
-        the frame is handled.
+        Raises OperationFailedError on a reported failure. result_callback is
+        told whether the op-response reported success, as the frame is handled.
         """
         assert self.session is not None  # nosec
         _LOGGER.debug("%s: Executing %s", self.name, command_name)
@@ -592,19 +606,20 @@ class Lock:
             retry_after_write=retry_after_write,
         )
         result = response[RESULT_BYTE]
-        _LOGGER.debug(
-            "%s: Finished %s (result 0x%02X)", self.name, command_name, result
-        )
-        return result
+        if result != OperationError.COMM_SUCCESS:
+            raise OperationFailedError(
+                command_name, VALUE_TO_OPERATION_ERROR.get(result, result)
+            )
+        _LOGGER.debug("%s: Finished %s", self.name, command_name)
 
     @raise_if_not_connected
     async def force_securemode(
         self,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
-    ) -> int:
-        """Force the lock into securemode; returns the lock's result code."""
-        return await self._execute_operation(
+    ) -> None:
+        """Force the lock into securemode; raises OperationFailedError on a failure."""
+        await self._execute_operation(
             Commands.LOCK,
             SECUREMODE_OPERATION_BYTE,
             "force_securemode",
@@ -617,9 +632,9 @@ class Lock:
         self,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
-    ) -> int:
-        """Force the lock to lock; returns the lock's result code."""
-        return await self._execute_operation(
+    ) -> None:
+        """Force the lock to lock; raises OperationFailedError on a failure."""
+        await self._execute_operation(
             Commands.LOCK, 0x00, "force_lock", write_success_callback, result_callback
         )
 
@@ -628,9 +643,9 @@ class Lock:
         self,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
-    ) -> int:
-        """Force the lock to unlock; returns the lock's result code."""
-        return await self._execute_operation(
+    ) -> None:
+        """Force the lock to unlock; raises OperationFailedError on a failure."""
+        await self._execute_operation(
             Commands.UNLOCK,
             0x00,
             "force_unlock",
@@ -643,13 +658,14 @@ class Lock:
         self,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
-    ) -> int:
-        """Retract the latch (momentary open); returns the lock's result code.
+    ) -> None:
+        """Retract the latch (momentary open).
 
         Returns on the latch pull, before the cycle ends. A failure after the
-        write raises OperationIncompleteError, as a repeat opens the door again.
+        write raises OperationIncompleteError, as a repeat opens the door again;
+        a reported failure raises OperationFailedError.
         """
-        return await self._execute_operation(
+        await self._execute_operation(
             Commands.UNLOCK,
             UNLATCH_OPERATION_BYTE,
             "force_unlatch",
@@ -766,19 +782,22 @@ class Lock:
         await self._send_keycode(cmd, "commit_keycode")
 
     async def securemode(self) -> None:
+        """Set securemode unless already set; raises OperationFailedError on failure."""
         if (await self.lock_status()) != LockStatus.SECUREMODE:
             await self.force_securemode()
 
     async def lock(self) -> None:
+        """Lock unless already locked; raises OperationFailedError on a failure."""
         if (await self.lock_status()) != LockStatus.LOCKED:
             await self.force_lock()
 
     async def unlock(self) -> None:
+        """Unlock unless already unlocked; raises OperationFailedError on a failure."""
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
 
     async def unlatch(self) -> None:
-        """Unlatch; always runs, as there is no resting state to compare."""
+        """Unlatch; always runs, and raises OperationFailedError on a failure."""
         await self.force_unlatch()
 
     async def _execute_command(

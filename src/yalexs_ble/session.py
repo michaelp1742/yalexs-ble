@@ -78,6 +78,19 @@ class OperationIncompleteError(YaleXSBLEError):
     """The operation ended without its op-response and was not retried."""
 
 
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed; not retryable.
+
+    Re-driving a failed mechanism is not a recovery.
+    """
+
+    def __init__(self, command: str, error: OperationError | int) -> None:
+        self.command = command
+        self.error = error
+        name = error.name if isinstance(error, OperationError) else "unknown error"
+        super().__init__(f"{command} failed: {name} (0x{error:02X})")
+
+
 @dataclass
 class OperationProgress:
     """How far a mechanical operation got.
@@ -253,6 +266,15 @@ class Session:
             return
         if (future := self._disarm_wait()) is not None and not future.done():
             future.set_exception(ex)
+
+    def awaits_op_response(self, frame: bytes) -> bool:
+        """Whether frame answers the mechanical operation whose staged wait is armed."""
+        return (
+            self._operation_progress is not None
+            and self._notify_future is not None
+            and self._notify_matcher is not None
+            and self._notify_matcher(frame)
+        )
 
     def _notify(self, char: int, data: bytearray) -> None:
         self._last_callback_time = monotonic()
