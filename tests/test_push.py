@@ -31,6 +31,7 @@ from yalexs_ble.const import (
     LockOperationSource,
     LockState,
     LockStatus,
+    OperationError,
 )
 from yalexs_ble.lock import ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
@@ -3693,7 +3694,7 @@ async def test_a_failure_op_response_displays_jammed_inside_the_window(
         write_success_callback()  # puts the transitional on the display
         push_lock._state_callback([LockStatus.JAMMED])
         result_callback(False)
-        raise OperationFailedError(f"{op_attr} reported failure")
+        raise OperationFailedError(op_attr, OperationError.MECH_POSITION)
 
     setattr(mock_lock, op_attr, operation)
 
@@ -6347,7 +6348,11 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     ("error", "jam", "delay"),
     [
         (None, False, KEEP_ALIVE_TIME),
-        (OperationFailedError("reported failure"), False, KEEP_ALIVE_TIME),
+        (
+            OperationFailedError("force_lock", OperationError.MECH_POSITION),
+            False,
+            KEEP_ALIVE_TIME,
+        ),
         (
             OperationIncompleteError("no op-response"),
             False,

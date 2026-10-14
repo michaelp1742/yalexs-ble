@@ -1079,9 +1079,8 @@ class PushLock:
                 result_callback=functools.partial(self._operation_result, operation),
             )
         except OperationFailedError:
-            # The failure op-response has already put JAMMED on the display.
-            _LOGGER.debug("%s: %s reported failure", self.name, op_attr)
-            # The lock answered, so the exit moves the timers as a success does.
+            # The lock answered, so the exit moves the timers as a success does;
+            # its JAMMED is already on display.
             self._complete_operation(time.monotonic())
             raise
         except Exception as ex:

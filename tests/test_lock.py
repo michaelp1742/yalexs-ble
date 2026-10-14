@@ -41,7 +41,6 @@ from yalexs_ble.lock import (
     UNLATCH_OPERATION_BYTE,
     Lock,
     _ack_matcher,
-    _describe_operation_error,
     _keycode_response_matcher,
     _operation_response_matcher,
     _poll_response_matcher,
@@ -53,6 +52,7 @@ from yalexs_ble.session import (
     KeycodeError,
     OperationFailedError,
     OperationIncompleteError,
+    OperationProgress,
     ResponseError,
     Session,
 )
@@ -316,13 +316,25 @@ def test_parse_lock_activity_is_no_update(
     assert "Unknown state" not in caplog.text
 
 
-def test_mechanical_operation_errors_is_the_whole_mech_range() -> None:
-    """The hand-written set holds exactly the MECH_* codes, and nothing else."""
-    assert {
-        error for error in OperationError if error.name.startswith("MECH_")
-    } == MECHANICAL_OPERATION_ERRORS
+def _failure_log_levels(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The levels of the operation-failure log lines, in order."""
+    return [
+        record.levelname
+        for record in caplog.records
+        if "Operation failed with result" in record.message
+    ]
 
 
+def _arm_op_response_wait(lock: Lock, opcode: int) -> None:
+    """Arm the session's staged wait as a running operation on opcode would."""
+    session = lock.session
+    assert session is not None
+    session._operation_progress = OperationProgress()
+    session._notify_matcher = _operation_response_matcher(opcode)
+    session._notify_future = asyncio.get_running_loop().create_future()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("awaited_opcode", "result_byte", "expected_level"),
     [
@@ -334,15 +346,16 @@ def test_mechanical_operation_errors_is_the_whole_mech_range() -> None:
         (None, 0x1F, "WARNING"),
     ],
 )
-def test_parse_op_response_failure_log_level(
+async def test_parse_op_response_failure_log_level(
     awaited_opcode: int | None,
     result_byte: int,
     expected_level: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Only a mechanical failure of our own awaited operation logs at DEBUG."""
-    lock = _make_lock()
-    lock._awaited_operation_opcode = awaited_opcode
+    lock = _make_connected_lock_with_session()
+    if awaited_opcode is not None:
+        _arm_op_response_wait(lock, awaited_opcode)
 
     frame = _op_response_frame(Commands.LOCK, result_byte)
     with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
@@ -350,20 +363,16 @@ def test_parse_op_response_failure_log_level(
 
     assert result is not None
     assert list(result) == [LockStatus.JAMMED]
-    records = [
-        record
-        for record in caplog.records
-        if "Operation failed with result" in record.message
-    ]
-    assert [record.levelname for record in records] == [expected_level]
+    assert _failure_log_levels(caplog) == [expected_level]
 
 
-def test_parse_non_mech_error_is_jammed_and_logs_decoded_name(
+@pytest.mark.asyncio
+async def test_parse_non_mech_error_is_jammed_and_logs_decoded_name(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A non-MECH failure result still parses as JAMMED and logs its name."""
-    lock = _make_lock()
-    lock._awaited_operation_opcode = Commands.LOCK.value
+    lock = _make_connected_lock_with_session()
+    _arm_op_response_wait(lock, Commands.LOCK.value)
 
     # byte[15] = 0x32 VBAT_LOW (synthetic; no real capture for a non-MECH error).
     # Armed, so the WARNING pins a non-mechanical result of our own operation.
@@ -392,11 +401,6 @@ def test_parse_unknown_error_code_is_jammed_and_logs_unknown(
     assert list(result) == [LockStatus.JAMMED]
     assert "0x77" in caplog.text
     assert "unknown" in caplog.text
-
-
-def test_describe_operation_error_names_the_success_result() -> None:
-    """A 0x00 result decodes to COMM_SUCCESS."""
-    assert _describe_operation_error(OperationError.COMM_SUCCESS) == "COMM_SUCCESS"
 
 
 def test_parse_bogus_frame_is_none_and_logs_unknown(
@@ -1680,7 +1684,6 @@ async def test_force_operations_complete_on_ack_then_op_response(
     lock = _make_connected_lock_with_session()
     events = await _drive_operation(lock, op_attr, opcode, ack)
     assert events == ["write_success", "ack", "result True", "op_response"]
-    assert lock._awaited_operation_opcode is None
 
 
 @pytest.mark.asyncio
@@ -1800,7 +1803,7 @@ async def test_force_lock_failure_op_response_raises_operation_failed(
 ) -> None:
     """A mechanical failure after write-success raises OperationFailedError.
 
-    The frame logs at DEBUG and the awaited opcode is cleared afterwards.
+    The frame logs at DEBUG and the error names the reported result.
     """
     lock = _make_connected_lock_with_session()
     session = lock.session
@@ -1818,18 +1821,12 @@ async def test_force_lock_failure_op_response_raises_operation_failed(
     feeder = asyncio.create_task(feed())
     with (
         caplog.at_level("DEBUG", logger="yalexs_ble.lock"),
-        pytest.raises(OperationFailedError, match="MECH_POSITION"),
+        pytest.raises(OperationFailedError, match="MECH_POSITION") as excinfo,
     ):
         await lock.force_lock()
     await feeder
-    records = [
-        record
-        for record in caplog.records
-        if "Operation failed with result" in record.message
-    ]
-    assert [record.levelname for record in records] == ["DEBUG"]
-    # Left set, later external op-responses would read as ours.
-    assert lock._awaited_operation_opcode is None
+    assert excinfo.value.error is OperationError.MECH_POSITION
+    assert _failure_log_levels(caplog) == ["DEBUG"]
 
 
 @pytest.mark.asyncio
@@ -1856,30 +1853,23 @@ async def test_a_failure_after_our_op_response_logs_at_warning(
     with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
         await lock.force_lock()
     await feeder
-    records = [
-        record
-        for record in caplog.records
-        if "Operation failed with result" in record.message
-    ]
-    assert [record.levelname for record in records] == ["WARNING"]
+    assert _failure_log_levels(caplog) == ["WARNING"]
     assert states == [[LockStatus.JAMMED]]
 
 
 @pytest.mark.asyncio
-async def test_an_op_response_before_write_success_leaves_it_unarmed(
+async def test_a_failure_after_an_op_response_during_the_write_logs_at_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An op-response handled during the write keeps the opcode unarmed."""
+    """Once the op-response landed during the write, a later failure is unsolicited."""
     lock = _make_connected_lock_with_session()
     session = lock.session
     assert session is not None
-    at_hook: list[int | None] = []
 
     async def _write(*args: object, **kwargs: object) -> None:
         session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
 
     def _on_write_success() -> None:
-        at_hook.append(lock._awaited_operation_opcode)
         session._notify(
             0,
             bytearray(_op_response_frame(Commands.LOCK, OperationError.MECH_POSITION)),
@@ -1889,61 +1879,4 @@ async def test_an_op_response_before_write_success_leaves_it_unarmed(
     lock.client.write_gatt_char = AsyncMock(side_effect=_write)
     with caplog.at_level("DEBUG", logger="yalexs_ble.lock"):
         await lock.force_lock(write_success_callback=_on_write_success)
-    records = [
-        record
-        for record in caplog.records
-        if "Operation failed with result" in record.message
-    ]
-    assert at_hook == [None]
-    assert [record.levelname for record in records] == ["WARNING"]
-
-
-@pytest.mark.asyncio
-async def test_an_exit_without_an_op_response_disarms_the_opcode() -> None:
-    """An operation that gets no op-response clears the opcode at its exit."""
-    lock = _make_connected_lock_with_session()
-    at_hook: list[int | None] = []
-
-    def _on_write_success() -> None:
-        at_hook.append(lock._awaited_operation_opcode)
-
-    with (
-        patch("yalexs_ble.session.ACK_TIMEOUT", 0.01),
-        pytest.raises(TimeoutError),
-    ):
-        await lock.force_lock(write_success_callback=_on_write_success)
-    assert at_hook == [Commands.LOCK.value]
-    assert lock._awaited_operation_opcode is None
-
-
-@pytest.mark.asyncio
-async def test_the_awaited_opcode_is_armed_at_the_command_write() -> None:
-    """The awaited opcode is armed at write-success, not before the write."""
-    lock = _make_connected_lock_with_session()
-    session = lock.session
-    assert session is not None
-    at_write: list[int | None] = []
-    at_hook: list[int | None] = []
-
-    async def _write(*args: object, **kwargs: object) -> None:
-        at_write.append(lock._awaited_operation_opcode)
-
-    def _on_write_success() -> None:
-        at_hook.append(lock._awaited_operation_opcode)
-
-    assert lock.client is not None
-    lock.client.write_gatt_char = AsyncMock(side_effect=_write)
-
-    async def feed() -> None:
-        await _spin_until(lambda: session._ack_future is not None)
-        session._notify(0, bytearray(LOCK_ACK))
-        await asyncio.sleep(0)
-        session._notify(0, bytearray(_op_response_frame(Commands.LOCK)))
-
-    feeder = asyncio.create_task(feed())
-    await lock.force_lock(write_success_callback=_on_write_success)
-    await feeder
-
-    assert at_write == [None]
-    assert at_hook == [Commands.LOCK.value]
-    assert lock._awaited_operation_opcode is None
+    assert _failure_log_levels(caplog) == ["WARNING"]

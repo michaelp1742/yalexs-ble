@@ -110,17 +110,9 @@ class OperationError(IntEnum):
 
 VALUE_TO_OPERATION_ERROR = {err.value: err for err in OperationError}
 
-# Written out rather than matched on the MECH_ name prefix, so a new MECH_
-# member counts as mechanical only once it is added here.
+# The results of a motor stall or a mechanism out of position.
 MECHANICAL_OPERATION_ERRORS = frozenset(
-    {
-        OperationError.MECH_TIMEOUT,
-        OperationError.MECH_POSITION,
-        OperationError.MECH_MOTPOL,
-        OperationError.MECH_TIMEOUT_CAL,
-        OperationError.MECH_BACKOFF,
-        OperationError.MECH_HANDLE_NOT_LIFTED,
-    }
+    error for error in OperationError if error.name.startswith("MECH_")
 )
 
 
