@@ -3665,7 +3665,7 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
 
 @pytest.mark.asyncio
-async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
+async def test_securemode_on_a_locked_lock_moves_only_the_secure_lock() -> None:
     """Securing an already-locked lock moves the secure lock and not the main."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:60")
     emissions: list[tuple[LockStatus, LockStatus]] = []
