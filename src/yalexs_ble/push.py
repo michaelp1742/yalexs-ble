@@ -745,20 +745,22 @@ class PushLock:
         async with self._operation_lock:
             if not self._running or not self.is_connected:
                 return
-            lock = await self._ensure_connected()
             info = self._lock_info
             now = time.monotonic()
             battery_allowed = (
                 info is None or info.model not in NO_BATTERY_SUPPORT_MODELS
             ) and now >= self._earliest_battery_attempt_time
-            if battery_allowed:
-                await self._read_battery(lock, now)
-            elif info is not None and info.door_sense:
-                try:
+            if not battery_allowed and (info is None or not info.door_sense):
+                return
+            try:
+                lock = await self._ensure_connected()
+                if battery_allowed:
+                    await self._read_battery(lock, now)
+                else:
                     await lock.door_status()
-                except Exception as ex:
-                    # The cycle at the floor's end retries and reports the link.
-                    _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+            except Exception as ex:
+                # The cycle at the floor's end retries and reports the link.
+                _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
 
     def _clear_reconnect_backoff(self) -> None:
         """A completed update or operation proves the link; drop the backoff."""

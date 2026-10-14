@@ -1375,31 +1375,41 @@ async def test_keep_alive_without_a_floor_sends_no_extra_read() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "read", "error"),
+    [
+        ("ASL-03", "battery", DisconnectedError("link dropped")),
+        ("SL-103", "door_status", BleakError("gone")),
+    ],
+    ids=["battery", "door"],
+)
 async def test_keep_alive_read_yields_to_a_disconnect_and_contains_a_failure(
-    caplog: pytest.LogCaptureFixture,
+    model: str, read: str, error: Exception, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The read is skipped once the link dropped and a failing read only logs."""
-    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:09", "SL-103")
+    """The read is skipped once the link dropped, and a failing read only logs."""
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:09", model)
     client = cast(MagicMock, push_lock._client)
-    mock_lock = MagicMock(door_status=AsyncMock(side_effect=BleakError("gone")))
+    mock_lock = MagicMock(**{read: AsyncMock(side_effect=error)})
     push_lock._hold_update()
 
-    with patch.object(
+    connected = patch.object(
         push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
-    ):
+    )
+    with connected:
         async with push_lock._operation_lock:
             push_lock._keep_alive()
             client.is_connected = False
         await asyncio.gather(*push_lock._background_tasks)
-        mock_lock.door_status.assert_not_awaited()
+        getattr(mock_lock, read).assert_not_awaited()
 
         client.is_connected = True
         with caplog.at_level("DEBUG", logger="yalexs_ble.push"):
             push_lock._keep_alive()
             await asyncio.gather(*push_lock._background_tasks)
 
-    mock_lock.door_status.assert_awaited_once()
+    getattr(mock_lock, read).assert_awaited_once()
     assert "Keep-alive read failed" in caplog.text
+    assert "Background task failed" not in caplog.text
 
 
 @pytest.mark.asyncio
