@@ -736,20 +736,29 @@ class PushLock:
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
 
     async def _keep_link_alive(self) -> None:
-        """Read the battery, or the door on a model without; neither is a position."""
+        """Read the battery, or the door where the battery is off limits.
+
+        Neither answers with a position. The battery cooldown applies here too,
+        so a lock that times out battery reads does not hold the operation lock
+        through the timeout; the door stands in, on a lock that senses it.
+        """
         async with self._operation_lock:
             if not self._running or not self.is_connected:
                 return
             lock = await self._ensure_connected()
             info = self._lock_info
-            try:
-                if info is not None and info.model in NO_BATTERY_SUPPORT_MODELS:
+            now = time.monotonic()
+            battery_allowed = (
+                info is None or info.model not in NO_BATTERY_SUPPORT_MODELS
+            ) and now >= self._earliest_battery_attempt_time
+            if battery_allowed:
+                await self._read_battery(lock, now)
+            elif info is not None and info.door_sense:
+                try:
                     await lock.door_status()
-                else:
-                    await lock.battery()
-            except Exception as ex:
-                # The cycle at the floor's end retries and reports the link.
-                _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+                except Exception as ex:
+                    # The cycle at the floor's end retries and reports the link.
+                    _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
 
     def _clear_reconnect_backoff(self) -> None:
         """A completed update or operation proves the link; drop the backoff."""
@@ -1512,6 +1521,11 @@ class PushLock:
         if BatteryState in self._seen_this_session:
             return False
 
+        await self._read_battery(lock, now)
+        return True
+
+    async def _read_battery(self, lock: Lock, now: float) -> None:
+        """Read the battery; a timeout starts the cooldown, a link error is logged."""
         try:
             await lock.battery()
             self._record_auth_success()
@@ -1532,8 +1546,6 @@ class PushLock:
                 self.name,
                 err,
             )
-
-        return True
 
     async def _probe_lock_info(self, lock: Lock) -> LockInfo:
         """Probe the lock for info, falling back to defaults on failure."""

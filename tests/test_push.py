@@ -1322,15 +1322,27 @@ def _connected_always_on_lock(address: str, model: str = "ASL-03") -> PushLock:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model", "read"),
-    [("ASL-03", "battery"), ("SL-103", "door_status")],
-    ids=["battery", "door-on-a-model-without-a-battery-read"],
+    ("model", "battery_cooldown", "read"),
+    [
+        ("ASL-03", False, "battery"),
+        ("SL-103", False, "door_status"),
+        ("ASL-03", True, "door_status"),
+        ("ASL-02", True, None),
+    ],
+    ids=[
+        "battery",
+        "door-on-a-model-without-a-battery-read",
+        "door-while-the-battery-cools-down",
+        "nothing-without-a-door-sense-in-the-cooldown",
+    ],
 )
 async def test_keep_alive_under_the_floor_sends_a_read_the_floor_allows(
-    model: str, read: str
+    model: str, battery_cooldown: bool, read: str | None
 ) -> None:
     """Under a live floor the keep-alive reads the battery or door, not the status."""
     push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:07", model)
+    if battery_cooldown:
+        push_lock._earliest_battery_attempt_time = time.monotonic() + 100.0
     mock_lock = MagicMock(
         battery=AsyncMock(), door_status=AsyncMock(), lock_status=AsyncMock()
     )
@@ -1342,8 +1354,8 @@ async def test_keep_alive_under_the_floor_sends_a_read_the_floor_allows(
         push_lock._keep_alive()
         await asyncio.gather(*push_lock._background_tasks)
 
-    getattr(mock_lock, read).assert_awaited_once()
-    mock_lock.lock_status.assert_not_awaited()
+    for name in ("battery", "door_status", "lock_status"):
+        assert getattr(mock_lock, name).await_count == (1 if name == read else 0)
     # The status poll itself waits for the floor.
     handle = push_lock._cancel_deferred_update
     assert handle is not None
@@ -1367,9 +1379,9 @@ async def test_keep_alive_read_yields_to_a_disconnect_and_contains_a_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The read is skipped once the link dropped and a failing read only logs."""
-    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:09")
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:09", "SL-103")
     client = cast(MagicMock, push_lock._client)
-    mock_lock = MagicMock(battery=AsyncMock(side_effect=BleakError("gone")))
+    mock_lock = MagicMock(door_status=AsyncMock(side_effect=BleakError("gone")))
     push_lock._hold_update()
 
     with patch.object(
@@ -1379,14 +1391,14 @@ async def test_keep_alive_read_yields_to_a_disconnect_and_contains_a_failure(
             push_lock._keep_alive()
             client.is_connected = False
         await asyncio.gather(*push_lock._background_tasks)
-        mock_lock.battery.assert_not_awaited()
+        mock_lock.door_status.assert_not_awaited()
 
         client.is_connected = True
         with caplog.at_level("DEBUG", logger="yalexs_ble.push"):
             push_lock._keep_alive()
             await asyncio.gather(*push_lock._background_tasks)
 
-    mock_lock.battery.assert_awaited_once()
+    mock_lock.door_status.assert_awaited_once()
     assert "Keep-alive read failed" in caplog.text
 
 
