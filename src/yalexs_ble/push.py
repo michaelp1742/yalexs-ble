@@ -959,39 +959,35 @@ class PushLock:
                 f"{failure!r}; it was not retried"
             ) from failure
 
-    def _attention_holds_display(self, state: LockStatus) -> bool:
-        """Whether a jam or setup condition that takes precedence is still on display.
+    def _attention_holds_display(self, state: LockStatus, window_live: bool) -> bool:
+        """Whether an attention status on display keeps state off it while window_live.
 
         Logs the state it keeps off the display.
         """
-        if not (
-            self._jam_takes_precedence()
-            and self.lock_status in MANUAL_INTERVENTION_STATUSES
-        ):
+        if not (window_live and self.lock_status in MANUAL_INTERVENTION_STATUSES):
             return False
         _LOGGER.debug(
-            "%s: %s not applied; a status needing attention takes precedence",
+            "%s: %s not applied; a status needing attention holds the display",
             self.name,
             state,
         )
         return True
 
     def _operation_result(self, operation: _LockOperation, succeeded: bool) -> None:
-        """Close the operation window and apply the op-response to the display.
+        """Close the operation window and display a successful op-response.
 
-        Runs as the op-response frame is handled; a failure's JAMMED reached the
-        display on that same frame, so only a success has anything left to apply.
+        A failure's JAMMED reached the display on the same frame.
         """
         self._operation_answered = True
         self._close_operation_window()
         if not self._running or not succeeded:
             return
-        if not self._jam_takes_precedence():
-            # The answer supersedes a held status; a write that fails after it
-            # never runs the write-success release.
-            self._release_jam_hold()
-        if self._attention_holds_display(operation.complete):
+        if self._attention_holds_display(
+            operation.complete, self._jam_takes_precedence()
+        ):
             return
+        # The answer supersedes a held status.
+        self._release_jam_hold()
         self._display(
             _project_lock_status(operation.complete, self._get_current_state())
         )
@@ -1005,13 +1001,8 @@ class PushLock:
         if self._operation_answered:
             return
         pending = operation.pending(self._get_current_state())
-        if self._attention_holds_display(pending.lock):
+        if self._attention_holds_display(pending.lock, self._jam_takes_precedence()):
             return
-        if self._jam_hold_live():
-            _LOGGER.debug(
-                "%s: New operation write succeeded; releasing the display hold",
-                self.name,
-            )
         self._release_jam_hold()
         self._display(pending)
 
@@ -1033,14 +1024,11 @@ class PushLock:
             # A restarted watcher polls the lock afresh, so a report from before
             # the stop neither takes precedence over its commands nor holds its
             # display.
-            self._last_jam_event_time = NEVER_TIME
-            self._release_jam_hold()
+            self._reset_jam_state()
             return
-        if (
-            outcome is not None
-            and not self._attention_holds_display(outcome)
-            # A hold still live here means the command's write never succeeded.
-            and not self._jam_hold_keeps_display(outcome)
+        # A hold still live here means the command's write never succeeded.
+        if outcome is not None and not self._attention_holds_display(
+            outcome, self._jam_takes_precedence() or self._jam_hold_live()
         ):
             self._display(_project_lock_status(outcome, self._get_current_state()))
         # The exit owns the next poll; drop any cycle armed during the operation.
@@ -1058,26 +1046,20 @@ class PushLock:
             self._schedule_future_update_with_debounce(delay)
 
     def _init_jam_state(self) -> None:
-        """Initialize the jam state; it survives reconnects but not a stop."""
+        """Initialize the jam state."""
         self._jammed_hold_deadline = NEVER_TIME
         self._jam_hold_timer: asyncio.TimerHandle | None = None
-        # When the lock last reported a jam or setup condition; a stop resets it.
+        # When the lock last reported a jam or setup condition.
         self._last_jam_event_time = NEVER_TIME
+
+    def _reset_jam_state(self) -> None:
+        """Forget the reported jam: a restarted watcher polls the lock afresh."""
+        self._last_jam_event_time = NEVER_TIME
+        self._release_jam_hold()
 
     def _jam_hold_live(self) -> bool:
         """Whether a reported jam or setup condition is within its display hold."""
         return time.monotonic() < self._jammed_hold_deadline
-
-    def _jam_hold_keeps_display(self, state: LockStatus) -> bool:
-        """Whether the display hold keeps state off the display; logs when it does."""
-        if not (
-            self.lock_status in MANUAL_INTERVENTION_STATUSES and self._jam_hold_live()
-        ):
-            return False
-        _LOGGER.debug(
-            "%s: %s not applied; holding %s", self.name, state, self.lock_status
-        )
-        return True
 
     def _arm_jam_hold(self, now: float) -> None:
         """Set the hold deadline and arm the timer that ends the hold."""
@@ -1094,6 +1076,8 @@ class PushLock:
             self._jam_hold_timer = None
 
     def _release_jam_hold(self) -> None:
+        if self._jammed_hold_deadline != NEVER_TIME:
+            _LOGGER.debug("%s: Releasing the display hold", self.name)
         self._jammed_hold_deadline = NEVER_TIME
         self._cancel_jam_hold_timer()
 
@@ -1139,7 +1123,7 @@ class PushLock:
                 incoming,
             )
             return None
-        if self._jam_hold_keeps_display(incoming):
+        if self._attention_holds_display(incoming, self._jam_hold_live()):
             return None
         return incoming
 
@@ -2021,12 +2005,10 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
-        # A leftover deadline would mask the status on a restarted watcher.
-        self._release_jam_hold()
         if not self._operation_in_flight:
-            # Left set while a command is in flight so a jam reported during it
+            # Kept while a command is in flight so a jam reported during it
             # still ends its attempts; the stopped exit resets it instead.
-            self._last_jam_event_time = NEVER_TIME
+            self._reset_jam_state()
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:

@@ -96,7 +96,6 @@ def _cancel_timers(push_lock: PushLock) -> None:
     push_lock._cancel_disconnect_timer()
     push_lock._cancel_keepalive_timer()
     push_lock._cancel_jam_hold_timer()
-    push_lock._cancel_jam_hold_timer()
 
 
 @pytest.fixture(autouse=True)
@@ -5031,7 +5030,7 @@ async def test_a_failure_under_precedence_drops_the_idle_timer_and_the_link() ->
     assert (push_lock._disconnect_timer, push_lock._client) == (None, None)
     client.disconnect.assert_awaited_once()
     assert push_lock.lock_status == LockStatus.JAMMED
-    assert push_lock._jammed_hold_deadline > time.monotonic()
+    assert push_lock._jam_hold_live()
     scheduled.assert_not_called()
 
 
@@ -5840,7 +5839,6 @@ async def test_the_locks_answer_releases_the_hold_when_the_write_then_fails(
         assert push_lock._jammed_hold_deadline == (
             held_deadline if hold_stands else NEVER_TIME
         )
-    assert (push_lock._jam_hold_timer is not None) is hold_stands
 
 
 @pytest.mark.asyncio
@@ -5876,7 +5874,6 @@ async def test_a_jam_reported_during_a_command_under_a_hold_does_not_flap() -> N
     assert LockStatus.LOCKED not in emissions
     assert push_lock.lock_status is LockStatus.JAMMED
     assert push_lock._jammed_hold_deadline == clock[0] + JAMMED_HOLD_TIME
-    assert push_lock._jam_hold_timer is not None
 
 
 @pytest.mark.asyncio
@@ -5946,7 +5943,6 @@ async def test_a_reported_failure_re_arms_the_hold_at_its_op_response(
 
     assert push_lock.lock_status is LockStatus.JAMMED
     assert push_lock._jammed_hold_deadline == clock[0] + JAMMED_HOLD_TIME
-    assert push_lock._jam_hold_timer is not None
     assert not _update_scheduled(push_lock)
 
 
@@ -6708,7 +6704,7 @@ async def test_every_operation_exit_owes_the_status_poll(
     assert push_lock._force_lock_status_poll is True
     if delay is None:
         assert push_lock.lock_status is LockStatus.JAMMED
-        assert push_lock._jammed_hold_deadline > time.monotonic()
+        assert push_lock._jam_hold_live()
         scheduled.assert_not_called()
     else:
         scheduled.assert_called_once_with(delay)
@@ -6820,7 +6816,7 @@ async def test_the_exit_keeps_the_reconnect_an_always_connected_lock_owes(
     handle = push_lock._cancel_deferred_update
     assert handle is not None
     assert delay - 1 < handle.when() - push_lock.loop.time() <= delay
-    assert (time.monotonic() < push_lock._jammed_hold_deadline) is held
+    assert push_lock._jam_hold_live() is held
 
 
 @pytest.mark.asyncio
@@ -7222,7 +7218,6 @@ async def test_a_polled_unknown_mid_hold_does_not_extend_the_jam_hold():
         clock[0] = 1000.0
         push_lock._update_any_state([LockStatus.JAMMED])
     push_lock._cancel_future_update()
-    timer_before = push_lock._jam_hold_timer
 
     # A reconnect cleared the session, so the cycle polls the status again.
     push_lock._seen_this_session.clear()
@@ -7240,7 +7235,6 @@ async def test_a_polled_unknown_mid_hold_does_not_extend_the_jam_hold():
     assert final_state.lock is LockStatus.JAMMED
     # The deadline is still the admission's, not 1015.0 + JAMMED_HOLD_TIME.
     assert push_lock._jammed_hold_deadline == 1000.0 + JAMMED_HOLD_TIME
-    assert push_lock._jam_hold_timer is timer_before
 
 
 @pytest.mark.asyncio
@@ -7252,15 +7246,12 @@ async def test_a_settle_after_the_deadline_clears_a_repeated_jam() -> None:
         clock[0] = 1000.0
         push_lock._update_any_state([LockStatus.JAMMED])
         assert push_lock._jammed_hold_deadline == 1000.0 + JAMMED_HOLD_TIME
-    timer_at_transition = push_lock._jam_hold_timer
-    assert timer_at_transition is not None
 
     with _patched_clock() as clock:
         clock[0] = 1020.0
         push_lock._update_any_state([LockStatus.JAMMED])
         assert push_lock.lock_status is LockStatus.JAMMED
         assert push_lock._jammed_hold_deadline == 1000.0 + JAMMED_HOLD_TIME
-    assert push_lock._jam_hold_timer is timer_at_transition
 
     with _patched_clock() as clock:
         clock[0] = 1025.0
@@ -7271,8 +7262,6 @@ async def test_a_settle_after_the_deadline_clears_a_repeated_jam() -> None:
     with _patched_clock() as clock:
         clock[0] = 1031.0
         push_lock._update_any_state([LockStatus.LOCKED])
-        push_lock._cancel_jam_hold_timer()
-        push_lock._cancel_future_update()
         assert push_lock.lock_status is LockStatus.LOCKED
 
 
@@ -7326,7 +7315,6 @@ async def test_write_success_releases_the_hold_past_the_precedence_time_only(
     assert push_lock._jammed_hold_deadline == (
         NEVER_TIME if released else start + JAMMED_HOLD_TIME
     )
-    assert push_lock._jam_hold_timer is (None if released else armed_timer)
     assert armed_timer.cancelled() is released
     assert push_lock.lock_status is (
         LockStatus.LOCKING if released else LockStatus.JAMMED
