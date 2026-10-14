@@ -112,7 +112,14 @@ VALUE_TO_OPERATION_ERROR = {err.value: err for err in OperationError}
 
 # The results of a motor stall or a mechanism out of position.
 MECHANICAL_OPERATION_ERRORS = frozenset(
-    error for error in OperationError if error.name.startswith("MECH_")
+    {
+        OperationError.MECH_TIMEOUT,
+        OperationError.MECH_POSITION,
+        OperationError.MECH_MOTPOL,
+        OperationError.MECH_TIMEOUT_CAL,
+        OperationError.MECH_BACKOFF,
+        OperationError.MECH_HANDLE_NOT_LIFTED,
+    }
 )
 
 
