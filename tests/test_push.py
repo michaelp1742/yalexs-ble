@@ -36,6 +36,9 @@ from yalexs_ble.const import (
 from yalexs_ble.lock import ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
+    _LOCK_OPERATION,
+    _SECUREMODE_OPERATION,
+    _UNLOCK_OPERATION,
     ACTIVITY_DRAIN_FAILURE_THRESHOLD,
     ACTIVITY_DRAIN_MAX_OVERRUNS,
     ACTIVITY_PRIME_DELAY,
@@ -3816,12 +3819,12 @@ async def test_settled_securemode_push_is_not_a_securing_transitional() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
-    """A stamped _SECURING must not suppress the follow-up status poll."""
+async def test_the_securing_display_is_not_a_position_the_lock_holds() -> None:
+    """A securing display must not suppress the follow-up status poll."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6a")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 
-    push_lock._update_any_state([LockStatus._SECURING], operation=True)
+    push_lock._operation_write_success(_SECUREMODE_OPERATION)
 
     assert push_lock.secure_status is LockStatus.LOCKING
     assert LockStatus not in push_lock._seen_this_session
@@ -3836,12 +3839,12 @@ async def test_retried_unlock_keeps_the_secure_transitional() -> None:
     )
 
     # Attempt 1 writes, then fails retryably.
-    push_lock._operation_write_success(LockStatus.UNLOCKING)
+    push_lock._operation_write_success(_UNLOCK_OPERATION)
     push_lock._close_operation_window()
     assert push_lock.secure_status is LockStatus.UNLOCKING
 
     # Attempt 2 writes and stamps the same pending state.
-    push_lock._operation_write_success(LockStatus.UNLOCKING)
+    push_lock._operation_write_success(_UNLOCK_OPERATION)
     assert (push_lock.lock_status, push_lock.secure_status) == (
         LockStatus.UNLOCKING,
         LockStatus.UNLOCKING,
@@ -5294,7 +5297,7 @@ async def test_an_op_response_before_write_success_shows_no_transitional() -> No
     write_success = push_lock._operation_write_success
     window_after_write_success: list[bool] = []
 
-    def record_the_window(*args: LockStatus) -> None:
+    def record_the_window(*args: Any) -> None:
         write_success(*args)
         window_after_write_success.append(push_lock._operation_window_open)
 
@@ -5785,7 +5788,7 @@ async def test_the_window_refuses_a_position_and_passes_a_jam_and_the_door_membe
         push_lock._operation_issued_at = start
         push_lock._operation_window_open = True
 
-        push_lock._operation_write_success(LockStatus.LOCKING)
+        push_lock._operation_write_success(_LOCK_OPERATION)
         assert push_lock.lock_status is LockStatus.LOCKING
         assert push_lock._operation_window_open is True
 
@@ -6143,7 +6146,7 @@ async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
         # As the operation sets them before its write.
         push_lock._operation_issued_at = clock[0]
         push_lock._operation_window_open = True
-        push_lock._operation_write_success(LockStatus.UNLOCKING)
+        push_lock._operation_write_success(_UNLOCK_OPERATION)
         push_lock._update_any_state([LockStatus.UNLOCKED])
 
     assert push_lock.lock_status is LockStatus.UNLOCKING

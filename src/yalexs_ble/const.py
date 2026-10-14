@@ -134,9 +134,6 @@ class LockStatus(Enum):
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
     SECUREMODE = 0x0C
-    # Library-synthesized and never published; wider than a byte so no frame
-    # decodes to it.
-    _SECURING = 0x100
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
