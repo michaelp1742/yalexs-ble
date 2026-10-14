@@ -13,6 +13,9 @@ SECURE_READ_CHARACTERISTIC = "bd4ac614-0b45-11e3-8ffd-0800200c9a66"
 
 APPLE_MFR_ID = 76
 YALE_MFR_ID = 465
+ASSA_ABLOY_MFR_ID = 302
+# Company IDs a lock's manufacturer data is advertised under, read in this order.
+YALE_MFR_IDS = (YALE_MFR_ID, ASSA_ABLOY_MFR_ID)
 HAP_FIRST_BYTE = 0x06
 HAP_ENCRYPTED_FIRST_BYTE = 0x11
 
@@ -31,13 +34,23 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
 
+# Slot reported for unlocks with the keypad master (programming) code, which
+# is set at the keypad and cannot be read or written over BLE
+KEYPAD_MASTER_CODE_SLOT = 0xFFEE
+
+
 class Commands(IntEnum):
     GETSTATUS = 0x02
     WRITESETTING = 0x03
     READSETTING = 0x04
     UNLOCK = 0x0A
     LOCK = 0x0B
+    KEYCODE_SET = 0x27
+    KEYCODE_CLEAR = 0x28
+    KEYCODE_ACCESS = 0x2B
+    KEYCODE_COMMIT = 0x2C
     LOCK_ACTIVITY = 0x2D
+    KEYCODE_GET = 0x39
 
 
 class OperationError(IntEnum):
@@ -97,6 +110,18 @@ class OperationError(IntEnum):
 
 VALUE_TO_OPERATION_ERROR = {err.value: err for err in OperationError}
 
+# The results of a motor stall or a mechanism out of position.
+MECHANICAL_OPERATION_ERRORS = frozenset(
+    {
+        OperationError.MECH_TIMEOUT,
+        OperationError.MECH_POSITION,
+        OperationError.MECH_MOTPOL,
+        OperationError.MECH_TIMEOUT_CAL,
+        OperationError.MECH_BACKOFF,
+        OperationError.MECH_HANDLE_NOT_LIFTED,
+    }
+)
+
 
 class StatusType(IntEnum):
     LOCK_ONLY = 0x02
@@ -118,12 +143,19 @@ class LockStatus(Enum):
     LOCKED = 0x05
     UNKNOWN_06 = 0x06  # PolDiscovery
     JAMMED = 0x07  # STATICPOSITION
-    # UNLATCHING = 0x09
-    # UNLATCHED = 0x0A
+    UNLATCHING = 0x09
+    UNLATCHED = 0x0A
     SECUREMODE = 0x0C
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
+
+# Statuses reported during calibration (0x01) and polarity discovery (0x06),
+# setup conditions that end at the lock by hand.
+SETUP_CONDITION_STATUSES = frozenset({LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06})
+
+# Statuses that need a person at the lock; exported for consumers.
+MANUAL_INTERVENTION_STATUSES = SETUP_CONDITION_STATUSES | {LockStatus.JAMMED}
 
 
 class DoorStatus(Enum):
@@ -148,6 +180,7 @@ class AutoLockMode(IntEnum):
 
 class LockActivityType(Enum):
     LOCK = 0x00
+    KEYPAD_UNLOCK = 0x07
     DOOR = 0x20
     PIN = 0x0E
     NONE = 0x80
@@ -175,6 +208,9 @@ class LockState:
     # Hold the previous auto lock state so that it can be restored if auto lock
     # is enabled
     auto_lock_prev: AutoLockState | None
+    # Status of the secure lock: LOCKED when the lock is in securemode, so
+    # SECUREMODE itself never appears here.
+    secure: LockStatus = LockStatus.UNKNOWN
 
 
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState

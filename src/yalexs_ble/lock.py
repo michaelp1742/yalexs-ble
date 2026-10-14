@@ -4,7 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import datetime
 from typing import Any, TypeVar, cast
 
@@ -19,6 +19,7 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_DOOR_STATUS,
@@ -44,11 +45,31 @@ from .const import (
     StatusType,
 )
 from .secure_session import SecureSession
-from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+from .session import (
+    OPERATION_RESPONSE_TIMEOUT,
+    AuthError,
+    DisconnectedError,
+    KeycodeError,
+    OperationFailedError,
+    OperationProgress,
+    ResponseError,
+    Session,
+    YaleXSBLEError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+LOCK_INFO_ATTEMPTS = 2
+
+# Upper bound on the records read in one drain of the activity log
+MAX_ACTIVITY_RECORDS = 32
+
+# Operation byte that makes an Unlock command an unlatch (retract the latch).
+UNLATCH_OPERATION_BYTE = 0x0A
+
+# Operation byte (byte[4]) that makes a Lock command securemode.
+SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -169,6 +190,80 @@ def _poll_response_matcher(
     return matches
 
 
+# Opcodes whose frames carry no lock state; their results go to the waiting command.
+NO_STATE_OPCODES = frozenset(
+    {
+        Commands.KEYCODE_SET.value,
+        Commands.KEYCODE_CLEAR.value,
+        Commands.KEYCODE_ACCESS.value,
+        Commands.KEYCODE_COMMIT.value,
+        Commands.KEYCODE_GET.value,
+        Commands.LOCK_ACTIVITY.value,
+    }
+)
+KEYCODE_ACCESS_ALWAYS = 0x80
+KEYCODE_CREDENTIAL_PIN = 0x00
+KEYCODE_MAX_SLOT = 0xFFFF
+# Result code of a 0xBB op-response or keycode result.
+RESULT_BYTE = 0x0F
+
+
+def _keycode_response_matcher(
+    opcode: int, slot: int | None = None
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB result of a keycode command; a read also needs its slot echoed."""
+    matches_result = _operation_response_matcher(opcode)
+    if slot is None:
+        return matches_result
+
+    def matches(data: bytes) -> bool:
+        return matches_result(data) and util._bytes_to_int(data[0x04:0x06]) == slot
+
+    return matches
+
+
+def _validate_keycode_slot(slot: int) -> None:
+    if not 1 <= slot <= KEYCODE_MAX_SLOT:
+        raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
+
+
+def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
+    """Match the acknowledgment (0xAA + opcode + operation byte) of a command.
+
+    The operation byte tells a securemode acknowledgment from a plain lock's.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return (
+            len(data) > 0x04
+            and data[0x00] == 0xAA
+            and data[0x01] == opcode
+            and data[0x04] == operation_byte
+        )
+
+    return _matches
+
+
+def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match the 0xBB result frame for opcode; the floor admits the result byte.
+
+    The operation byte is not matched: a securemode command carries 0x04 there
+    and its op-response carries 0x00.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > RESULT_BYTE and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
+
+
+class ActivityLogOverrunError(ResponseError):
+    """The activity log did not end within the read cap."""
+
+
+_LOCK_ACTIVITY_MATCHER = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
+
+
 class Lock:
     def __init__(
         self,
@@ -179,6 +274,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        op_response_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -191,11 +287,8 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
-        # byte[15] of the most recent op-response: 0x00 success, non-zero =
-        # OperationError enum value (MECH_* = jam). None until the first op.
-        # Retained so a follow-up can expose the failure reason as a
-        # diagnostic.
-        self._last_op_error: int | None = None
+        # Called on every LOCK/UNLOCK op-response, ours or not.
+        self._op_response_callback = op_response_callback
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -284,28 +377,41 @@ class Lock:
         raise BleakError(f"Missing characteristic {char_uuid}")
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+        if state[0] in (0xAA, 0xBB) and state[1] in NO_STATE_OPCODES:
+            return ()  # Answered to the waiting command; carries no state
         if state[0] == 0xBB:
             # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
             # motor stops. The operation result is byte[15]: 0x00 = success,
             # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
             if (
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
-                and len(state) > 0x0F
+                and len(state) > RESULT_BYTE
             ):
-                result = state[0x0F]
-                self._last_op_error = result
+                result = state[RESULT_BYTE]
+                if self._op_response_callback is not None:
+                    self._op_response_callback()
                 if result != OperationError.COMM_SUCCESS:
+                    solicited = self.session is not None and (
+                        self.session.awaits_op_response(state)
+                    )
+                    if solicited and result in MECHANICAL_OPERATION_ERRORS:
+                        # The caller learns of this failure from
+                        # OperationFailedError; debug is enough here.
+                        level = logging.DEBUG
+                    else:
+                        level = logging.WARNING
                     error = VALUE_TO_OPERATION_ERROR.get(result)
-                    _LOGGER.warning(
+                    _LOGGER.log(
+                        level,
                         "%s: Operation failed with result 0x%02X (%s)",
                         self.name,
                         result,
                         error.name if error else "unknown",
                     )
+                    # Every failure needs a person at the lock, so all
+                    # display as JAMMED.
                     return [LockStatus.JAMMED]
                 return ()  # success: recognized, no state update
-            if state[1] == Commands.LOCK_ACTIVITY.value:
-                return ()  # Ignore lock activity as these are historical events
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
                     return [self._parse_lock_status(state[0x08])]
@@ -322,10 +428,8 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
+                return ()  # Operation ack; state arrives in the 0xBB op-response
             if state[1] in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,
@@ -407,38 +511,62 @@ class Lock:
             FIRMWARE_REVISION_CHARACTERISTIC,
         )
         results: dict[str, str] = {}
-        try:
-            async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
-                for char_uuid in char_uuids:
-                    char = self.client.services.get_characteristic(char_uuid)
-                    if not char:
-                        _LOGGER.warning(
-                            "%s: Characteristic %s not found", self.name, char_uuid
-                        )
-                        continue
-                    try:
-                        results[char_uuid] = (
-                            (await self.client.read_gatt_char(char))
-                            .decode()
-                            .split("\0")[0]
-                        )
-                    # The read is radio input too: the BLE controller bug
-                    # noted above corrupts packets, so the bytes may not be
-                    # UTF-8. A bad read degrades to the fallback for that
-                    # characteristic, like a failed one.
-                    except (BleakError, UnicodeDecodeError) as err:
-                        _LOGGER.warning(
-                            "%s: Failed to read characteristic %s: %s",
-                            self.name,
-                            char_uuid,
-                            err,
-                        )
-        except TimeoutError:
-            _LOGGER.warning(
-                "%s: Timeout reading lock info, using %d partial results",
-                self.name,
-                len(results),
+        # Retried once: an empty model reads as no door sense, and the
+        # consumer caches the result.
+        missing: set[str] = set()
+        for attempt in range(1, LOCK_INFO_ATTEMPTS + 1):
+            timed_out = False
+            try:
+                async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
+                    for char_uuid in char_uuids:
+                        if char_uuid in results or char_uuid in missing:
+                            continue
+                        char = self.client.services.get_characteristic(char_uuid)
+                        if not char:
+                            missing.add(char_uuid)
+                            _LOGGER.warning(
+                                "%s: Characteristic %s not found", self.name, char_uuid
+                            )
+                            continue
+                        try:
+                            results[char_uuid] = (
+                                (await self.client.read_gatt_char(char))
+                                .decode()
+                                .split("\0")[0]
+                            )
+                        # The read is radio input too: the BLE controller bug
+                        # noted above corrupts packets, so the bytes may not be
+                        # UTF-8. A bad read degrades to the fallback for that
+                        # characteristic, like a failed one.
+                        except (BleakError, UnicodeDecodeError) as err:
+                            _LOGGER.warning(
+                                "%s: Failed to read characteristic %s: %s",
+                                self.name,
+                                char_uuid,
+                                err,
+                            )
+            except TimeoutError:
+                timed_out = True
+            model_known = (
+                MODEL_NUMBER_CHARACTERISTIC in results
+                or MODEL_NUMBER_CHARACTERISTIC in missing
             )
+            if model_known and not timed_out:
+                break
+            if attempt == LOCK_INFO_ATTEMPTS:
+                _LOGGER.warning(
+                    "%s: Lock info incomplete after %d attempts, using %d partial "
+                    "results",
+                    self.name,
+                    attempt,
+                    len(results),
+                )
+            else:
+                _LOGGER.debug(
+                    "%s: Lock info incomplete with %d partial results, retrying",
+                    self.name,
+                    len(results),
+                )
         # Use the BLE address as fallback serial to keep devices unique
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address
@@ -450,36 +578,106 @@ class Lock:
         )
         return self._lock_info
 
-    @raise_if_not_connected
-    async def force_securemode(self) -> None:
-        """Force the lock into securemode."""
-        _LOGGER.debug("%s: Securing", self.name)
+    async def _execute_operation(
+        self,
+        opcode: int,
+        operation_byte: int,
+        command_name: str,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+        retry_after_write: bool = True,
+    ) -> None:
+        """Run a mechanical operation.
+
+        Raises OperationFailedError on a reported failure. result_callback is
+        told whether the op-response reported success, as the frame is handled.
+        """
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
+        _LOGGER.debug("%s: Executing %s", self.name, command_name)
+
+        def _on_result(response: bytes) -> None:
+            if result_callback is not None:
+                result_callback(response[RESULT_BYTE] == OperationError.COMM_SUCCESS)
+
+        response = await self.session.execute_operation(
+            self.session.build_operation_command(opcode, operation_byte),
+            command_name,
+            ack_matcher=_ack_matcher(opcode, operation_byte),
+            response_matcher=_operation_response_matcher(opcode),
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            progress=OperationProgress(),
+            write_success_callback=write_success_callback,
+            result_callback=_on_result,
+            retry_after_write=retry_after_write,
+        )
+        result = response[RESULT_BYTE]
+        if result != OperationError.COMM_SUCCESS:
+            raise OperationFailedError(
+                command_name, VALUE_TO_OPERATION_ERROR.get(result, result)
+            )
+        _LOGGER.debug("%s: Finished %s", self.name, command_name)
+
+    @raise_if_not_connected
+    async def force_securemode(
+        self,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Force the lock into securemode; raises OperationFailedError on a failure."""
+        await self._execute_operation(
+            Commands.LOCK,
+            SECUREMODE_OPERATION_BYTE,
             "force_securemode",
+            write_success_callback,
+            result_callback,
         )
-        _LOGGER.debug("%s: Finished securemode", self.name)
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
-        """Force the lock to lock."""
-        _LOGGER.debug("%s: Locking", self.name)
-        assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.LOCK), "force_lock"
+    async def force_lock(
+        self,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Force the lock to lock; raises OperationFailedError on a failure."""
+        await self._execute_operation(
+            Commands.LOCK, 0x00, "force_lock", write_success_callback, result_callback
         )
-        _LOGGER.debug("%s: Finished locking", self.name)
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
-        """Force the lock to unlock."""
-        _LOGGER.debug("%s: Unlocking", self.name)
-        assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.UNLOCK), "force_unlock"
+    async def force_unlock(
+        self,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Force the lock to unlock; raises OperationFailedError on a failure."""
+        await self._execute_operation(
+            Commands.UNLOCK,
+            0x00,
+            "force_unlock",
+            write_success_callback,
+            result_callback,
         )
-        _LOGGER.debug("%s: Finished unlocking", self.name)
+
+    @raise_if_not_connected
+    async def force_unlatch(
+        self,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Retract the latch (momentary open).
+
+        Returns on the latch pull, before the cycle ends. A failure after the
+        write raises OperationIncompleteError, as a repeat opens the door again;
+        a reported failure raises OperationFailedError.
+        """
+        await self._execute_operation(
+            Commands.UNLOCK,
+            UNLATCH_OPERATION_BYTE,
+            "force_unlatch",
+            write_success_callback,
+            result_callback,
+            retry_after_write=False,
+        )
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -521,17 +719,91 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
+    async def _send_keycode(
+        self, cmd: bytearray, command_name: str, slot: int | None = None
+    ) -> bytes:
+        """Send a keycode command and raise KeycodeError on a failed result."""
+        assert self.session is not None  # nosec
+        response = await self.session.execute(
+            cmd, command_name, _keycode_response_matcher(cmd[0x01], slot)
+        )
+        if (result := response[RESULT_BYTE]) != OperationError.COMM_SUCCESS:
+            raise KeycodeError(
+                command_name, VALUE_TO_OPERATION_ERROR.get(result, result)
+            )
+        return response
+
+    def _keycode_slot_command(self, opcode: int, pin: bytes, slot: int) -> bytearray:
+        """Build the CLEAR or COMMIT frame: PIN, slot and credential type."""
+        assert self.session is not None  # nosec
+        cmd = self.session.build_command(opcode)
+        util._copy(cmd, pin, destLocation=0x04)
+        cmd[0x0B] = slot & 0xFF
+        cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        cmd[0x0D] = slot >> 8
+        return cmd
+
+    @raise_if_not_connected
+    async def get_keycode(self, slot: int) -> str | None:
+        """Read the PIN in a keypad slot; None if the slot is empty."""
+        _validate_keycode_slot(slot)
+        assert self.session is not None  # nosec
+        cmd = self.session.build_command(Commands.KEYCODE_GET)
+        cmd[0x04:0x06] = util._int_to_bytes(slot, 2)
+        response = await self._send_keycode(cmd, "get_keycode", slot)
+        return util.decode_keycode_pin(response[0x06:0x0D])
+
+    @raise_if_not_connected
+    async def clear_keycode(self, slot: int) -> None:
+        """Clear a keypad slot without needing to know its PIN."""
+        _validate_keycode_slot(slot)
+        blank = b"\xff" * util.KEYCODE_PIN_BYTES
+        cmd = self._keycode_slot_command(Commands.KEYCODE_CLEAR, blank, slot)
+        await self._send_keycode(cmd, "clear_keycode")
+
+    @raise_if_not_connected
+    async def set_keycode(self, slot: int, pin: str) -> None:
+        """Program a PIN into a keypad slot with an always-valid schedule.
+
+        The slot is cleared first, so a KeycodeError from a later step
+        leaves the slot empty; the error names the step that failed.
+        """
+        _validate_keycode_slot(slot)
+        encoded = util.encode_keycode_pin(pin)
+        assert self.session is not None  # nosec
+        await self.clear_keycode(slot)
+
+        cmd = self.session.build_command(Commands.KEYCODE_SET)
+        util._copy(cmd, encoded, destLocation=0x04)
+        cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        await self._send_keycode(cmd, "set_keycode")
+
+        cmd = self.session.build_command(Commands.KEYCODE_ACCESS)
+        cmd[0x0C] = KEYCODE_ACCESS_ALWAYS
+        cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
+        await self._send_keycode(cmd, "set_keycode_access")
+
+        cmd = self._keycode_slot_command(Commands.KEYCODE_COMMIT, encoded, slot)
+        await self._send_keycode(cmd, "commit_keycode")
+
     async def securemode(self) -> None:
+        """Set securemode unless already set; raises OperationFailedError on failure."""
         if (await self.lock_status()) != LockStatus.SECUREMODE:
             await self.force_securemode()
 
     async def lock(self) -> None:
+        """Lock unless already locked; raises OperationFailedError on a failure."""
         if (await self.lock_status()) != LockStatus.LOCKED:
             await self.force_lock()
 
     async def unlock(self) -> None:
+        """Unlock unless already unlocked; raises OperationFailedError on a failure."""
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        """Unlatch; always runs, and raises OperationFailedError on a failure."""
+        await self.force_unlatch()
 
     async def _execute_command(
         self,
@@ -776,20 +1048,55 @@ class Lock:
                 source=LockOperationSource.PIN,
                 slot=pin_slot,
             )
-        _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
+        if activity_type == LockActivityType.KEYPAD_UNLOCK.value:
+            # Timestamp is at 0x05-0x08
+            # Slot is a uint16 at 0x0E-0x0F; 0xFFEE is the keypad master code
+            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
+            slot = util._bytes_to_int(response[0x0E:0x10])
+            return LockActivity(
+                timestamp,
+                LockStatus.UNLOCKED,
+                source=LockOperationSource.PIN,
+                slot=slot,
+            )
+        _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
+
+    async def _read_lock_activity_response(self) -> bytes:
+        """Pop the oldest record from the lock's activity log."""
+        assert self.session is not None  # nosec
+        return await self.session.execute(
+            self.session.build_command(Commands.LOCK_ACTIVITY.value),
+            "lock_activity",
+            _LOCK_ACTIVITY_MATCHER,
+        )
 
     @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
-        assert self.session is not None  # nosec
-        response = await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value),
-            "lock_activity",
-            _poll_response_matcher(Commands.LOCK_ACTIVITY.value),
-        )
+        response = await self._read_lock_activity_response()
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
+
+    async def drain_lock_activity(self) -> AsyncIterator[DoorActivity | LockActivity]:
+        """Pop and yield records until the end marker; raise past the read cap.
+
+        Each read pops the lock's oldest record, so records are yielded as
+        they arrive. Unknown types are skipped.
+        """
+        if not self.is_connected:
+            raise DisconnectedError("Lock is not connected")
+        _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
+        for _ in range(MAX_ACTIVITY_RECORDS):
+            response = await self._read_lock_activity_response()
+            if response[0x04] == LockActivityType.NONE.value:
+                _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
+                return
+            if (activity := self._parse_lock_activity(response)) is not None:
+                yield activity
+        raise ActivityLogOverrunError(
+            f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
+        )
 
     async def disconnect(self) -> None:
         """Disconnect from the lock."""
