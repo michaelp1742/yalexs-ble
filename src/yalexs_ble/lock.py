@@ -63,6 +63,9 @@ LOCK_INFO_ATTEMPTS = 2
 # Upper bound on the records read in one drain of the activity log
 MAX_ACTIVITY_RECORDS = 32
 
+# Operation byte that makes an Unlock command an unlatch (retract the latch).
+UNLATCH_OPERATION_BYTE = 0x0A
+
 # Operation byte (byte[4]) that makes a Lock command securemode.
 SECUREMODE_OPERATION_BYTE = 0x04
 
@@ -242,7 +245,8 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     """Match the 0xBB result frame for opcode; the floor admits the result byte.
 
-    The operation byte is 0x00 for every variant, so it is not matched.
+    The operation byte is not matched: a securemode command carries 0x04 there
+    and its op-response carries 0x00.
     """
 
     def _matches(data: bytes) -> bool:
@@ -562,6 +566,7 @@ class Lock:
         command_name: str,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
+        retry_after_write: bool = True,
     ) -> int:
         """Run a mechanical operation; return the result code the lock reported.
 
@@ -584,6 +589,7 @@ class Lock:
             progress=OperationProgress(),
             write_success_callback=write_success_callback,
             result_callback=_on_result,
+            retry_after_write=retry_after_write,
         )
         result = response[RESULT_BYTE]
         _LOGGER.debug(
@@ -630,6 +636,26 @@ class Lock:
             "force_unlock",
             write_success_callback,
             result_callback,
+        )
+
+    @raise_if_not_connected
+    async def force_unlatch(
+        self,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+    ) -> int:
+        """Retract the latch (momentary open); returns the lock's result code.
+
+        Returns on the latch pull, before the cycle ends. A failure after the
+        write raises OperationIncompleteError, as a repeat opens the door again.
+        """
+        return await self._execute_operation(
+            Commands.UNLOCK,
+            UNLATCH_OPERATION_BYTE,
+            "force_unlatch",
+            write_success_callback,
+            result_callback,
+            retry_after_write=False,
         )
 
     @raise_if_not_connected
@@ -750,6 +776,10 @@ class Lock:
     async def unlock(self) -> None:
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        """Unlatch; always runs, as there is no resting state to compare."""
+        await self.force_unlatch()
 
     async def _execute_command(
         self,

@@ -3640,6 +3640,7 @@ def _known_state(
         ("lock", "force_lock", LockStatus.LOCKED),
         ("unlock", "force_unlock", LockStatus.UNLOCKED),
         ("securemode", "force_securemode", LockStatus.SECUREMODE),
+        ("unlatch", "force_unlatch", LockStatus.UNLATCHED),
     ],
 )
 async def test_execute_lock_operation_success_stamps_complete_state(
@@ -3761,6 +3762,22 @@ async def test_securemode_on_a_locked_lock_moves_only_the_secure_lock() -> None:
                 (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
             ],
         ),
+        (
+            (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            "unlatch",
+            [
+                (LockStatus.UNLATCHING, LockStatus.UNLOCKING),
+                (LockStatus.UNLATCHED, LockStatus.UNLOCKED),
+            ],
+        ),
+        (
+            (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            "unlatch",
+            [
+                (LockStatus.UNLATCHING, LockStatus.UNLOCKED),
+                (LockStatus.UNLATCHED, LockStatus.UNLOCKED),
+            ],
+        ),
     ],
     ids=[
         "lock_unlocked_to_locked",
@@ -3770,6 +3787,8 @@ async def test_securemode_on_a_locked_lock_moves_only_the_secure_lock() -> None:
         "securemode_already_secured_moves_only_secure",
         "unlock_locked_to_unlocked",
         "unlock_secured_to_unlocked",
+        "unlatch_secured_to_unlatched",
+        "unlatch_locked_to_unlatched",
     ],
 )
 async def test_secure_projection_invariant_table(
@@ -3849,35 +3868,6 @@ async def test_retried_unlock_keeps_the_secure_transitional() -> None:
         LockStatus.UNLOCKING,
         LockStatus.UNLOCKING,
     )
-
-
-@pytest.mark.asyncio
-async def test_nonretryable_securemode_after_write_stamps_unknown() -> None:
-    """A securemode that dies after its write settles the pair at UNKNOWN."""
-    exc = OperationIncompleteError("no op-response")
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:66")
-    push_lock._lock_state = _known_state(LockStatus.LOCKED)
-
-    mock_lock = MagicMock()
-
-    async def force_securemode(
-        write_success_callback: Callable[[], None],
-        result_callback: Callable[[bool], None],
-    ) -> None:
-        write_success_callback()
-        raise exc
-
-    mock_lock.force_securemode = force_securemode
-
-    with (
-        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
-        pytest.raises(type(exc)),
-    ):
-        await push_lock.securemode()
-
-    assert push_lock._operation_window_open is False
-    assert push_lock.lock_status is LockStatus.UNKNOWN
-    assert push_lock.secure_status is LockStatus.UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -4112,50 +4102,67 @@ async def test_window_admits_the_door_member():
 
 
 @pytest.mark.asyncio
-async def test_early_error_before_write_leaves_no_window_and_stamps_unknown():
-    """A retryable failure before the write closes the window and displays UNKNOWN."""
+@pytest.mark.parametrize(
+    ("exc", "op_attr", "operation"),
+    [
+        (DisconnectedError("dropped before write"), "force_lock", "lock"),
+        (OperationIncompleteError("errored write"), "force_unlatch", "unlatch"),
+    ],
+)
+async def test_failure_before_write_success_closes_window_displays_unknown(
+    exc, op_attr, operation
+):
+    """A failure before write-success closes the window and displays UNKNOWN."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 
     mock_lock = MagicMock()
-    mock_lock.force_lock = AsyncMock(
-        side_effect=DisconnectedError("dropped before write")
-    )
+    setattr(mock_lock, op_attr, AsyncMock(side_effect=exc))
 
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
-        pytest.raises(DisconnectedError),
+        pytest.raises(type(exc)),
     ):
-        await push_lock.lock()
+        await getattr(push_lock, operation)()
 
     assert push_lock._operation_window_open is False
     assert push_lock.lock_status == LockStatus.UNKNOWN
 
 
 @pytest.mark.asyncio
-async def test_nonretryable_after_write_stamps_unknown():
-    """A non-retryable failure after write-success closes the window, stamps UNKNOWN."""
-    exc = OperationIncompleteError("no op-response")
+@pytest.mark.parametrize(
+    ("exc", "op_attr", "operation"),
+    [
+        (OperationIncompleteError("no op-response"), "force_lock", "lock"),
+        (OperationIncompleteError("after write"), "force_unlatch", "unlatch"),
+        (OperationIncompleteError("no op-response"), "force_securemode", "securemode"),
+    ],
+)
+async def test_nonretryable_after_write_stamps_unknown(exc, op_attr, operation):
+    """A non-retryable failure after write-success is not retried and stamps UNKNOWN."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
     mock_lock = MagicMock()
 
-    async def force_lock(write_success_callback, result_callback):
-        write_success_callback()  # puts LOCKING on the display
+    async def force_op(write_success_callback, result_callback):
+        write_success_callback()  # puts the transitional on the display
         raise exc
 
-    mock_lock.force_lock = force_lock
+    mock_op = AsyncMock(side_effect=force_op)
+    setattr(mock_lock, op_attr, mock_op)
 
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         pytest.raises(type(exc)),
     ):
-        await push_lock.lock()
+        await getattr(push_lock, operation)()
 
+    assert mock_op.await_count == 1
     assert push_lock._operation_window_open is False
     assert push_lock.lock_status == LockStatus.UNKNOWN
+    assert push_lock.secure_status is LockStatus.UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -5990,6 +5997,7 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         command_name: str,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
+        retry_after_write: bool = True,
     ) -> int:
         handed.append(write_success_callback)
         if write_success_callback is not None:
@@ -6189,6 +6197,53 @@ async def test_exhausted_retries_after_write_success_stamp_unknown() -> None:
     assert push_lock._operation_window_open is False
     assert LockStatus not in push_lock._seen_this_session
     assert push_lock._force_lock_status_poll is True
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resting_state",
+    [LockStatus.UNLOCKED, LockStatus.LOCKED],
+    ids=["unlocked", "locked"],
+)
+async def test_unlatch_stamps_unlatching_then_unlatched(
+    resting_state: LockStatus,
+) -> None:
+    """unlatch() stamps UNLATCHING at write-success and UNLATCHED on success.
+
+    The resting state the lock reports afterwards replaces UNLATCHED.
+    """
+    push_lock = _operational_push_lock()
+    order: list[str | LockStatus] = []
+
+    def cb(lock_state, lock_info, connection_info):
+        order.append(lock_state.lock)
+
+    push_lock.register_callback(cb)
+
+    mock_lock = MagicMock()
+
+    async def force_unlatch(write_success_callback, result_callback):
+        order.append("write_success")
+        write_success_callback()
+        result_callback(True)
+
+    mock_lock.force_unlatch = force_unlatch
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        await push_lock.unlatch()
+
+    assert order == ["write_success", LockStatus.UNLATCHING, LockStatus.UNLATCHED]
+    assert push_lock.lock_status == LockStatus.UNLATCHED
+    # UNLATCHED is a held position, so the follow-up poll waits the keep-alive.
+    assert LockStatus in push_lock._seen_this_session
+    schedule.assert_called_once_with(KEEP_ALIVE_TIME)
+    push_lock._state_callback([resting_state])
+    assert push_lock.lock_status == resting_state
+    push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
 
 
@@ -6512,7 +6567,6 @@ async def test_a_failed_status_read_leaves_the_poll_obligation_armed() -> None:
         LockStatus.LOCKING,
         LockStatus.UNLOCKING,
         LockStatus.UNLATCHING,
-        LockStatus.UNLATCHED,
         LockStatus.UNKNOWN,
     ],
 )
@@ -6535,6 +6589,7 @@ async def test_a_value_the_lock_is_not_holding_is_not_a_status_reading(
     [
         LockStatus.LOCKED,
         LockStatus.UNLOCKED,
+        LockStatus.UNLATCHED,
         LockStatus.SECUREMODE,
         LockStatus.JAMMED,
         LockStatus.UNKNOWN_01,

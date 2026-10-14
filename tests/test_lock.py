@@ -36,6 +36,7 @@ from yalexs_ble.const import (
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
     MAX_ACTIVITY_RECORDS,
+    UNLATCH_OPERATION_BYTE,
     Lock,
     _ack_matcher,
     _keycode_response_matcher,
@@ -47,6 +48,7 @@ from yalexs_ble.lock import (
 from yalexs_ble.session import (
     DisconnectedError,
     KeycodeError,
+    OperationIncompleteError,
     ResponseError,
     Session,
 )
@@ -1519,6 +1521,19 @@ def _make_connected_lock_with_session(
 # --------------------------------------------------------------------------- #
 
 
+def _ack_frame(opcode: int, operation_byte: int) -> bytes:
+    """A 0xAA acknowledgment carrying an operation's opcode and operation byte."""
+    frame = bytearray(0x12)
+    frame[0x00] = 0xAA
+    frame[0x01] = opcode
+    frame[0x04] = operation_byte
+    frame[0x10] = 0x02
+    return _with_checksum(frame.hex())
+
+
+UNLATCH_ACK = _ack_frame(Commands.UNLOCK, UNLATCH_OPERATION_BYTE)
+
+
 def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -> bytes:
     """A 0xBB op-response carrying the operation result in byte[15]."""
     frame = bytearray(0x12)
@@ -1532,7 +1547,7 @@ async def _drive_operation(
     lock: Lock,
     op_attr: str,
     opcode: int,
-    ack: bytes,
+    ack: bytes | None,
     before_ack: bytes | None = None,
     before_response: bytes | None = None,
     result: int = OperationError.COMM_SUCCESS,
@@ -1553,10 +1568,11 @@ async def _drive_operation(
             session._notify(0, bytearray(before_ack))
             assert session._ack_future is not None, "taken for the acknowledgment"
             await asyncio.sleep(0)
-        session._notify(0, bytearray(ack))
-        assert session._ack_future is None, "the acknowledgment was not matched"
-        events.append("ack")
-        await asyncio.sleep(0)
+        if ack is not None:
+            session._notify(0, bytearray(ack))
+            assert session._ack_future is None, "the acknowledgment was not matched"
+            events.append("ack")
+            await asyncio.sleep(0)
         if before_response is not None:
             session._notify(0, bytearray(before_response))
             assert session._notify_future is not None, "taken for the op-response"
@@ -1597,13 +1613,14 @@ def test_parse_operation_ack_reports_no_state(
         ("force_lock", Commands.LOCK, LOCK_ACK),
         ("force_unlock", Commands.UNLOCK, UNLOCK_ACK),
         ("force_securemode", Commands.LOCK, SECUREMODE_ACK),
+        ("force_unlatch", Commands.UNLOCK, UNLATCH_ACK),
     ],
-    ids=["lock", "unlock", "securemode"],
+    ids=["lock", "unlock", "securemode", "unlatch"],
 )
 async def test_force_operations_complete_on_ack_then_op_response(
     op_attr: str, opcode: int, ack: bytes
 ) -> None:
-    """Each force_* completes on its own ack then op-response, after write-success."""
+    """Each force_* sees write-success, matches its ack, and completes on the result."""
     lock = _make_connected_lock_with_session()
     events = await _drive_operation(lock, op_attr, opcode, ack)
     assert events == ["write_success", "ack", "result True", "op_response"]
@@ -1689,3 +1706,40 @@ async def test_convenience_wrappers_run_the_operation_outside_the_target_state(
     ):
         await getattr(lock, wrapper)()
     assert mock_force.await_count == (0 if in_target_state else 1)
+
+
+@pytest.mark.asyncio
+async def test_public_unlatch_wrapper_runs_force_unlatch() -> None:
+    """Lock.unlatch() always runs force_unlatch, without reading the status."""
+    lock = _make_lock()
+    with (
+        patch.object(lock, "lock_status", AsyncMock()) as mock_status,
+        patch.object(lock, "force_unlatch", AsyncMock()) as mock_force,
+    ):
+        await lock.unlatch()
+    mock_force.assert_awaited_once()
+    mock_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unlatch_completes_without_an_acknowledgment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unlatch with no acknowledgment completes on its op-response and logs it."""
+    lock = _make_connected_lock_with_session()
+    with caplog.at_level("INFO", logger="yalexs_ble.session"):
+        events = await _drive_operation(lock, "force_unlatch", Commands.UNLOCK, None)
+    assert events == ["write_success", "result True", "op_response"]
+    assert "completed on its op-response; no acknowledgment was received" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_force_unlatch_does_not_retry_a_raising_write() -> None:
+    """A raising GATT write ends an unlatch as OperationIncompleteError."""
+    lock = _make_connected_lock_with_session()
+    assert lock.client is not None
+    lock.client.write_gatt_char = AsyncMock(side_effect=BleakError("write failed"))
+
+    with pytest.raises(OperationIncompleteError) as excinfo:
+        await lock.force_unlatch()
+    assert isinstance(excinfo.value.__cause__, BleakError)

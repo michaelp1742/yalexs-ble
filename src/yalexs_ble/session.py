@@ -90,6 +90,14 @@ class OperationProgress:
     acknowledged: bool = False
     result: bytes | None = None
 
+    def final_stage(self, retry_after_write: bool) -> str | None:
+        """The stage past which a failure is final, if the operation reached one."""
+        if self.acknowledged:
+            return "the lock acknowledged it"
+        if self.write_attempted and not retry_after_write:
+            return "its write was attempted"
+        return None
+
 
 class Session:
     _write_characteristic = WRITE_CHARACTERISTIC
@@ -435,10 +443,13 @@ class Session:
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bytes], None] | None = None,
+        retry_after_write: bool = True,
     ) -> bytes:
-        """Write a mechanical command, then wait for its acknowledgment
-        (ACK_TIMEOUT) and op-response (response_timeout), both timed from the
-        write.
+        """Write a mechanical command, then wait for its acknowledgment (ACK_TIMEOUT)
+        and op-response (response_timeout), both timed from the write.
+
+        The acknowledgment deadline only serves a retry, so a command that is not
+        retried after its write skips it and waits on the op-response alone.
         """
         if not self.client.is_connected:
             raise BleakError("disconnected")
@@ -478,22 +489,25 @@ class Session:
                         self.name,
                         command_name,
                     )
-            _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
-            ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
-            done, _ = await asyncio.wait(
-                (ack_future, result_future),
-                timeout=max(ack_remaining, 0),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if result_future in done:
-                # The op-response supersedes the acknowledgment; a stale
-                # same-opcode op-response can land here (_completed logs it).
-                return self._completed(result_future.result(), progress, command_name)
-            if ack_future not in done:
-                raise TimeoutError(
-                    f"{self.name}: No acknowledgment to {command_name} within "
-                    f"{ACK_TIMEOUT}s of the command being issued"
+            if retry_after_write:
+                _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
+                ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
+                done, _ = await asyncio.wait(
+                    (ack_future, result_future),
+                    timeout=max(ack_remaining, 0),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if result_future in done:
+                    # The op-response supersedes the acknowledgment; a stale
+                    # same-opcode op-response can land here (_completed logs it).
+                    return self._completed(
+                        result_future.result(), progress, command_name
+                    )
+                if ack_future not in done:
+                    raise TimeoutError(
+                        f"{self.name}: No acknowledgment to {command_name} "
+                        f"within {ACK_TIMEOUT}s of the command being issued"
+                    )
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
             result_remaining = response_timeout - (monotonic() - attempt_start)
             # asyncio.wait never cancels the future, so a same-turn arrival
@@ -501,9 +515,9 @@ class Session:
             await asyncio.wait((result_future,), timeout=max(result_remaining, 0))
             if not result_future.done():
                 raise OperationIncompleteError(
-                    f"{self.name}: {command_name} was acknowledged but no "
-                    f"op-response arrived within {response_timeout}s of the "
-                    "command being issued"
+                    f"{self.name}: No op-response to {command_name} arrived "
+                    f"within {response_timeout}s of the command being issued"
+                    f"{'' if progress.acknowledged else '; it was never acknowledged'}"
                 )
             result = result_future.result()
         finally:
@@ -641,16 +655,14 @@ class Session:
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bytes], None] | None = None,
+        retry_after_write: bool = True,
     ) -> bytes:
-        """Run a mechanical operation with the staged wait.
+        """Run a mechanical operation with the staged wait; return its op-response.
 
-        A failure after the acknowledgment raises OperationIncompleteError; one
-        before it is raised as execute() would, for the caller to retry.
-        response_timeout must exceed ACK_TIMEOUT.
-
-        write_success_callback runs when the write succeeds; result_callback
-        runs with the op-response as that frame is handled, before the wait
-        resolves.
+        A failure after the acknowledgment, or after the write when
+        retry_after_write is False, and an op-response wait that runs out raise
+        OperationIncompleteError; earlier failures raise as execute() would, for
+        the caller to retry. response_timeout must exceed ACK_TIMEOUT.
         """
         if progress.write_attempted or progress.acknowledged or progress.result:
             # A reused record would report a previous attempt's frames as this one's.
@@ -668,6 +680,7 @@ class Session:
                     progress,
                     write_success_callback,
                     result_callback,
+                    retry_after_write,
                 )
         except OperationIncompleteError:
             raise
@@ -682,10 +695,10 @@ class Session:
                     err,
                 )
                 return self._completed(result, progress, command_name)
-            if progress.acknowledged:
+            if (stage := progress.final_stage(retry_after_write)) is not None:
                 raise OperationIncompleteError(
-                    f"{self.name}: {command_name} failed after the lock "
-                    f"acknowledged it: {err!r}; the result is unknown"
+                    f"{self.name}: {command_name} failed after {stage}: {err!r}; "
+                    "the result is unknown and it was not retried"
                 ) from err
             if isinstance(err, BleakError):
                 self._raise_for_bleak_error(err)

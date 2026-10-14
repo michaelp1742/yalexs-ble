@@ -132,11 +132,13 @@ OPERATION_IN_PROGRESS_DEFER_SECONDS = 1.0
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
 # Statuses that report a position the lock is holding; the attention statuses
-# qualify because they end only by hand. Any other status must stay out of
-# _seen_this_session so the follow-up lock_status() poll runs.
+# qualify because they end only by hand, and UNLATCHED because the lock holds
+# it for the dwell. Any other status must stay out of _seen_this_session so the
+# follow-up lock_status() poll runs.
 POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
     LockStatus.LOCKED,
     LockStatus.UNLOCKED,
+    LockStatus.UNLATCHED,
     LockStatus.SECUREMODE,
 }
 
@@ -422,6 +424,11 @@ _UNLOCK_OPERATION = _LockOperation(
 )
 _SECUREMODE_OPERATION = _LockOperation(
     "force_securemode", _securing_display, LockStatus.SECUREMODE
+)
+_UNLATCH_OPERATION = _LockOperation(
+    "force_unlatch",
+    functools.partial(_project_lock_status, LockStatus.UNLATCHING),
+    LockStatus.UNLATCHED,
 )
 
 
@@ -890,6 +897,14 @@ class PushLock:
     async def unlock(self) -> None:
         """Unlock the lock."""
         await self._run_lock_operation(_UNLOCK_OPERATION)
+
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        Completes as UNLATCHED; the state the lock settles to after the dwell
+        arrives as a later status update.
+        """
+        await self._run_lock_operation(_UNLATCH_OPERATION)
 
     def _init_operation_state(self) -> None:
         """Initialize the per-operation fields so they read before any operation."""
