@@ -3817,11 +3817,11 @@ async def test_settled_securemode_push_is_not_a_securing_transitional() -> None:
 
 @pytest.mark.asyncio
 async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
-    """A stamped SECURING must not suppress the follow-up status poll."""
+    """A stamped _SECURING must not suppress the follow-up status poll."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6a")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 
-    push_lock._update_any_state([LockStatus.SECURING], operation=True)
+    push_lock._update_any_state([LockStatus._SECURING], operation=True)
 
     assert push_lock.secure_status is LockStatus.LOCKING
     assert LockStatus not in push_lock._seen_this_session

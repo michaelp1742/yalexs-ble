@@ -379,7 +379,7 @@ def _project_lock_status(
 
     The main lock keeps SECUREMODE for compatibility.
     """
-    if reported is LockStatus.SECURING:
+    if reported is LockStatus._SECURING:
         if main in (LockStatus.LOCKED, LockStatus.SECUREMODE):
             return main, LockStatus.LOCKING
         return LockStatus.LOCKING, LockStatus.LOCKING
@@ -854,7 +854,7 @@ class PushLock:
     async def securemode(self) -> None:
         """Set the lock into securemode."""
         await self._run_lock_operation(
-            "force_securemode", LockStatus.SECURING, LockStatus.SECUREMODE
+            "force_securemode", LockStatus._SECURING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:

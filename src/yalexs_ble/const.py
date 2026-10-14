@@ -136,7 +136,7 @@ class LockStatus(Enum):
     SECUREMODE = 0x0C
     # Library-synthesized and never published; wider than a byte so no frame
     # decodes to it.
-    SECURING = 0x100
+    _SECURING = 0x100
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}

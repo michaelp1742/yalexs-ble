@@ -273,11 +273,11 @@ def test_parse_lock_status_decodes_the_unlatch_states(
 
 
 def test_no_status_byte_decodes_to_securing() -> None:
-    """No status byte decodes to SECURING."""
+    """No status byte decodes to _SECURING."""
     lock = _make_lock()
 
     assert all(
-        lock._parse_lock_status(value) is not LockStatus.SECURING
+        lock._parse_lock_status(value) is not LockStatus._SECURING
         for value in range(0x100)
     )
 
