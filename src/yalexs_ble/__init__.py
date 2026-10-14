@@ -33,7 +33,7 @@ from .util import (
     unique_id_from_local_name_address,
 )
 
-__version__ = "6.3.0"
+__version__ = "7.0.0"
 
 __all__ = [
     "KEYPAD_MASTER_CODE_SLOT",
