@@ -41,7 +41,7 @@ from .const import (
     LockStateValue,
     LockStatus,
 )
-from .lock import ActivityLogOverrunError, Lock
+from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
 from .session import (
     AuthError,
     BluetoothError,
@@ -52,7 +52,12 @@ from .session import (
     ResponseError,
     YaleXSBLEError,
 )
-from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
+from .util import (
+    asyncio_timeout,
+    encode_keycode_pin,
+    is_disconnected_error,
+    local_name_is_unique,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1306,6 +1311,7 @@ class PushLock:
 
     async def get_keycode(self, slot: int) -> str | None:
         """Read the PIN in a keypad slot; None if the slot is empty."""
+        validate_keycode_slot(slot)
         return await self._run_on_lock(
             "get_keycode", lambda lock: lock.get_keycode(slot)
         )
@@ -1313,29 +1319,56 @@ class PushLock:
     async def set_keycode(self, slot: int, pin: str) -> None:
         """Program a PIN into a keypad slot.
 
-        The slot is cleared first, so a failure leaves it empty.
+        The slot is cleared first, so any failure after the Clear can leave it empty.
         """
+        validate_keycode_slot(slot)
+        encode_keycode_pin(pin)
         await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
+        validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
     @operation_lock
-    @retry_bluetooth_connection_error
     async def _run_on_lock(
         self, name: str, operation: Callable[[Lock], Awaitable[_T]]
     ) -> _T:
-        """Run an operation on the connected lock under the operation lock."""
+        """Run a command that moves no motor; a failure is logged once at warning."""
         if not self._running:
             raise RuntimeError(f"{self.name}: {name} not possible because not running")
         try:
-            lock = await self._ensure_connected()
-            self._cancel_future_update()
-            result = await operation(lock)
-        except Exception as ex:
-            _LOGGER.debug("%s: Failed to execute %s due to %s", self.name, name, ex)
+            outcome = await self._attempt_on_lock(name, operation)
+            if isinstance(outcome, TimeoutError):
+                raise TimeoutError(  # noqa: TRY301
+                    f"{self.name}: lock did not answer {name}"
+                ) from outcome
+        except Exception as err:
+            # A ResponseError's message can hold the rejected frame's hex.
+            detail = "" if isinstance(err, ResponseError) else f": {err}"
+            _LOGGER.warning(
+                "%s: %s failed: %s%s", self.name, name, type(err).__name__, detail
+            )
             raise
+        return outcome
+
+    @retry_bluetooth_connection_error
+    async def _attempt_on_lock(
+        self, name: str, operation: Callable[[Lock], Awaitable[_T]]
+    ) -> _T | TimeoutError:
+        """Run one attempt; a TimeoutError from the command's wait is returned."""
+        # Not reconnected to resend after a stop.
+        if not self._running:
+            raise RuntimeError(
+                f"{self.name}: stopped during {name}; its result is unknown"
+            )
+        lock = await self._ensure_connected()
+        try:
+            result = await operation(lock)
+        except TimeoutError as err:
+            # Raised, it would make the retry decorator reconnect and resend.
+            return err
+        self._record_auth_success()
         self._complete_operation(time.monotonic())
         return result
 
@@ -1344,7 +1377,7 @@ class PushLock:
         self._last_operation_complete_time = now
         self._clear_reconnect_backoff()
         if self._activity_callbacks and not self._activity_primed:
-            # The operation cancelled any pending update, the priming one included.
+            # A lock operation cancelled any pending update, the priming one included.
             self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
@@ -1464,12 +1497,7 @@ class PushLock:
         self._callback_state(replace(lock_state, **changes))
 
     def _record_auth_success(self) -> None:
-        """Record a successful round trip with the lock.
-
-        Nothing else produces AuthState(successful=True); the latch in the
-        retry decorator is the only producer of the failure, so both reach the
-        consumer through _update_any_state, which drops a repeat.
-        """
+        """Clear the auth failure count and publish AuthState(successful=True)."""
         _AUTH_FAILURE_HISTORY.auth_success(self.address)
         self._update_any_state([AuthState(successful=True)])
 
@@ -1888,9 +1916,10 @@ class PushLock:
         )
         if not self._callbacks:
             return
-        assert self._lock_info is not None  # nosec
         connection_info = self.connection_info
-        assert connection_info is not None  # nosec
+        if self._lock_info is None or connection_info is None:
+            # Kept until both are known; the debug line above shows which is not.
+            return
         for callback in self._callbacks:
             try:
                 callback(lock_state, self._lock_info, connection_info)
