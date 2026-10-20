@@ -39,6 +39,11 @@ def _bytes_to_int(buffer: bytes | bytearray) -> int:
     return int.from_bytes(buffer, byteorder="little", signed=False)
 
 
+def _bytes_to_signed_int(buffer: bytes | bytearray) -> int:
+    """Convert a byte buffer to a signed integer."""
+    return int.from_bytes(buffer, byteorder="little", signed=True)
+
+
 def _named(enum: type[_EnumT], value: int) -> _EnumT | int:
     """Return the member of enum for value, or value when enum has none.
 
