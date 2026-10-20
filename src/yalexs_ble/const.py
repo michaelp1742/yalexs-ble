@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum, IntEnum, IntFlag
 from typing import TypedDict
 
@@ -45,11 +44,6 @@ NO_BATTERY_SUPPORT_MODELS = {
     "CERES",  # Smart code handle
     "Yale Linus L2",  # Linus L2 Nordic
 }
-
-
-# Slot reported for unlocks with the keypad master (programming) code, which
-# is set at the keypad and cannot be read or written over BLE
-KEYPAD_MASTER_CODE_SLOT = 0xFFEE
 
 
 class Commands(IntEnum):
@@ -203,13 +197,6 @@ class AutoLockMode(IntEnum):
     INSTANT = 0
     TIMER = 1
     OFF = 2
-
-
-class LockActivityType(Enum):
-    LOCK = 0x00
-    KEYPAD_UNLOCK = 0x07
-    DOOR = 0x20
-    PIN = 0x0E
 
 
 @dataclass
@@ -797,22 +784,6 @@ BULK_OPERATION_TYPE_NAMES: dict[int, str] = {
     0x01: "UsersClear",
     0x02: "CredsClear",
 }
-
-
-@dataclass
-class LockActivity:
-    timestamp: datetime
-    status: LockStatus
-    # source is None for a 0x07 or 0x0E record, which has no opCode byte.
-    # OpCode.DOOR_STATE_CHANGED is 0, so a truth test cannot tell it from None.
-    source: OpCode | int | None
-    slot: int | None = None
-
-
-@dataclass
-class DoorActivity:
-    timestamp: datetime
-    status: DoorStatus
 
 
 @dataclass
