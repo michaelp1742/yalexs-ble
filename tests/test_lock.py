@@ -985,6 +985,13 @@ def _with_checksum(hex_str: str) -> bytes:
     return bytes(frame)
 
 
+def _with_byte(frame: bytes, offset: int, value: int) -> bytes:
+    """A copy of frame with one byte replaced and the checksum recomputed."""
+    edited = bytearray(frame)
+    edited[offset] = value
+    return _with_checksum(edited.hex())
+
+
 # A LOCK_ACTIVITY reply carries one activity record: byte[2] is the record
 # index and byte[4] the record type. 0x80 ends the log and decodes to nothing;
 # 0x20 is a door state change, carrying a door status at byte[9], so it decodes
@@ -1358,6 +1365,8 @@ KEYPAD_UNLOCK_SLOT_UNKNOWN = bytes.fromhex("bb2d00d007299c76a3330049e414eeff0200
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
 UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
+# Built to the 0x0E layout: PIN credential, slot 7, unlocked and closed.
+CREDENTIAL_RECORD_SLOT_7 = _with_checksum("bb2d00000e9aa176a3000700130000000000")
 # Captured GetLog replies from a Yale Unity L9000ER on 2026-10-25.
 AUTO_RELOCK_LOCKED = bytes.fromhex("bb2d000e000505007baddd6a2017193f0200")
 # Captured from a Yale Unity L9000K3 on 2026-10-25.
@@ -1372,10 +1381,14 @@ DOOR_STATE_CHANGED_SLOT_255 = bytes.fromhex("bb2d001c000005ff0433e06a0817193d020
         (KEYPAD_UNLOCK_SLOT_205, 205),
         (KEYPAD_UNLOCK_SLOT_200, 200),
         (KEYPAD_UNLOCK_SLOT_UNKNOWN, KEYPAD_MASTER_CODE_SLOT),
+        (CREDENTIAL_RECORD_SLOT_7, 7),
     ],
+    ids=["0x07-slot-205", "0x07-slot-200", "0x07-master-code", "0x0e-slot-7"],
 )
-def test_parse_keypad_unlock_activity(frame: bytes, slot: int | None) -> None:
-    """Real keypad PIN unlock records (type 0x07) from a Yale YRD256."""
+def test_a_code_or_credential_record_has_its_slot_and_no_source(
+    frame: bytes, slot: int
+) -> None:
+    """Captured 0x07 and built 0x0E unlocks give their slot and no source."""
     activity = _make_lock()._parse_lock_activity(frame)
     assert isinstance(activity, LockActivity)
     assert activity.status is LockStatus.UNLOCKED
@@ -1419,21 +1432,11 @@ def test_the_end_marker_decodes_to_nothing() -> None:
 def test_a_lock_record_keeps_an_op_code_with_no_name() -> None:
     """A type 0x00 record whose opCode has no OpCode member keeps the value."""
     # Built: the captured lock-button record with opCode 0x0D.
-    frame = _with_checksum("bb2d0056000d0500a0a176a3df14194a0200")
+    frame = _with_byte(KEYPAD_LOCK_BUTTON, 0x05, 0x0D)
     activity = _make_lock()._parse_lock_activity(frame)
     assert isinstance(activity, LockActivity)
     assert activity.source == 13
     assert type(activity.source) is int
-
-
-def test_a_credential_record_has_no_source() -> None:
-    """A type 0x0E record has no opCode byte, so its source is None."""
-    # Built to the 0x0E layout: PIN credential, slot 7, unlocked and closed.
-    frame = _with_checksum("bb2d00000e9aa176a3000700130000000000")
-    activity = _make_lock()._parse_lock_activity(frame)
-    assert isinstance(activity, LockActivity)
-    assert activity.source is None
-    assert activity.slot == 7
 
 
 def test_op_code_holds_the_vendor_table() -> None:
