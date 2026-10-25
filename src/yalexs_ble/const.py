@@ -25,6 +25,10 @@ HAP_ENCRYPTED_FIRST_BYTE = 0x11
 # share this length.
 RESPONSE_FRAME_LEN = 0x12
 
+# When True, a log line that prints a decrypted or plaintext frame masks its
+# keypad code and the checksum that gives away the sum of the code's bytes.
+MASK_SENSITIVE = False
+
 
 MANUFACTURER_NAME_CHARACTERISTIC = "00002a29-0000-1000-8000-00805f9b34fb"
 MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"

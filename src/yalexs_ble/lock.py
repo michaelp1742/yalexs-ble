@@ -444,11 +444,11 @@ class Lock:
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
-        _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
+        _LOGGER.debug("%s: State changed: %s", self.name, util._loggable_hex(state))
         parsed_state = self._parse_state(state)
         if parsed_state is None:
             # Unrecognized frame - surface it for diagnosis.
-            _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
+            _LOGGER.info("%s: Unknown state: %s", self.name, util._loggable_hex(state))
         elif parsed_state:
             # Non-empty iterable - emit the state(s) to the consumer.
             self._state_callback(parsed_state)
@@ -819,10 +819,18 @@ class Lock:
         # well.
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
-        _LOGGER.debug("%s: send: [%s] [%s]", self.name, command.hex(), hex(cmd_byte))
+        _LOGGER.debug(
+            "%s: send: [%s] [%s]",
+            self.name,
+            util._loggable_hex(command),
+            hex(cmd_byte),
+        )
         response = await self.session.execute(command, command_name, response_matcher)
         _LOGGER.debug(
-            "%s: response: [%s] [%s]", self.name, response.hex(), hex(cmd_byte)
+            "%s: response: [%s] [%s]",
+            self.name,
+            util._loggable_hex(response),
+            hex(cmd_byte),
         )
         return response
 
